@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 logger = logging.get_logger(__name__)
 
+import pdb
 
 class PaTHAttention(nn.Module):
     def __init__(
@@ -99,14 +100,25 @@ class PaTHAttention(nn.Module):
                 "for padding purposes (0 indicating padding). "
                 "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
             )
+        
         batch_size, q_len, _ = hidden_states.size()
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
         w = self.w_proj(hidden_states)
-        beta = self.bt_proj(hidden_states).sigmoid() * 2  # allowing negative eigenvalues
+        # Beta in (0, 2). With ||w||=1, the rank-one update (I - beta w w^T) has eigenvalue 1-beta along w.
+        # Thus beta > 1 yields a negative eigenvalue as intended by the paper.
+        beta = self.bt_proj(hidden_states).sigmoid() * 2
         g = F.logsigmoid(self.g_proj(hidden_states).float()) if self.use_forget_gate else None
+        # print(torch.max(q), torch.max(k))
+        # print()
         q, k = self.maybe_q_norm(q), self.maybe_k_norm(k)
+        # print(torch.max(q), torch.max(k))
+        # print(hidden_states, 'hidden_states in PaTHAttention.')
+        # print(beta, 'beta in PaTHAttention.')
+        
+        # pdb.set_trace()
+        # print('!!!!!!!!!!!!!!!')
         cu_seqlens = kwargs.get('cu_seqlens', None)
         assert not (cu_seqlens is not None and attention_mask is not None), (
             "cu_seqlens should not be provided when attention_mask is not None"
@@ -212,5 +224,6 @@ class PaTHAttention(nn.Module):
                     )
             o = pad_input(o.squeeze(0), indices_q, batch_size, q_len)
         o = rearrange(o, '... h d -> ... (h d)')
+        ##!!!
         o = self.o_proj(o)
         return o, None, past_key_values
