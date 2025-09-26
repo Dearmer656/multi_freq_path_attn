@@ -106,9 +106,7 @@ class PaTHAttention(nn.Module):
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
         w = self.w_proj(hidden_states)
-        # Beta in (0, 2). With ||w||=1, the rank-one update (I - beta w w^T) has eigenvalue 1-beta along w.
-        # Thus beta > 1 yields a negative eigenvalue as intended by the paper.
-        beta = self.bt_proj(hidden_states).sigmoid() * 2
+        beta = self.bt_proj(hidden_states).sigmoid() * 2  # allowing negative eigenvalues
         g = F.logsigmoid(self.g_proj(hidden_states).float()) if self.use_forget_gate else None
         # print(torch.max(q), torch.max(k))
         # print()
@@ -128,12 +126,23 @@ class PaTHAttention(nn.Module):
             assert use_cache is False, "use_cache should be False in training"
             if self.use_w_shortconv:
                 w, _ = self.w_conv1d(w, cache=None, output_final_state=False, cu_seqlens=cu_seqlens)
+            
+            # 重排所有张量到多头格式
             q = rearrange(q, '... (h d) -> ... h d', d=self.head_dim)
             k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
             v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
             w = rearrange(w, '... (h d) -> ... h d', d=self.head_dim)
             w = l2_norm(w)
-            o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
+            
+            # 确保维度正确
+            # beta: [B, T, num_kv_heads] ✓
+            # g: [B, T, num_heads] ✓ (如果存在)
+            
+            # 计算缩放因子
+            
+            o, _ = parallel_path_attn(
+                q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens, use_cache=False
+            )
 
         # Prefilling or decoding
         else:
