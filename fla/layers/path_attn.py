@@ -25,8 +25,7 @@ logger = logging.get_logger(__name__)
 import pdb
 
 class PaTHAttention(nn.Module):
-    def __init__(
-        self,
+    def __init__(self,
         hidden_size: int = 2048,
         num_heads: int = 32,
         num_kv_heads: Optional[int] = None,
@@ -37,11 +36,16 @@ class PaTHAttention(nn.Module):
         use_w_shortconv: bool = True,
         conv_size: int = 3,
         conv_bias: bool = False,
+        # NEW ↓↓↓
+        num_harmonics: int = 2,
+        share_freq_across_heads: bool = True,
     ):
         super().__init__()
 
         self.hidden_size = hidden_size
         self.num_heads = num_heads
+        self.r = num_harmonics
+        self.share_freq_across_heads = share_freq_across_heads        
         if num_kv_heads is None:
             self.num_kv_heads = self.num_heads
         else:
@@ -56,15 +60,14 @@ class PaTHAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
 
         # We use low-rank parameterization for the w_proj to reduce parameters in MHA settings.
+        out_w = self.kv_dim * (2 * self.r)
         if use_low_rank_w:
             self.w_proj = nn.Sequential(
                 nn.Linear(self.hidden_size, 32, bias=False),
-                nn.Linear(32, self.kv_dim, bias=False)
+                nn.Linear(32, out_w, bias=False),
             )
-        # In MQA/GQA settings, key/value heads are shared, so we use a standard linear projection
-        # which doesn't introduce too many parameters
         else:
-            self.w_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
+            self.w_proj = nn.Linear(self.hidden_size, out_w, bias=False)
 
         # TODO: per head norm?
         if use_qk_norm:
@@ -75,14 +78,21 @@ class PaTHAttention(nn.Module):
             self.maybe_k_norm = nn.Identity()
 
         if use_w_shortconv:
-            self.w_conv1d = ShortConvolution(hidden_size=self.kv_dim, kernel_size=conv_size, bias=conv_bias, activation='silu')
+            # 卷积的通道数也改成 2R 倍
+            self.w_conv1d = ShortConvolution(hidden_size=out_w, kernel_size=conv_size,
+                                             bias=conv_bias, activation='silu')
         self.use_w_shortconv = use_w_shortconv
-        self.bt_proj = nn.Linear(self.hidden_size, self.num_kv_heads, bias=True)
+        # β: 每个频带一个 β 门（范围 0~2）
+        self.bt_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.r, bias=True)
+
         self.use_forget_gate = use_forget_gate
         if use_forget_gate:
             self.g_proj = nn.Linear(self.hidden_size, self.num_heads, bias=True)
-        self.o_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
 
+        self.o_proj = nn.Linear(self.hidden_size * self.r, self.hidden_size, bias=False)
+        Hf = 1 if share_freq_across_heads else self.num_kv_heads
+        self.omega = nn.Parameter(0.01 * torch.ones(1, 1, Hf, self.r))  # 小值初始化更稳
+        self.phi   = nn.Parameter(torch.zeros(1, 1, Hf, self.r))
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -123,26 +133,47 @@ class PaTHAttention(nn.Module):
         )
         # Training
         if attention_mask is None:
+            B, T, _ = hidden_states.size()
+            pos = torch.arange(T, device=hidden_states.device, dtype=hidden_states.dtype)[None, :, None, None]  # [1,T,1,1]
+            omega = self.omega if not self.share_freq_across_heads else self.omega.expand(1,1,self.num_kv_heads,self.r)
+            phi   = self.phi   if not self.share_freq_across_heads else self.phi.expand(1,1,self.num_kv_heads,self.r)
+            theta = omega * pos + phi                           # [1,T,H,R]
+            c, s = torch.cos(theta), torch.sin(theta)
             assert use_cache is False, "use_cache should be False in training"
+            w_raw = self.w_proj(hidden_states)
             if self.use_w_shortconv:
-                w, _ = self.w_conv1d(w, cache=None, output_final_state=False, cu_seqlens=cu_seqlens)
-            
+                w_raw, _ = self.w_conv1d(w_raw, cache=None, output_final_state=False, cu_seqlens=kwargs.get('cu_seqlens', None))
+          
+            # [B,T,H,2R,d]
+            w2 = rearrange(w_raw, 'b t (h rr d) -> b t h rr d', h=self.num_kv_heads, rr=2*self.r, d=self.head_dim)
+            A = w2[:, :, :, 0::2, :]                            # [B,T,H,R,d]
+            B_ = w2[:, :, :, 1::2, :]                           # [B,T,H,R,d]
+            # 广播到 [B,T,H,R,d]
+            c = c.to(A.dtype).expand(B, T, self.num_kv_heads, self.r)[..., None]
+            s = s.to(A.dtype).expand(B, T, self.num_kv_heads, self.r)[..., None]
+            W = A * c + B_ * s                                  # [B,T,H,R,d]
+            W = l2_norm(W)                          
             # 重排所有张量到多头格式
-            q = rearrange(q, '... (h d) -> ... h d', d=self.head_dim)
-            k = rearrange(k, '... (h d) -> ... h d', d=self.head_dim)
-            v = rearrange(v, '... (h d) -> ... h d', d=self.head_dim)
-            w = rearrange(w, '... (h d) -> ... h d', d=self.head_dim)
-            w = l2_norm(w)
-            
-            # 确保维度正确
-            # beta: [B, T, num_kv_heads] ✓
-            # g: [B, T, num_heads] ✓ (如果存在)
-            
-            # 计算缩放因子
-            
-            o, _ = parallel_path_attn(
-                q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens, use_cache=False
-            )
+            beta = self.bt_proj(hidden_states).sigmoid() * 2    # [B,T,H*R]
+            beta = rearrange(beta, 'b t (h r) -> b t h r', h=self.num_kv_heads, r=self.r)
+            q = rearrange(q, 'b t (h d) -> b t h d', d=self.head_dim)
+            k = rearrange(k, 'b t (h d) -> b t h d', d=self.head_dim)
+            v = rearrange(v, 'b t (h d) -> b t h d', d=self.head_dim)
+
+            # 展开：repeat_interleave 比较直接
+            q = q.repeat_interleave(self.r, dim=2)              # [B,T,H*R,d]
+            k = k.repeat_interleave(self.r, dim=2)
+            v = v.repeat_interleave(self.r, dim=2)
+            w = rearrange(W, 'b t h r d -> b t (h r) d')        # [B,T,H*R,d]
+            beta = rearrange(beta, 'b t h r -> b t (h r)')      # [B,T,H*R]
+
+            if g is not None:
+                g = rearrange(g, 'b t h -> b t h 1').repeat(1,1,1*self.r,1).squeeze(-1)
+
+            # 5) 调 parallel_path_attn（签名不变）
+            o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g,
+                                    cu_seqlens=kwargs.get('cu_seqlens', None), use_cache=False)
+
 
         # Prefilling or decoding
         else:
@@ -232,7 +263,7 @@ class PaTHAttention(nn.Module):
                         offset=q_len
                     )
             o = pad_input(o.squeeze(0), indices_q, batch_size, q_len)
-        o = rearrange(o, '... h d -> ... (h d)')
+        o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
         ##!!!
         o = self.o_proj(o)
         return o, None, past_key_values

@@ -253,7 +253,6 @@ def chunk_scaled_dot_kkt_fwd(
     """
     B, T, H, K = k.shape
     BT = chunk_size
-    pdb.set_trace()
     chunk_indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
     if gk is None:
