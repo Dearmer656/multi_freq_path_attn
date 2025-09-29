@@ -17,6 +17,8 @@ from fla.modules.l2norm import l2_norm
 from fla.ops.attn.decoding import attn_decoding_one_step
 from fla.ops.path_attn.parallel import parallel_path_attn
 
+import math
+
 if TYPE_CHECKING:
     from fla.models.utils import Cache
 
@@ -45,7 +47,8 @@ class PaTHAttention(nn.Module):
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.r = num_harmonics
-        self.share_freq_across_heads = share_freq_across_heads        
+        self.use_w_shortconv = use_w_shortconv
+        self.share_freq_across_heads = share_freq_across_heads
         if num_kv_heads is None:
             self.num_kv_heads = self.num_heads
         else:
@@ -60,14 +63,19 @@ class PaTHAttention(nn.Module):
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
 
         # We use low-rank parameterization for the w_proj to reduce parameters in MHA settings.
-        out_w = self.kv_dim * (2 * self.r)
+        out_w_branch = self.num_kv_heads * self.r * self.head_dim
         if use_low_rank_w:
-            self.w_proj = nn.Sequential(
+            self.wA_proj = nn.Sequential(
                 nn.Linear(self.hidden_size, 32, bias=False),
-                nn.Linear(32, out_w, bias=False),
+                nn.Linear(32, out_w_branch, bias=False),
             )
+            self.wB_proj = nn.Sequential(
+                nn.Linear(self.hidden_size, 32, bias=False),
+                nn.Linear(32, out_w_branch, bias=False),
+            )            
         else:
-            self.w_proj = nn.Linear(self.hidden_size, out_w, bias=False)
+            self.wA_proj = nn.Linear(self.hidden_size, out_w_branch, bias=False)
+            self.wB_proj = nn.Linear(self.hidden_size, out_w_branch, bias=False)
 
         # TODO: per head norm?
         if use_qk_norm:
@@ -79,8 +87,12 @@ class PaTHAttention(nn.Module):
 
         if use_w_shortconv:
             # 卷积的通道数也改成 2R 倍
-            self.w_conv1d = ShortConvolution(hidden_size=out_w, kernel_size=conv_size,
-                                             bias=conv_bias, activation='silu')
+            self.wA_conv1d = ShortConvolution(
+                hidden_size=out_w_branch, kernel_size=conv_size, bias=conv_bias, activation='silu'
+            )
+            self.wB_conv1d = ShortConvolution(
+                hidden_size=out_w_branch, kernel_size=conv_size, bias=conv_bias, activation='silu'
+            )          
         self.use_w_shortconv = use_w_shortconv
         # β: 每个频带一个 β 门（范围 0~2）
         self.bt_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.r, bias=True)
@@ -90,9 +102,14 @@ class PaTHAttention(nn.Module):
             self.g_proj = nn.Linear(self.hidden_size, self.num_heads, bias=True)
 
         self.o_proj = nn.Linear(self.hidden_size * self.r, self.hidden_size, bias=False)
+
+        # 频率/相位参数：按开关决定 Hf；初始化为“近 0 频率、相位 0”
         Hf = 1 if share_freq_across_heads else self.num_kv_heads
-        self.omega = nn.Parameter(0.01 * torch.ones(1, 1, Hf, self.r))  # 小值初始化更稳
-        self.phi   = nn.Parameter(torch.zeros(1, 1, Hf, self.r))
+        self.omega_raw = nn.Parameter(torch.full((1,1,Hf,self.r), -8.0))  # ~0
+        self.omega_scale = 2*math.pi / (512 * 16.0)
+        self.phi = nn.Parameter(torch.zeros(1,1,Hf,self.r))
+        nn.init.constant_(self.bt_proj.bias, -2.0)  # β 小一点
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -115,8 +132,6 @@ class PaTHAttention(nn.Module):
         q = self.q_proj(hidden_states)
         k = self.k_proj(hidden_states)
         v = self.v_proj(hidden_states)
-        w = self.w_proj(hidden_states)
-        beta = self.bt_proj(hidden_states).sigmoid() * 2  # allowing negative eigenvalues
         g = F.logsigmoid(self.g_proj(hidden_states).float()) if self.use_forget_gate else None
         # print(torch.max(q), torch.max(k))
         # print()
@@ -135,20 +150,26 @@ class PaTHAttention(nn.Module):
         if attention_mask is None:
             B, T, _ = hidden_states.size()
             pos = torch.arange(T, device=hidden_states.device, dtype=hidden_states.dtype)[None, :, None, None]  # [1,T,1,1]
-            omega = self.omega if not self.share_freq_across_heads else self.omega.expand(1,1,self.num_kv_heads,self.r)
-            phi   = self.phi   if not self.share_freq_across_heads else self.phi.expand(1,1,self.num_kv_heads,self.r)
-            theta = omega * pos + phi                           # [1,T,H,R]
-            c, s = torch.cos(theta), torch.sin(theta)
+            omega = self.omega_scale * F.softplus(self.omega_raw)  # [1,1,H,R]  ← 每个 head 一组
+            phi   = self.phi                                       # [1,1,H,R]
+            theta = omega * pos + phi                              # [1,T,H,R]
+            c = torch.cos(theta).to(hidden_states.dtype)  # [1,T,H,R]
+            s = torch.sin(theta).to(hidden_states.dtype)  # [1,T,H,R]
             assert use_cache is False, "use_cache should be False in training"
-            w_raw = self.w_proj(hidden_states)
+            wA = self.wA_proj(hidden_states)  # [B,T, H*R*d]
             if self.use_w_shortconv:
-                w_raw, _ = self.w_conv1d(w_raw, cache=None, output_final_state=False, cu_seqlens=kwargs.get('cu_seqlens', None))
-          
-            # [B,T,H,2R,d]
-            w2 = rearrange(w_raw, 'b t (h rr d) -> b t h rr d', h=self.num_kv_heads, rr=2*self.r, d=self.head_dim)
-            A = w2[:, :, :, 0::2, :]                            # [B,T,H,R,d]
-            B_ = w2[:, :, :, 1::2, :]                           # [B,T,H,R,d]
-            # 广播到 [B,T,H,R,d]
+                wA, _ = self.wA_conv1d(wA, cache=None, output_final_state=False,
+                                        cu_seqlens=kwargs.get('cu_seqlens', None))
+            A = rearrange(wA, 'b t (h r d) -> b t h r d',
+                        h=self.num_kv_heads, r=self.r, d=self.head_dim)  # [B,T,H,R,d]
+
+            # --- B 分支 ---
+            wB = self.wB_proj(hidden_states)  # [B,T, H*R*d]
+            if self.use_w_shortconv:
+                wB, _ = self.wB_conv1d(wB, cache=None, output_final_state=False,
+                                        cu_seqlens=kwargs.get('cu_seqlens', None))
+            B_ = rearrange(wB, 'b t (h r d) -> b t h r d',
+                        h=self.num_kv_heads, r=self.r, d=self.head_dim)
             c = c.to(A.dtype).expand(B, T, self.num_kv_heads, self.r)[..., None]
             s = s.to(A.dtype).expand(B, T, self.num_kv_heads, self.r)[..., None]
             W = A * c + B_ * s                                  # [B,T,H,R,d]
