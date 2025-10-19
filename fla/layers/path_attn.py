@@ -9,7 +9,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
-from transformers.utils import logging
 
 from fla.layers.utils import pad_input, unpad_input
 from fla.modules import RMSNorm, ShortConvolution
@@ -24,9 +23,25 @@ from scipy.signal import find_peaks
 if TYPE_CHECKING:
     from fla.models.utils import Cache
 
-logger = logging.get_logger(__name__)
 
 import pdb
+def build_causal_mask(q_len: int,
+                      k_len: int | None = None,
+                      past_kv_len: int = 0,
+                      device=None,
+                      dtype=torch.bool):
+    """
+    返回形状 (1, 1, q_len, k_len_total) 的布尔mask，
+    True=保留；False=屏蔽。
+    k_len_total = (past_kv_len + (k_len if k_len is not None else q_len))
+    """
+    if k_len is None:
+        k_len = q_len
+    total_k = past_kv_len + k_len
+    i = torch.arange(q_len, device=device).unsqueeze(1) + past_kv_len  # query 位置（对齐到全局K坐标）
+    j = torch.arange(total_k, device=device).unsqueeze(0)               # key 位置（全局）
+    mask = (i >= j)  # 下三角（含对角）
+    return mask.view(1, 1, q_len, total_k).to(dtype)
 def log_line_fig(tensor, name, y_min=None, y_max=None, sigma=200):    
     # 将 tensor 转换为 numpy 数组
     tensor = tensor.cpu().detach().numpy()
@@ -90,9 +105,20 @@ class PaTHAttention(nn.Module):
         conv_bias: bool = False,
         # NEW ↓↓↓
         num_harmonics: int = 1,   # rank 数，=1 退化为原版
+        use_wavelet_beta: bool = False,
+        wavelet_mode: str = "additive",   # "additive" | "softmix"
+        logging_steps: int = 1000,
+        wavelet_baseline_use: bool = False,
+        attn_pdrop=0.1,
+        init_theta=0.847,   # initial theta for path attention ratio
     ):
         super().__init__()
+        # logging / steps
+        self.logging_steps = 1000
+        self.steps = 0
 
+        self.use_wavelet_beta = use_wavelet_beta
+        self.wavelet_mode = wavelet_mode
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.r = int(num_harmonics)
@@ -109,7 +135,7 @@ class PaTHAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
 
-        # w 分支输出扩到 H*R*d（保持你原有低秩/全连接两种实现）
+        # w 分支输出扩到 H*R*d
         out_w = self.kv_dim * self.r
         if use_low_rank_w:
             self.w_proj = nn.Sequential(
@@ -119,7 +145,7 @@ class PaTHAttention(nn.Module):
         else:
             self.w_proj = nn.Linear(self.hidden_size, out_w, bias=False)
 
-        # Q/K 归一保持和原版一致
+        # Q/K 归一
         if use_qk_norm:
             self.maybe_q_norm = RMSNorm(self.hidden_size)
             self.maybe_k_norm = RMSNorm(self.kv_dim)
@@ -127,7 +153,7 @@ class PaTHAttention(nn.Module):
             self.maybe_q_norm = nn.Identity()
             self.maybe_k_norm = nn.Identity()
 
-        # depthwise short conv 的通道也扩到 H*R*d
+        # depthwise short conv 对拼接后的 H*R*d
         self.use_w_shortconv = use_w_shortconv
         if use_w_shortconv:
             self.w_conv1d = ShortConvolution(
@@ -137,20 +163,69 @@ class PaTHAttention(nn.Module):
         # 每个 (head, rank) 一个 beta
         self.bt_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.r, bias=True)
 
+        # 可选 FoX 遗忘门
         self.use_forget_gate = use_forget_gate
         if use_forget_gate:
             self.g_proj = nn.Linear(self.hidden_size, self.num_heads, bias=True)
 
-        # 输出层输入维度改为 H*R*d（= hidden_size * R），映射回 hidden_size
+        # 输出层（H*R*d → hidden_size）
         self.o_proj = nn.Linear(self.hidden_size * self.r, self.hidden_size, bias=False)
+        self.wavelet_baseline_use = wavelet_baseline_use
+        if wavelet_baseline_use:
+            self.attn_dropout = nn.Dropout(attn_pdrop)
+            self.path_attention_ratio = nn.Parameter(torch.tensor(init_theta)) 
+        # ===== Wavelet(beta) 参数 =====
+        if use_wavelet_beta:
+            H = self.num_kv_heads
+
+            # 1) 你的新要求：指数项可学，且初始化为负数序列
+            #    e = [-2*(h//2) for h in range(H)]  → [0,0,-2,-2,-4,-4,...,-10,-10] 当 H=12
+            # exp_list   = [-2 * (h // 2) for h in range(H)]
+            # exp_list = [-1e6] * H
+            exp_list = [0] * H
+            shift_list = [float(h % 2) for h in range(H)]  # [0,1,0,1,...]
+
+            self.ricker_scale_exp   = torch.tensor(exp_list, dtype=torch.float32, device='cuda').unsqueeze(1)  # [H,1]
+            self.ricker_shift = torch.tensor(shift_list, dtype=torch.float32, device='cuda').unsqueeze(1)  # [H,1]
+
+            # exp_init   = torch.tensor(exp_list, dtype=torch.float32).view(1,1,H,1).repeat(1,1,1,self.r)
+            # shift_init = torch.tensor(shift_list, dtype=torch.float32).view(1,1,H,1).repeat(1,1,1,self.r)
+
+            # ★ e 是可学习参数；scale = 2**e 在 forward 里计算
+            # self.ricker_scale_exp = nn.Parameter(exp_init)        # [1,1,H,r]
+            # self.ricker_shift     = nn.Parameter(shift_init)      # [1,1,H,r]
+
+            # 振幅：从 0 起，不扰动基线
+            # self.ricker_amp = nn.Parameter(torch.ones(1, 1, H, self.r, dtype=torch.float32))
+
+            # softmix 的可学习混合系数
+            # self.mix_logit = nn.Parameter(torch.tensor(1.0)) if wavelet_mode == "softmix" else None
+
+    # 小工具：按 head 打印
+    def _log_head_vector(self, name: str, vec: torch.Tensor, fmt: str = "{:.4f}", topk: Optional[int] = None):
+        try:
+            v = vec.detach().float().cpu()
+            vals = v.tolist()
+            if isinstance(vals, float):  # 标量容错
+                msg = fmt.format(vals)
+            else:
+                if topk is not None and len(vals) > topk:
+                    msg = " ".join(f"h{i}:{fmt.format(vals[i])}" for i in range(topk))
+                    msg += f" ... (+{len(vals)-topk} heads)"
+                else:
+                    msg = " ".join(f"h{i}:{fmt.format(x)}" for i, x in enumerate(vals))
+            self.logger.info(f"{name}: {msg}")
+        except Exception as e:
+            print(f"[PaTHAttention][log error] {name}: {e}")
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[Cache] = None,
+        past_key_values: Optional[Tuple[torch.Tensor]] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        wavelet_decay_table: Optional[torch.Tensor] = None,  # [B,T,H,] or None
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
@@ -163,11 +238,11 @@ class PaTHAttention(nn.Module):
                 "Arbitrary attention masks of shape [batch_size, seq_len, seq_len] are not allowed."
             )
 
-        q = self.q_proj(hidden_states)           # [B,T,HQ*d]
-        k = self.k_proj(hidden_states)           # [B,T,H*d]   (H = num_kv_heads)
+        q = self.q_proj(hidden_states)           # [B,T,Hq*d]
+        k = self.k_proj(hidden_states)           # [B,T,H*d]
         v = self.v_proj(hidden_states)           # [B,T,H*d]
         w = self.w_proj(hidden_states)           # [B,T,H*R*d]
-        beta = self.bt_proj(hidden_states).sigmoid() * 2  # [B,T,H*R]
+        beta_logits = self.bt_proj(hidden_states)  # [B,T,H*R]
         g = F.logsigmoid(self.g_proj(hidden_states).float()) if self.use_forget_gate else None
 
         q, k = self.maybe_q_norm(q), self.maybe_k_norm(k)
@@ -176,43 +251,115 @@ class PaTHAttention(nn.Module):
             "cu_seqlens should not be provided when attention_mask is not None"
         )
 
-        # 训练路径（和你给的版本保持一致）
+        # ========= 训练路径（mask=None）=========
         if attention_mask is None:
             assert use_cache is False, "use_cache should be False in training"
 
-            # w 分支卷积（对拼接后的 H*R*d）
+            # w 分支卷积
             if self.use_w_shortconv:
                 w, _ = self.w_conv1d(w, cache=None, output_final_state=False, cu_seqlens=cu_seqlens)
 
             # 整理到多头格式
-            q = rearrange(q, 'b t (h d) -> b t h d', d=self.head_dim)                     # HQ 可能 != H
-            k = rearrange(k, 'b t (h d) -> b t h d',  d=self.head_dim)                     # H
-            v = rearrange(v, 'b t (h d) -> b t h d',  d=self.head_dim)                     # H
+            q = rearrange(q, 'b t (h d) -> b t h d', d=self.head_dim)                     # HQ
+            k = rearrange(k, 'b t (h d) -> b t h d', d=self.head_dim)                     # H
+            v = rearrange(v, 'b t (h d) -> b t h d', d=self.head_dim)                     # H
             W = rearrange(w, 'b t (h r d) -> b t h r d', h=self.num_kv_heads, r=self.r, d=self.head_dim)  # [B,T,H,R,d]
-            W = l2_norm(W)  # 对最后一维 d 做 L2 归一
-
-            # 把 rank 维并到头维：q/k/v 重复 R 倍；w/beta reshape 合并
+            W = l2_norm(W)
+            if self.wavelet_baseline_use:
+                qk = torch.matmul(q.transpose(1, 2), k.transpose(1, 2).transpose(-1, -2))
+                rel = torch.einsum("blhd,dln->blhn", q, wavelet_decay_table)
+                rel= rel.transpose(1, 2)
+                wavelet_bias = (qk + rel) / torch.full(
+                    [], self.head_dim ** 0.5, dtype=q.dtype, device=q.device
+                )
+                mask_value = torch.finfo(wavelet_bias.dtype).min
+                # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+                # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+                mask_value = torch.full([], mask_value, dtype=wavelet_bias.dtype, device=wavelet_bias.device)
+                wavelet_bias = torch.where(build_causal_mask(rel.size(-1),rel.size(-1), device='cuda'), wavelet_bias.to(wavelet_bias.dtype), mask_value)
+                wavelet_bias = nn.functional.softmax(wavelet_bias, dim=-1)
+                wavelet_bias = self.attn_dropout(wavelet_bias)
+                attn_output = torch.matmul(wavelet_bias, v.transpose(1, 2))
+            # rank 展开
             q = q.repeat_interleave(self.r, dim=2)                                         # [B,T,HQ*R,d]
             k = k.repeat_interleave(self.r, dim=2)                                         # [B,T,H*R,d]
             v = v.repeat_interleave(self.r, dim=2)                                         # [B,T,H*R,d]
             w = rearrange(W, 'b t h r d -> b t (h r) d')                                   # [B,T,H*R,d]
-            beta = rearrange(beta, 'b t (h r) -> b t (h r)', h=self.num_kv_heads, r=self.r)
 
-            # g（若开启）也在 HQ 维做 repeat_interleave(R)
+            # === Wavelet(beta)（可选）===
+            wave = None
+            if getattr(self, "use_wavelet_beta", False):
+                B, T = hidden_states.shape[:2]
+                # pos ∈ [-T+1, ..., 0]，末位为中心
+                pos_end = torch.arange(0, T, device=hidden_states.device).unsqueeze(0).to(hidden_states.dtype)  # [1,T,1,1]
+
+                # 指数项可学：scale = 2**e，e 初始为负序列，窗更宽/衰减更慢
+                e = self.ricker_scale_exp.to(hidden_states.dtype)                          # [1,1,H,r]
+                scale = torch.exp2(e)                                                      # [1,1,H,r]
+                shift = self.ricker_shift.to(hidden_states.dtype)                          # [1,1,H,r]
+
+                # 扩展到 [B,T,H,r]
+                # scale = scale.expand(1, T, self.num_kv_heads, self.r).expand(B, T, self.num_kv_heads, self.r)
+                # shift = shift.expand(1, T, self.num_kv_heads, self.r).expand_as(scale)
+
+                # t_affine = scale * (pos_end - shift)
+                t_affine = scale * (pos_end - shift)                                       # [B,T,H,r]
+
+                # Ricker（无 σ 版本）
+                psi = (1.0 - t_affine**2) * torch.exp(-0.5 * t_affine**2)     
+                wave = (psi - psi.min(dim=1, keepdim=True)[0]) / (psi.max(dim=1, keepdim=True)[0] - psi.min(dim=1, keepdim=True)[0] + 1e-6)             # [B,T,H,r]
+                # wave = psi - psi.mean(dim=1, keepdim=True)
+                # psi = psi - psi.mean(dim=1, keepdim=True)
+
+                # wave = (self.ricker_amp.to(beta_logits.dtype).expand_as(psi) * psi).to(beta_logits.dtype)  # [B,T,H,r]
+                # wave = rearrange(wave, 'b t h r -> b t (h r)')                             # [B,T,H*R]
+
+                # if self.wavelet_mode == "additive":
+                #     beta_logits = beta_logits + wave
+                #     beta = torch.sigmoid(beta_logits) * 2.0
+                # elif self.wavelet_mode == "softmix":
+                #     beta_base = torch.sigmoid(beta_logits) * 2.0
+                #     beta_gate = torch.sigmoid(beta_logits + wave) * 2.0
+                #     lam = torch.sigmoid(self.mix_logit)
+                #     beta = (1 - lam) * beta_base + lam * beta_gate
+                # else:
+                #     raise ValueError(f"Unknown wavelet_mode: {self.wavelet_mode}")
+            beta = torch.sigmoid(beta_logits) * 2.0
+            # per-head logging（参数 + 运行时）
+            self.steps += 1
+            if torch.cuda.current_device() == 0:
+                if (self.logging_steps > 0) and (self.steps % self.logging_steps == 0):
+                    try:
+                        # 参数向量：沿 (B_like=0,1 和 r) reduce，保留 H
+                        # amp_head     = self.ricker_amp.mean(dim=(0,1,3))                   # [H]
+                        # scale_exp_hd = self.ricker_scale_exp.mean(dim=(0,1,3))             # [H]
+                        # shift_head   = self.ricker_shift.mean(dim=(0,1,3))                 # [H]
+                        ratio_head    = self.path_attention_ratio if self.wavelet_baseline_use else torch.tensor(1.0)
+                        print(f"layer{self.layer_idx}: path attention ratio:",   ratio_head)
+                        # 运行时（如果有 wavelet）：psi 的按 head 平均幅值
+                        # if self.use_wavelet_beta:
+                        #     psi_head_mean = psi.mean(dim=(0,1,3))                           # [H]
+                        #     print(f"layer{self.layer_idx}: psi_mean_by_head", psi_head_mean)
+                    except Exception as e:
+                        print(f"[PaTHAttention][log error] {e}")
+
+            # g（若开启）扩到 R
             if g is not None:
                 g = rearrange(g, 'b t hq -> b t hq 1').repeat(1, 1, self.r, 1).view(g.shape[0], g.shape[1], -1)
 
-            # 直接调原内核（接口不变）
+            # 核心 op
+
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
 
-            # 合并回隐维，再做输出投影（H*R*d → hidden_size）
+            # 合并回隐维 → 输出投影
+            # theta = torch.sigmoid(self.path_attention_ratio) if self.wavelet_baseline_use else torch.tensor(1.0)
+            # o = theta * o + (1-theta) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
+            o = self.path_attention_ratio * o + (1-self.path_attention_ratio) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
             return o, None, past_key_values
 
-        # 你给的这份类没有实现 mask≠None 的预填充/解码分支；保持不变
-        # 如需推理/缓存，请把原版的 Prefill/Decode 分支也做同样的 rank 展开（和上面训练分支一致的思路）。
-        # 这里直接走训练同款（仅为完整性，通常不会在 mask!=None 时进入这里）：
+        # ========= 其它路径（mask!=None）：最小实现 =========
         if self.use_w_shortconv:
             w, _ = self.w_conv1d(w, cache=None, output_final_state=False, cu_seqlens=cu_seqlens)
         q = rearrange(q, 'b t (h d) -> b t hq d', d=self.head_dim)
@@ -224,14 +371,17 @@ class PaTHAttention(nn.Module):
         k = k.repeat_interleave(self.r, dim=2)
         v = v.repeat_interleave(self.r, dim=2)
         w = rearrange(W, 'b t h r d -> b t (h r) d')
-        beta = rearrange(beta, 'b t (h r) -> b t (h r)', h=self.num_kv_heads, r=self.r)
+
+        # 先得到 beta（最小实现里不叠 wavelet；如需，可复用上面的代码段）
+        beta = torch.sigmoid(beta_logits) * 2.0
+
         if g is not None:
             g = rearrange(g, 'b t hq -> b t hq 1').repeat(1, 1, self.r, 1).view(g.shape[0], g.shape[1], -1)
+
         o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
         o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
         o = self.o_proj(o)
         return o, None, past_key_values
-
 # class PaTHAttention(nn.Module):
 #     def __init__(
 #         self,
@@ -445,6 +595,7 @@ class PaTHAttentionWfreq(nn.Module):
         wavelet_mode: str = "additive",   # "additive" | "softmix"
     ):
         super().__init__()
+        self.use_wavelet_beta = False
         self.use_beta_modulation = use_beta_modulation 
         self.single_A_B = single_A_B
         self.hidden_size = hidden_size
@@ -518,19 +669,20 @@ class PaTHAttentionWfreq(nn.Module):
         self.log2e = math.log(2.0)
 
         # ----- 相位参数：周期内比例 -----
-        
-        self.phi_raw = nn.Parameter(torch.zeros(1,1,Hf,self.r))        
-        nn.init.constant_(self.bt_proj.bias, -2.0)  # β 小一点
-        self.use_wavelet_beta = use_wavelet_beta           # 开关：想先关就置 False
-        self.wavelet_mode = wavelet_mode        # "additive" 或 "softmix"
-        self.beta_amp = nn.Parameter(torch.zeros(1,1,Hf,self.r))
-        # 幅度 a（从 0 起，不扰动基线），σ 的安全参数化，给个下限避免太尖
-        self.ricker_amp   = nn.Parameter(torch.zeros(1,1,Hf,self.r))              # a
-        self.ricker_log_s = nn.Parameter(torch.full((1,1,Hf,self.r), -0.7))       # softplus 后再加下限
-        self.sigma_min = 8.0                                                       # token 级下限，可按需要调
 
-        # 若选择 softmix，这个是可学习的混合系数 λ 的 logit
-        self.mix_logit = nn.Parameter(torch.tensor(0.0)) if True else None  # 若只用 additive 可删
+        H = self.num_kv_heads
+        # 12个头：e=[0,0,2,2,4,4,6,6,8,8,10,10]
+        exp_list   = [2 * (h // 2) for h in range(H)]         # [0,0,2,2,...,10,10]
+        shift_list = [float(h % 2) for h in range(H)]         # [0,1,0,1,...,1]
+
+        # 形状 [1,1,H,1] 再在 r 维复制
+        exp_init   = torch.tensor(exp_list, dtype=torch.float32).view(1,1,H,1).repeat(1,1,1,self.r)
+        shift_init = torch.tensor(shift_list, dtype=torch.float32).view(1,1,H,1).repeat(1,1,1,self.r)
+
+        # ★ e 是可学习参数；scale = 2**e 在 forward 里计算
+        self.ricker_scale_exp = nn.Parameter(exp_init)        # [1,1,H,r]  ← 学这个“指数”
+        self.ricker_shift     = nn.Parameter(shift_init)      # [1,1,H,r]  ← 直接学 shift（按 token）
+        self.mix_logit = nn.Parameter(torch.tensor(0.0)) if wavelet_mode == "softmix" else None
     def get_omega(self):
         raw = self.omega_raw.clamp(min=-20, max=20)
         return self.omega_base * torch.exp(raw * self.log2e)
@@ -643,43 +795,33 @@ class PaTHAttentionWfreq(nn.Module):
             freq = rearrange(freq, 'b t h r -> b t (h r)')            # [B,T,H*R]
             beta_logits = beta_logits + freq
         if getattr(self, "use_wavelet_beta", False):
-            # 末位对齐：pos ∈ [-T+1, ..., 0]，在 0 处峰值
+            # 末位对齐：pos ∈ [-T+1, ..., 0]，0 处峰值
             pos_end = torch.arange(-T+1, 1, device=hidden_states.device).view(1, T, 1, 1).to(hidden_states.dtype)  # [1,T,1,1]
 
-            # σ 安全参数化
-            sigma = F.softplus(self.ricker_log_s) + self.sigma_min                     # [1,1,Hf,r]
+            # σ（token 级，带下限）
+            # sigma = F.softplus(self.ricker_log_s) + self.sigma_min              # [1,1,H,r]
 
-            # === 将 get_omega / get_phi 应用于 wavelet 的时间轴 ===
-            omega_w = self.get_omega()                                                 # [1,1,Hf,r]
-            phi_w   = self.get_phi()                                                   # [1,1,Hf,r]
+            # === 指数项可学：scale = 2**e ===
+            e = self.ricker_scale_exp.to(hidden_states.dtype)                   # [1,1,H,r]
+            # 可选护栏：e = e.clamp(-2, 12)
+            scale = torch.exp2(e)                                               # [1,1,H,r]
+            shift = self.ricker_shift.to(hidden_states.dtype)                   # [1,1,H,r]
 
-            # 把相位/频率换算到“token 轴”的仿射参数：
-            # scale: 相对 omega_base 的无量纲缩放；shift_tokens: 相位对应的 token 级平移
-            scale = (omega_w / self.omega_base).to(hidden_states.dtype)                # [1,1,Hf,r]
-            shift_tokens = (phi_w / (omega_w + 1e-6)).to(hidden_states.dtype)          # [1,1,Hf,r]
+            # 扩展到 [B,T,H,r]
+            scale = scale.expand(1, T, self.num_kv_heads, self.r).expand(B, T, self.num_kv_heads, self.r)
+            shift = shift.expand(1, T, self.num_kv_heads, self.r).expand_as(scale)
+            # sigma_full = sigma.expand(1, T, self.num_kv_heads, self.r).expand_as(scale)
 
-            # 广播到 [1,T,Hf,r]
-            scale = scale.expand(1, T, scale.size(2), scale.size(3))
-            shift_tokens = shift_tokens.expand_as(scale)
+            # 仿射时间轴：t_affine = scale * (pos_end - shift)
+            t_affine = scale * (pos_end - shift)                                # [B,T,H,r]
 
-            # 先平移再缩放：t_affine = scale * (pos_end - shift_tokens)
-            t_affine = scale * (pos_end - shift_tokens)                                # [1,T,Hf,r]
-
-            # 归一化距离 τ，用于 Ricker
-            tau = t_affine / (sigma + 1e-6)                                            # [1,T,Hf,r]
-
-            psi = (1.0 - tau**2) * torch.exp(-0.5 * tau**2)                            # [1,T,Hf,r]
+            # Ricker
+            # tau = t_affine / (sigma_full + 1e-6)
+            psi = (1.0 - t_affine**2) * torch.exp(-0.5 * t_affine**2)                    # [B,T,H,r]
             psi = psi - psi.mean(dim=1, keepdim=True)
-            wave = (self.ricker_amp * psi).to(beta_logits.dtype)                       # [1,T,Hf,r]
-            pdb.set_trace()
-            # 展到 [B,T,H,R] 再拉平
-            Hf = wave.size(2)
-            if Hf == 1:
-                wave = wave.expand(B, T, self.num_kv_heads, self.r)                    # [B,T,H,r]
-            else:
-                wave = wave.expand(B, T, Hf, self.r)
-            wave = rearrange(wave, 'b t h r -> b t (h r)')                             # [B,T,H*R]
 
+            wave = (self.ricker_amp.to(beta_logits.dtype).expand_as(psi) * psi).to(beta_logits.dtype)  # [B,T,H,r]
+            wave = rearrange(wave, 'b t h r -> b t (h r)')                      # [B,T,H*R]
             if self.wavelet_mode == "additive":
                 beta_logits = beta_logits + wave
                 beta = torch.sigmoid(beta_logits) * 2.0
