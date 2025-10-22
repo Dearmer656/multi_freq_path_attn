@@ -288,7 +288,7 @@ class PaTHAttention(nn.Module):
 
             # === Wavelet(beta)（可选）===
             wave = None
-            if getattr(self, "use_wavelet_beta", False):
+            if getattr(self, "use_soft_wavelet_fox", False):
                 B, T = hidden_states.shape[:2]
                 # pos ∈ [-T+1, ..., 0]，末位为中心
                 pos_end = torch.arange(0, T, device=hidden_states.device).unsqueeze(0).to(hidden_states.dtype)  # [1,T,1,1]
@@ -349,12 +349,13 @@ class PaTHAttention(nn.Module):
 
             # 核心 op
 
-            o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
+            o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens, decay_table=wavelet_decay_table, use_wavelet_decay=wavelet_decay_table is not Nont)
 
             # 合并回隐维 → 输出投影
-            # theta = torch.sigmoid(self.path_attention_ratio) if self.wavelet_baseline_use else torch.tensor(1.0)
-            # o = theta * o + (1-theta) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
-            o = self.path_attention_ratio * o + (1-self.path_attention_ratio) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
+            if self.wavelet_baseline_use:
+                theta = torch.sigmoid(self.path_attention_ratio) if self.wavelet_baseline_use else torch.tensor(1.0)
+                o = theta * o + (1-theta) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
+            # o = self.path_attention_ratio * o + (1-self.path_attention_ratio) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
             return o, None, past_key_values

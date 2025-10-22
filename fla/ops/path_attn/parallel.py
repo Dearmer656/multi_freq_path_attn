@@ -28,7 +28,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, w, beta, g, scale, cu_seqlens, use_cache=False):
+    def forward(ctx, q, k, v, w, beta, g, scale, cu_seqlens, use_cache=False, wavelet_decay_table=None, use_wavelet_decay=False):
 
         g_cumsum = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, output_dtype=torch.float32) if g is not None else None
         BS = 64 if check_shared_mem('hopper') else 32
@@ -75,8 +75,12 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             BT=BT,
             BS=BS,
         )
+        saved = [q, k, v, w, g_cumsum, o, beta, L, A]
+        if use_wavelet_decay:
+            saved.append(wavelet_decay_table)
+            ctx.has_decay_table = True
+        ctx.save_for_backward(*saved)
         k_cache = prepare_k_cache_fn(k=k_new, w1=w, w2=w2, cu_seqlens=cu_seqlens, BS=BS, use_cache=use_cache)
-        ctx.save_for_backward(q, k, v, w, g_cumsum, o, beta, L, A)
         ctx.scale = scale
         ctx.cu_seqlens = cu_seqlens
         return o, k_cache
@@ -229,7 +233,9 @@ def parallel_path_attn(
     g: Optional[torch.Tensor] = None,
     scale: float = None,
     cu_seqlens: Optional[torch.Tensor] = None,
-    use_cache: bool = False
+    use_cache: bool = False,
+    wavelet_decay_table: Optional[torch.Tensor] = None,
+    use_wavelet_decay: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -273,7 +279,7 @@ def parallel_path_attn(
     if g is not None:
         assert g.shape[:3] == q.shape[:3], 'g should have the same number of heads as q'
     assert q.shape[-2] % k.shape[-2] == 0, 'the number of query heads should be divisible by the number of key heads'
-    o, k_cache = ParallelPATHAttentionFunction.apply(q, k, v, w, beta, g, scale, cu_seqlens, use_cache)
+    o, k_cache = ParallelPATHAttentionFunction.apply(q, k, v, w, beta, g, scale, cu_seqlens, use_cache, wavelet_decay_table, use_wavelet_decay)
     return o, k_cache
 
 parallel_path_attention = parallel_path_attn
