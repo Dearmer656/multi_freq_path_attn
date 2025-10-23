@@ -32,6 +32,7 @@ def chunk_transform_qk_bwd_kernel_prepare(
     offsets,  # varlen helper
     chunk_offsets,  # varlen helper
     T,
+    wavelet_decay_table,
     G: tl.constexpr,
     HQ: tl.constexpr,
     H: tl.constexpr,
@@ -42,7 +43,8 @@ def chunk_transform_qk_bwd_kernel_prepare(
     BT: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_GATE: tl.constexpr,
-    RETURN_H: tl.constexpr
+    RETURN_H: tl.constexpr,
+    USE_WAVELET_DECAY: tl.constexpr,
 ):
     i_t, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hq = i_nh // HQ, i_nh % HQ
@@ -98,8 +100,44 @@ def chunk_transform_qk_bwd_kernel_prepare(
     b_qw = tl.where(m_t, tl.dot(b_q, tl.trans(b_w.to(b_q.dtype))), 0).to(b_q.dtype)
     b_qwT = tl.dot(b_qw, b_T.to(b_q.dtype)).to(b_q.dtype)
     b_wbk = tl.where(o_i[:, None] > o_i[None, :], tl.dot(b_w.to(b_kt.dtype), b_kt), 0).to(b_q.dtype)
-    b_A = tl.where(m_t, tl.dot(b_q, b_kt) - tl.dot(b_qwT, b_wbk), 0)
+    ############################
+    ### 2025/10/22 Edit
+    ### intra chunk Wavelet Decay
+    ############################
+    if USE_WAVELET_DECAY:
+        # 用 fp32 累加，最后再转回
+        decay_btbk = tl.zeros((BT, BT), dtype=tl.float32)
 
+        # 预生成行索引（放在循环外）
+        rows = tl.arange(0, BT)[:, None]  # (BT, 1)
+
+        for tt in range(0, BT):
+            base_slice = wavelet_decay_table + tt * BT
+            p_wdec = tl.make_block_ptr(base_slice, (BK, BT), (BT*BT, 1), (0, 0), (BK, BT), (1, 0))
+            b_decay = tl.load(p_wdec, boundary_check=(0, 1))  # (BK, BT)
+
+            p_q_row = tl.make_block_ptr(
+                q, (T, K), (HQ*K, 1),
+                (i_t * BT + tt, 0),
+                (1, BK),
+                (1, 0)
+            )
+            q_row = tl.load(p_q_row, boundary_check=(0, 1)).to(tl.float32)  # (1, BK)
+
+            # (1×BK) * (BK×BT) -> (1×BT)，用转置+逐元素乘+sum，避免 tl.dot 的布局限制
+            b_decay_T = tl.trans(b_decay.to(tl.float32))   # (BT, BK)
+            row_bt    = tl.sum(b_decay_T * q_row, axis=1)  # (BT,)
+
+            # 用掩码把 row 写入第 tt 行
+            mask = (rows == tt)                             # (BT, 1)
+            decay_btbk += tl.where(mask, row_bt[None, :], 0.0)
+
+        # 若后续 b_A 用的是 b_q.dtype，这里再转回
+        decay_btbk = decay_btbk.to(b_q.dtype)
+        b_A = tl.where(m_t, tl.dot(b_q, b_kt) - tl.dot(b_qwT, b_wbk) + decay_btbk, 0)
+    else:
+        b_A = tl.where(m_t, tl.dot(b_q, b_kt) - tl.dot(b_qwT, b_wbk), 0)
+    ############################
     b_q = b_q.to(tl.float32) - tl.dot(b_qwT, b_w.to(b_qwT.dtype))
     p_q_new = tl.make_block_ptr(q_new, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, K), (1, 0))
     tl.store(p_q_new, b_q.to(p_q_new.dtype.element_ty), boundary_check=(0, 1))
@@ -142,7 +180,7 @@ def chunk_transform_qk_bwd_kernel_prepare(
     tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
 
 
-def intra_chunk_preprocess_bwd_prepare_fn(q, k, v, w, beta, g_cumsum, A, L, D, do, scale, return_h=True, cu_seqlens=None):
+def intra_chunk_preprocess_bwd_prepare_fn(q, k, v, w, beta, g_cumsum, A, L, D, do, scale, return_h=True, cu_seqlens=None, wavelet_decay_table=None, use_wavelet_decay=False):
     BT = A.shape[-1]
     HQ = q.shape[-2]
     B, T, H, K = k.shape
@@ -191,6 +229,8 @@ def intra_chunk_preprocess_bwd_prepare_fn(q, k, v, w, beta, g_cumsum, A, L, D, d
         BK=triton.next_power_of_2(K),
         BV=triton.next_power_of_2(V),
         BT=BT,
-        RETURN_H=return_h
+        RETURN_H=return_h,
+        wavelet_decay_table=wavelet_decay_table,
+        USE_WAVELET_DECAY=1 if use_wavelet_decay else 0,
     )
     return q_new, k_new, h, dA_local, dv, dg_cumsum

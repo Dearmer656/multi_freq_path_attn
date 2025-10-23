@@ -111,12 +111,13 @@ class PaTHAttention(nn.Module):
         wavelet_baseline_use: bool = False,
         attn_pdrop=0.1,
         init_theta=0.847,   # initial theta for path attention ratio
+        use_soft_wavelet_fox: bool = False,
     ):
         super().__init__()
         # logging / steps
         self.logging_steps = 1000
         self.steps = 0
-
+        self.use_soft_wavelet_fox = use_soft_wavelet_fox
         self.use_wavelet_beta = use_wavelet_beta
         self.wavelet_mode = wavelet_mode
         self.hidden_size = hidden_size
@@ -175,7 +176,7 @@ class PaTHAttention(nn.Module):
             self.attn_dropout = nn.Dropout(attn_pdrop)
             self.path_attention_ratio = nn.Parameter(torch.tensor(init_theta)) 
         # ===== Wavelet(beta) 参数 =====
-        if use_wavelet_beta:
+        if use_wavelet_beta or use_soft_wavelet_fox:
             H = self.num_kv_heads
 
             # 1) 你的新要求：指数项可学，且初始化为负数序列
@@ -349,7 +350,7 @@ class PaTHAttention(nn.Module):
 
             # 核心 op
 
-            o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens, decay_table=wavelet_decay_table, use_wavelet_decay=wavelet_decay_table is not Nont)
+            o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens, wavelet_decay_table=wavelet_decay_table, use_wavelet_decay=wavelet_decay_table is not None)
 
             # 合并回隐维 → 输出投影
             if self.wavelet_baseline_use:
@@ -795,46 +796,46 @@ class PaTHAttentionWfreq(nn.Module):
                 freq = freq.expand(B, T, Hf, self.r)
             freq = rearrange(freq, 'b t h r -> b t (h r)')            # [B,T,H*R]
             beta_logits = beta_logits + freq
-        if getattr(self, "use_wavelet_beta", False):
-            # 末位对齐：pos ∈ [-T+1, ..., 0]，0 处峰值
-            pos_end = torch.arange(-T+1, 1, device=hidden_states.device).view(1, T, 1, 1).to(hidden_states.dtype)  # [1,T,1,1]
+        # if getattr(self, "use_wavelet_beta", False):
+        #     # 末位对齐：pos ∈ [-T+1, ..., 0]，0 处峰值
+        #     pos_end = torch.arange(-T+1, 1, device=hidden_states.device).view(1, T, 1, 1).to(hidden_states.dtype)  # [1,T,1,1]
 
-            # σ（token 级，带下限）
-            # sigma = F.softplus(self.ricker_log_s) + self.sigma_min              # [1,1,H,r]
+        #     # σ（token 级，带下限）
+        #     # sigma = F.softplus(self.ricker_log_s) + self.sigma_min              # [1,1,H,r]
 
-            # === 指数项可学：scale = 2**e ===
-            e = self.ricker_scale_exp.to(hidden_states.dtype)                   # [1,1,H,r]
-            # 可选护栏：e = e.clamp(-2, 12)
-            scale = torch.exp2(e)                                               # [1,1,H,r]
-            shift = self.ricker_shift.to(hidden_states.dtype)                   # [1,1,H,r]
+        #     # === 指数项可学：scale = 2**e ===
+        #     e = self.ricker_scale_exp.to(hidden_states.dtype)                   # [1,1,H,r]
+        #     # 可选护栏：e = e.clamp(-2, 12)
+        #     scale = torch.exp2(e)                                               # [1,1,H,r]
+        #     shift = self.ricker_shift.to(hidden_states.dtype)                   # [1,1,H,r]
 
-            # 扩展到 [B,T,H,r]
-            scale = scale.expand(1, T, self.num_kv_heads, self.r).expand(B, T, self.num_kv_heads, self.r)
-            shift = shift.expand(1, T, self.num_kv_heads, self.r).expand_as(scale)
-            # sigma_full = sigma.expand(1, T, self.num_kv_heads, self.r).expand_as(scale)
+        #     # 扩展到 [B,T,H,r]
+        #     scale = scale.expand(1, T, self.num_kv_heads, self.r).expand(B, T, self.num_kv_heads, self.r)
+        #     shift = shift.expand(1, T, self.num_kv_heads, self.r).expand_as(scale)
+        #     # sigma_full = sigma.expand(1, T, self.num_kv_heads, self.r).expand_as(scale)
 
-            # 仿射时间轴：t_affine = scale * (pos_end - shift)
-            t_affine = scale * (pos_end - shift)                                # [B,T,H,r]
+        #     # 仿射时间轴：t_affine = scale * (pos_end - shift)
+        #     t_affine = scale * (pos_end - shift)                                # [B,T,H,r]
 
-            # Ricker
-            # tau = t_affine / (sigma_full + 1e-6)
-            psi = (1.0 - t_affine**2) * torch.exp(-0.5 * t_affine**2)                    # [B,T,H,r]
-            psi = psi - psi.mean(dim=1, keepdim=True)
+        #     # Ricker
+        #     # tau = t_affine / (sigma_full + 1e-6)
+        #     psi = (1.0 - t_affine**2) * torch.exp(-0.5 * t_affine**2)                    # [B,T,H,r]
+        #     psi = psi - psi.mean(dim=1, keepdim=True)
 
-            wave = (self.ricker_amp.to(beta_logits.dtype).expand_as(psi) * psi).to(beta_logits.dtype)  # [B,T,H,r]
-            wave = rearrange(wave, 'b t h r -> b t (h r)')                      # [B,T,H*R]
-            if self.wavelet_mode == "additive":
-                beta_logits = beta_logits + wave
-                beta = torch.sigmoid(beta_logits) * 2.0
-            elif self.wavelet_mode == "softmix":
-                beta_base = torch.sigmoid(beta_logits) * 2.0
-                beta_gate = torch.sigmoid(beta_logits + wave) * 2.0
-                lam = torch.sigmoid(self.mix_logit)
-                beta = (1 - lam) * beta_base + lam * beta_gate
-            else:
-                raise ValueError(f"Unknown wavelet_mode: {self.wavelet_mode}")
-        else:
-            beta = torch.sigmoid(beta_logits) * 2.0
+        #     wave = (self.ricker_amp.to(beta_logits.dtype).expand_as(psi) * psi).to(beta_logits.dtype)  # [B,T,H,r]
+        #     wave = rearrange(wave, 'b t h r -> b t (h r)')                      # [B,T,H*R]
+        #     if self.wavelet_mode == "additive":
+        #         beta_logits = beta_logits + wave
+        #         beta = torch.sigmoid(beta_logits) * 2.0
+        #     elif self.wavelet_mode == "softmix":
+        #         beta_base = torch.sigmoid(beta_logits) * 2.0
+        #         beta_gate = torch.sigmoid(beta_logits + wave) * 2.0
+        #         lam = torch.sigmoid(self.mix_logit)
+        #         beta = (1 - lam) * beta_base + lam * beta_gate
+        #     else:
+        #         raise ValueError(f"Unknown wavelet_mode: {self.wavelet_mode}")
+        # else:
+        beta = torch.sigmoid(beta_logits) * 2.0
 
         # === ④ FoX 门形状扩展（如启用，不要重算 g）===
         if g is not None:

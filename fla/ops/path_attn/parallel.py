@@ -57,6 +57,8 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             scale=scale,
             BT=BS,
             cu_seqlens=cu_seqlens,
+            wavelet_decay_table=wavelet_decay_table[:, :BS, :BS] if use_wavelet_decay else None,
+            use_wavelet_decay=use_wavelet_decay,
         )
         w_fp16 = w.to(torch.float16)
         w2_fp16 = w2.to(torch.float16)
@@ -78,7 +80,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
         saved = [q, k, v, w, g_cumsum, o, beta, L, A]
         if use_wavelet_decay:
             saved.append(wavelet_decay_table)
-            ctx.has_decay_table = True
+            ctx.use_decay_table = True
         ctx.save_for_backward(*saved)
         k_cache = prepare_k_cache_fn(k=k_new, w1=w, w2=w2, cu_seqlens=cu_seqlens, BS=BS, use_cache=use_cache)
         ctx.scale = scale
@@ -89,7 +91,10 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
     @input_guard
     @autocast_custom_bwd
     def backward(ctx, do, dk_new):
-        q, k, v, w, g_cumsum, o, beta, L, A = ctx.saved_tensors
+        if ctx.use_decay_table:
+            q, k, v, w, g_cumsum, o, beta, L, A, wavelet_decay_table = ctx.saved_tensors
+        else:
+            q, k, v, w, g_cumsum, o, beta, L, A = ctx.saved_tensors
         BT = 128 if check_shared_mem('ampere') else 64
         BS = 64 if check_shared_mem('hopper') else 32
         S = 512
@@ -110,6 +115,8 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             scale=ctx.scale,
             cu_seqlens=cu_seqlens,
             return_h=False,
+            wavelet_decay_table=wavelet_decay_table[:, :BS, :BS],
+            use_wavelet_decay=ctx.use_decay_table
         )
         w_fp16 = w.to(torch.float16)
         h_fp16 = h.to(torch.float16)
@@ -220,7 +227,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
         return (dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), dw.to(w.dtype),
                 dbeta.to(beta.dtype),
                 dg_cumsum.to(g_cumsum.dtype) if g_cumsum is not None else None,
-                None, None, None, None)
+                None, None, None, None, None)
 
 
 @torch.compiler.disable
