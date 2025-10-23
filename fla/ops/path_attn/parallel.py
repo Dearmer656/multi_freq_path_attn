@@ -63,6 +63,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
         w_fp16 = w.to(torch.float16)
         w2_fp16 = w2.to(torch.float16)
         o, L = parallel_path_fwd_fn(
+            _q=q if use_wavelet_decay else None,
             q=q_new,
             k=k_new,
             v=v,
@@ -76,6 +77,8 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             BT=BT,
             BS=BS,
+            wavelet_decay_table=wavelet_decay_table if use_wavelet_decay else None,
+            use_wavelet_decay=use_wavelet_decay,
         )
         saved = [q, k, v, w, g_cumsum, o, beta, L, A]
         if use_wavelet_decay:

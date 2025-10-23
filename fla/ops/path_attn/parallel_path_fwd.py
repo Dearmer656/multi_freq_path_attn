@@ -11,6 +11,7 @@ from fla.ops.utils import prepare_chunk_indices
 })
 @triton.jit(do_not_specialize=['T'])
 def parallel_path_fwd_kernel(
+    _q,
     q,
     k,
     v,
@@ -26,6 +27,7 @@ def parallel_path_fwd_kernel(
     cu_seqlens,
     indices,
     T,
+    wavelet_decay_table,
     G: tl.constexpr,
     HQ: tl.constexpr,
     H: tl.constexpr,
@@ -37,6 +39,7 @@ def parallel_path_fwd_kernel(
     BV: tl.constexpr,
     USE_GATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    USE_WAVELET_DECAY: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -84,8 +87,44 @@ def parallel_path_fwd_kernel(
         b_w2 = tl.load(p_w2, boundary_check=(0, 1))
         # [BT, BS]
         m_s = i_t * BT + tl.arange(0, BT) >= (offset + BS)
-        b_s = tl.dot(b_q.to(b_k.dtype), b_k)
+    ###########################
+    ### 2025-10-23 Edit
+    ### inter chunk Wavelet Decay
+    ###########################
+        if USE_WAVELET_DECAY:
+            # 用 fp32 累加，最后再转回
+            decay_btbk = tl.zeros((BT, BS), dtype=tl.float32)
 
+            # 预生成行索引（放在循环外）
+            rows = tl.arange(0, BT)[:, None]  # (BT, 1)
+
+            for tt in range(0, BT):
+                base_slice = wavelet_decay_table + (i_t * BT) * T + offset
+                p_wdec = tl.make_block_ptr(base_slice, (BK, T), (T*T, 1), (0, 0), (BK, BS), (1, 0))
+                b_decay = tl.load(p_wdec, boundary_check=(0, 1))  # (BK, T)
+
+                p_q_row = tl.make_block_ptr(
+                    _q, (T, K), (HQ*K, 1),
+                    (i_t * BT + tt, 0),
+                    (1, BK),
+                    (1, 0)
+                )
+                q_row = tl.load(p_q_row, boundary_check=(0, 1)).to(tl.float32)  # (1, BK)
+
+                # (1×BK) * (BK×BT) -> (1×BT)，用转置+逐元素乘+sum，避免 tl.dot 的布局限制
+                b_decay_T = tl.trans(b_decay.to(tl.float32))   # (BS, BK)
+                row_bt    = tl.sum(b_decay_T * q_row, axis=1)  # (BT,)
+
+                # 用掩码把 row 写入第 tt 行
+                mask = (rows == tt)                             # (BT, 1)
+                decay_btbk += tl.where(mask, row_bt[None, :], 0.0)
+
+            # 若后续 b_A 用的是 b_q.dtype，这里再转回
+            decay_btbk = decay_btbk.to(b_q.dtype)
+            b_s = tl.dot(b_q.to(b_k.dtype), b_k) + decay_btbk
+        else:
+            b_s = tl.dot(b_q.to(b_k.dtype), b_k)
+    ###########################
         if USE_GATE:
             p_g_cumsum_k = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq), (T, ), (HQ, ), (offset, ), (BS, ), (0,))
             b_g_cumsum_k = tl.load(p_g_cumsum_k, boundary_check=(0,))
@@ -116,7 +155,44 @@ def parallel_path_fwd_kernel(
         b_w1 = tl.load(p_w1, boundary_check=(0, 1))
         b_w2 = tl.load(p_w2, boundary_check=(0, 1))
         # [BT, BS]
-        b_s = tl.dot(b_q.to(b_k.dtype), b_k)
+    ###########################
+    ### 2025-10-23 Edit
+    ### inter chunk Wavelet Decay
+    ###########################
+        if USE_WAVELET_DECAY:
+            # 用 fp32 累加，最后再转回
+            decay_btbk = tl.zeros((BT, BS), dtype=tl.float32)
+
+            # 预生成行索引（放在循环外）
+            rows = tl.arange(0, BT)[:, None]  # (BT, 1)
+
+            for tt in range(0, BT):
+                base_slice = wavelet_decay_table + (i_t * BT) * T + offset
+                p_wdec = tl.make_block_ptr(base_slice, (BK, T), (T*T, 1), (0, 0), (BK, BS), (1, 0))
+                b_decay = tl.load(p_wdec, boundary_check=(0, 1))  # (BK, T)
+
+                p_q_row = tl.make_block_ptr(
+                    _q, (T, K), (HQ*K, 1),
+                    (i_t * BT + tt, 0),
+                    (1, BK),
+                    (1, 0)
+                )
+                q_row = tl.load(p_q_row, boundary_check=(0, 1)).to(tl.float32)  # (1, BK)
+
+                # (1×BK) * (BK×BT) -> (1×BT)，用转置+逐元素乘+sum，避免 tl.dot 的布局限制
+                b_decay_T = tl.trans(b_decay.to(tl.float32))   # (BS, BK)
+                row_bt    = tl.sum(b_decay_T * q_row, axis=1)  # (BT,)
+
+                # 用掩码把 row 写入第 tt 行
+                mask = (rows == tt)                             # (BT, 1)
+                decay_btbk += tl.where(mask, row_bt[None, :], 0.0)
+
+            # 若后续 b_A 用的是 b_q.dtype，这里再转回
+            decay_btbk = decay_btbk.to(b_q.dtype)
+            b_s = tl.dot(b_q.to(b_k.dtype), b_k) + decay_btbk
+        else:
+            b_s = tl.dot(b_q.to(b_k.dtype), b_k)
+    ###########################
         if USE_GATE:
             p_g_cumsum_k = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq), (T, ), (HQ, ), (offset, ), (BS, ), (0,))
             b_g_cumsum_k = tl.load(p_g_cumsum_k, boundary_check=(0,))
@@ -141,6 +217,7 @@ def parallel_path_fwd_kernel(
 
 
 def parallel_path_fwd_fn(
+    _q,
     q,
     k,
     v,
@@ -154,6 +231,8 @@ def parallel_path_fwd_fn(
     cu_seqlens,
     BT,
     BS,
+    wavelet_decay_table,
+    use_wavelet_decay,
 ):
     B, T, HQ, K = q.shape
     V = v.shape[-1]
@@ -166,6 +245,7 @@ def parallel_path_fwd_fn(
     L_new = torch.empty_like(L)
 
     parallel_path_fwd_kernel[grid](
+        _q=_q,
         q=q,
         k=k,
         v=v,
@@ -190,6 +270,8 @@ def parallel_path_fwd_fn(
         H=H,
         BS=BS,
         BT=BT,
-        num_warps=8 if (BT == 128 and K == 128) else 4
+        num_warps=8 if (BT == 128 and K == 128) else 4,
+        USE_WAVELET_DECAY=use_wavelet_decay,
+        wavelet_decay_table=wavelet_decay_table,
     )
     return o_new, L_new
