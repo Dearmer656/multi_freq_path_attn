@@ -289,26 +289,26 @@ class PaTHAttention(nn.Module):
 
             # === Wavelet(beta)（可选）===
             wave = None
-            if getattr(self, "use_soft_wavelet_fox", False):
-                B, T = hidden_states.shape[:2]
-                # pos ∈ [-T+1, ..., 0]，末位为中心
-                pos_end = torch.arange(0, T, device=hidden_states.device).unsqueeze(0).to(hidden_states.dtype)  # [1,T,1,1]
+            # if getattr(self, "use_soft_wavelet_fox", False):
+            #     B, T = hidden_states.shape[:2]
+            #     # pos ∈ [-T+1, ..., 0]，末位为中心
+            #     pos_end = torch.arange(0, T, device=hidden_states.device).unsqueeze(0).to(hidden_states.dtype)  # [1,T,1,1]
 
-                # 指数项可学：scale = 2**e，e 初始为负序列，窗更宽/衰减更慢
-                e = self.ricker_scale_exp.to(hidden_states.dtype)                          # [1,1,H,r]
-                scale = torch.exp2(e)                                                      # [1,1,H,r]
-                shift = self.ricker_shift.to(hidden_states.dtype)                          # [1,1,H,r]
+            #     # 指数项可学：scale = 2**e，e 初始为负序列，窗更宽/衰减更慢
+            #     e = self.ricker_scale_exp.to(hidden_states.dtype)                          # [1,1,H,r]
+            #     scale = torch.exp2(e)                                                      # [1,1,H,r]
+            #     shift = self.ricker_shift.to(hidden_states.dtype)                          # [1,1,H,r]
 
-                # 扩展到 [B,T,H,r]
-                # scale = scale.expand(1, T, self.num_kv_heads, self.r).expand(B, T, self.num_kv_heads, self.r)
-                # shift = shift.expand(1, T, self.num_kv_heads, self.r).expand_as(scale)
+            #     # 扩展到 [B,T,H,r]
+            #     # scale = scale.expand(1, T, self.num_kv_heads, self.r).expand(B, T, self.num_kv_heads, self.r)
+            #     # shift = shift.expand(1, T, self.num_kv_heads, self.r).expand_as(scale)
 
-                # t_affine = scale * (pos_end - shift)
-                t_affine = scale * (pos_end - shift)                                       # [B,T,H,r]
+            #     # t_affine = scale * (pos_end - shift)
+            #     t_affine = scale * (pos_end - shift)                                       # [B,T,H,r]
 
-                # Ricker（无 σ 版本）
-                psi = (1.0 - t_affine**2) * torch.exp(-0.5 * t_affine**2)     
-                wave = (psi - psi.min(dim=1, keepdim=True)[0]) / (psi.max(dim=1, keepdim=True)[0] - psi.min(dim=1, keepdim=True)[0] + 1e-6)             # [B,T,H,r]
+            #     # Ricker（无 σ 版本）
+            #     psi = (1.0 - t_affine**2) * torch.exp(-0.5 * t_affine**2)     
+            #     wave = (psi - psi.min(dim=1, keepdim=True)[0]) / (psi.max(dim=1, keepdim=True)[0] - psi.min(dim=1, keepdim=True)[0] + 1e-6)             # [B,T,H,r]
                 # wave = psi - psi.mean(dim=1, keepdim=True)
                 # psi = psi - psi.mean(dim=1, keepdim=True)
 
