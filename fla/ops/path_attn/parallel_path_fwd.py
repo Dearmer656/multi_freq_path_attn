@@ -88,8 +88,8 @@ def parallel_path_fwd_kernel(
         # [BT, BS]
         m_s = i_t * BT + tl.arange(0, BT) >= (offset + BS)
     ###########################
-    ### 2025-10-23 Edit
-    ### inter chunk Wavelet Decay
+    ### 2025-10-24 Edit
+    ### debug the problem of operating with head0 all the time
     ###########################
         if USE_WAVELET_DECAY:
             # 用 fp32 累加，最后再转回
@@ -99,12 +99,12 @@ def parallel_path_fwd_kernel(
             rows = tl.arange(0, BT)[:, None]  # (BT, 1)
 
             for tt in range(0, BT):
-                base_slice = wavelet_decay_table + (i_t * BT) * T + offset
+                base_slice = wavelet_decay_table + (i_t * BT  + tt) * T + offset
                 p_wdec = tl.make_block_ptr(base_slice, (BK, T), (T*T, 1), (0, 0), (BK, BS), (1, 0))
                 b_decay = tl.load(p_wdec, boundary_check=(0, 1))  # (BK, T)
-
+                _q_base = _q + (bos*HQ + i_hq) * K
                 p_q_row = tl.make_block_ptr(
-                    _q, (T, K), (HQ*K, 1),
+                    _q_base, (T, K), (HQ*K, 1),
                     (i_t * BT + tt, 0),
                     (1, BK),
                     (1, 0)
@@ -156,8 +156,8 @@ def parallel_path_fwd_kernel(
         b_w2 = tl.load(p_w2, boundary_check=(0, 1))
         # [BT, BS]
     ###########################
-    ### 2025-10-23 Edit
-    ### inter chunk Wavelet Decay
+    ### 2025-10-24 Edit
+    ### debug the problem of operating with head0 all the time
     ###########################
         if USE_WAVELET_DECAY:
             # 用 fp32 累加，最后再转回
@@ -167,12 +167,12 @@ def parallel_path_fwd_kernel(
             rows = tl.arange(0, BT)[:, None]  # (BT, 1)
 
             for tt in range(0, BT):
-                base_slice = wavelet_decay_table + (i_t * BT) * T + offset
+                base_slice = wavelet_decay_table + (i_t * BT + tt) * T + offset
                 p_wdec = tl.make_block_ptr(base_slice, (BK, T), (T*T, 1), (0, 0), (BK, BS), (1, 0))
                 b_decay = tl.load(p_wdec, boundary_check=(0, 1))  # (BK, T)
-
+                _q_base = _q + (bos*HQ + i_hq) * K
                 p_q_row = tl.make_block_ptr(
-                    _q, (T, K), (HQ*K, 1),
+                    _q_base, (T, K), (HQ*K, 1),
                     (i_t * BT + tt, 0),
                     (1, BK),
                     (1, 0)
