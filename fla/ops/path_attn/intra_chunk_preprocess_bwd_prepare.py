@@ -180,7 +180,7 @@ def chunk_transform_qk_bwd_kernel_prepare(
     tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
 
 
-def intra_chunk_preprocess_bwd_prepare_fn(q, k, v, w, beta, g_cumsum, A, L, D, do, scale, return_h=True, cu_seqlens=None, wavelet_decay_table=None, use_wavelet_decay=False):
+def intra_chunk_preprocess_bwd_prepare_fn(q, k, v, w, beta, g_cumsum, A, L, D, do, scale, return_h=True, cu_seqlens=None, wavelet_decay_table=None, USE_WAVELET_DECAY=False):
     BT = A.shape[-1]
     HQ = q.shape[-2]
     B, T, H, K = k.shape
@@ -231,6 +231,6 @@ def intra_chunk_preprocess_bwd_prepare_fn(q, k, v, w, beta, g_cumsum, A, L, D, d
         BT=BT,
         RETURN_H=return_h,
         wavelet_decay_table=wavelet_decay_table,
-        USE_WAVELET_DECAY=1 if use_wavelet_decay else 0,
+        USE_WAVELET_DECAY=1 if USE_WAVELET_DECAY else 0,
     )
     return q_new, k_new, h, dA_local, dv, dg_cumsum

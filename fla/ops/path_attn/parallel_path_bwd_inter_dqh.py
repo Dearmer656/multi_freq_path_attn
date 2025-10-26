@@ -41,7 +41,7 @@ def parallel_path_bwd_dq_kernel(
     S: tl.constexpr,  # aka larger chunk size
     NUM_BLOCKS: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    USE_GATE: tl.constexpr
+    USE_GATE: tl.constexpr,
 ):
     i_t, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hq = i_nh // HQ, i_nh % HQ
@@ -195,6 +195,6 @@ def parallel_path_bwd_dq_fn(
         BV=BV,
         NUM_BLOCKS=num_blocks,
         num_warps=8 if (BT == 128 and K == 128) else 4,
-        num_stages=3 if check_shared_mem('ampere') else 2
+        num_stages=3 if check_shared_mem('ampere') else 2,
     )
     return dq, dhc_whole, dg_cumsum

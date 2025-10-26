@@ -13,13 +13,15 @@ from fla.ops.utils import prepare_chunk_indices
 def parallel_path_bwd_intra_chunk_kernel(
     q, k, v, g_cumsum, w1, w2,
     L, D,
-    dq, dq_new, dk, dv, dw1, dw2, do, dg_cumsum,
+    dq, dq_orig, dq_new, dk, dv, dw1, dw2, do, dg_cumsum,
     offsets, indices,
     T, scale,
+    wavelet_decay_table,
     G: tl.constexpr, HQ: tl.constexpr, H: tl.constexpr,
     K: tl.constexpr, V: tl.constexpr, BK: tl.constexpr,  BV: tl.constexpr,
     BT: tl.constexpr, S: tl.constexpr,
-    IS_VARLEN: tl.constexpr, USE_GATE: tl.constexpr
+    IS_VARLEN: tl.constexpr, USE_GATE: tl.constexpr,
+    USE_WAVELET_DECAY: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
@@ -42,6 +44,7 @@ def parallel_path_bwd_intra_chunk_kernel(
     q += (bos * HQ + i_hq) * K
     dq += (bos * HQ + i_hq) * K
     dq_new += (bos * HQ + i_hq) * K
+    dq_orig += (bos * HQ + i_hq) * K
     dk += (bos * HQ + i_hq) * K
     dv += (bos * HQ + i_hq) * V
     do += (bos * HQ + i_hq) * V
@@ -68,6 +71,7 @@ def parallel_path_bwd_intra_chunk_kernel(
     b_dq = tl.zeros([BT, BK], dtype=tl.float32)
     p_dq = tl.make_block_ptr(dq, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_dq += tl.load(p_dq, boundary_check=(0, 1))
+    b_dq_orig = tl.zeros([BT, BK], dtype=tl.float32)
     p_q = tl.make_block_ptr(q, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_q = tl.load(p_q, boundary_check=(0, 1))
 
@@ -134,9 +138,30 @@ def parallel_path_bwd_intra_chunk_kernel(
                       BK)[None, :], b_dw1, mask=mask[:, None], sem='relaxed')
         b_dq -= tl.dot(b_dA2, b_w1.to(b_v.dtype))
         b_dq += tl.dot(b_dA.to(b_k.dtype), b_k)
+        ##############################
+        # 2025/10/25 edit
+        # wavelet decay table backward
+        ##############################
+        if USE_WAVELET_DECAY:
+            rows = tl.arange(0, BT)                               # (BT,)
+            for tt in tl.static_range(0, BT):
+                # 读取 wavelet(i = i_t*BT + tt, j ∈ [offset, offset+BT)) -> (K, BT)，再转成 (BT, K)
+                base = wavelet_decay_table + (i_t * BT + tt) * T + offset
+                p_wdec = tl.make_block_ptr(base, (K, T), (T * T, 1), (0, 0), (K, BT), (1, 0))
+                wdec_KBT = tl.load(p_wdec, boundary_check=(0, 1)).to(tl.float32)   # (K, BT)
+                wdec_BTK = tl.trans(wdec_KBT)                                      # (BT, K)
 
+                # 一次性计算整个块的贡献： (BT, BT) @ (BT, K) -> (BT, K)
+                contrib_all = tl.dot(b_dA.to(tl.float32), wdec_BTK)                 # (BT, K)
+
+                # 只向第 tt 行写入：用 float 掩码避免 bool 运算参与乘法
+                row_mask_f32 = (rows == tt).to(tl.float32)[:, None]                 # (BT,1), float
+                b_dq_orig += (row_mask_f32 * contrib_all).to(b_dq_orig.dtype)         # (BT, BK)
+        ##############################
     p_dq_new = tl.make_block_ptr(dq_new, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     tl.store(p_dq_new, b_dq.to(dq_new.dtype.element_ty), boundary_check=(0, 1))
+    p_dq_orig = tl.make_block_ptr(dq_orig, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    tl.store(p_dq_orig, b_dq_orig.to(dq_orig.dtype.element_ty), boundary_check=(0, 1))
     mask = i_t * BT + tl.arange(0, BT) < T
     if USE_GATE:
         tl.atomic_add(dg_cumsum + (i_t * BT + tl.arange(0, BT)) * HQ, b_dgq, mask=mask, sem='relaxed')
@@ -148,6 +173,8 @@ def parallel_path_bwd_intra_chunk_fn(
     scale, L, D,
     cu_seqlens,
     S, BT,
+    wavelet_decay_table=None,
+    USE_WAVELET_DECAY=False
 ):
     assert dk.dtype == dv.dtype == dw1.dtype == dw2.dtype == torch.float32, 'atomic_add requires float32'
     B, T, HQ, K = q.shape
@@ -159,14 +186,17 @@ def parallel_path_bwd_intra_chunk_fn(
     indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(indices)
     dq_new = torch.empty_like(dq, dtype=q.dtype)
+    dq_orig = torch.empty_like(dq, dtype=q.dtype)
     parallel_path_bwd_intra_chunk_kernel[(NT, B*HQ)](
         q=q, k=k, v=v, g_cumsum=g_cumsum,
         w1=w1, w2=w2, L=L, D=D,
-        dq=dq, dq_new=dq_new, dk=dk, dv=dv, dw1=dw1, dw2=dw2,
+        dq=dq, dq_new=dq_new, dq_orig=dq_orig, dk=dk, dv=dv, dw1=dw1, dw2=dw2,
         do=do, dg_cumsum=dg_cumsum,
         offsets=cu_seqlens, indices=indices,
         T=T, S=S, BT=BT, scale=scale,
         G=G, HQ=HQ, H=H, K=K, V=V,
         BK=triton.next_power_of_2(K), BV=triton.next_power_of_2(V),
+        wavelet_decay_table=wavelet_decay_table if USE_WAVELET_DECAY else None,
+        USE_WAVELET_DECAY= 1 if USE_WAVELET_DECAY else 0,
     )
-    return dq_new, dk, dv, dw1, dw2, dg_cumsum
+    return dq_new, dk, dv, dw1, dw2, dg_cumsum, dq_orig

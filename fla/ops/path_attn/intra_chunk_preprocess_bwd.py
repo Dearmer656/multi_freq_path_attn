@@ -14,11 +14,11 @@ from fla.utils import check_shared_mem
 def intra_chunk_preprocess_bwd_kernel(
     q, k, w, w2, beta,
     AT,
-    dA_local, dq, dq_new, dk, dk_new, dw, dbeta, dw1, dw2, T,
-    offsets, indices,
+    dA_local, dq, dq_orig, dq_new, dk, dk_new, dw, dbeta, dw1, dw2, T,
+    offsets, indices, wavelet_decay_table,
     HQ: tl.constexpr, G: tl.constexpr, H: tl.constexpr,
     K: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr,
-    IS_VARLEN: tl.constexpr
+    IS_VARLEN: tl.constexpr, USE_WAVELET_DECAY: tl.constexpr,
 ):
     i_t, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hq = i_nh // HQ, i_nh % HQ
@@ -59,6 +59,9 @@ def intra_chunk_preprocess_bwd_kernel(
     b_dA_local = tl.load(p_dA_local, boundary_check=(0, 1))
 
     # # Twb part qw part.
+    p_dq_orig = tl.make_block_ptr(dq_orig + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
+    b_dq_orig = tl.load(p_dq_orig, boundary_check=(0, 1))
+
     p_dq = tl.make_block_ptr(dq + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_dq = tl.load(p_dq, boundary_check=(0, 1))
 
@@ -74,6 +77,32 @@ def intra_chunk_preprocess_bwd_kernel(
     b_dqw = tl.where(tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :], b_dqw, 0)
     b_dq += tl.dot(b_dA_local.to(b_k.dtype), b_k)
     b_dq += tl.dot(b_dqw.to(b_w.dtype), b_w)
+    b_dq += b_dq_orig
+    ##############################
+    # 2025/10/25 edit
+    # wavelet decay table backward
+    ##############################
+    if USE_WAVELET_DECAY:
+        rows = tl.arange(0, BT)  # (BT,)
+        for tt in tl.static_range(0, BT):
+            # 取固定 query 行 i=tt，对应 keys 的本地块 j∈[0, BT)
+            base = wavelet_decay_table + tt * BT
+            p_wdec = tl.make_block_ptr(
+                base, (BK, BT),           # (BK, BT)
+                (BT * BT, 1),             # strides: 沿 K 为 BT*BT，沿 j 为 1
+                (0, 0), (BK, BT),
+                (1, 0)
+            )
+            b_decay_KBT = tl.load(p_wdec, boundary_check=(0, 1)).to(tl.float32)  # (BK, BT)
+            b_decay_BTK = tl.trans(b_decay_KBT)                                  # (BT, BK)
+
+            # 整块贡献：(BT, BT) @ (BT, BK) -> (BT, BK)
+            contrib_all = tl.dot(b_dA_local.to(tl.float32), b_decay_BTK)         # (BT, BK)
+
+            # 仅向第 tt 行写入增量（用 float 掩码，避免 bool 参与算术）
+            row_mask_f32 = (rows == tt).to(tl.float32)[:, None]                  # (BT, 1)
+            b_dq += (row_mask_f32 * contrib_all).to(b_dq.dtype)          # (BT, BK)
+    ##############################
     b_dw += tl.dot(tl.trans(b_dqw.to(b_q.dtype)), b_q)
     p_q_new = tl.make_block_ptr(dq_new + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     tl.store(p_q_new, b_dq.to(dq_new.dtype.element_ty), boundary_check=(0, 1))
@@ -112,9 +141,10 @@ def intra_chunk_preprocess_bwd_kernel(
 
 
 def intra_chunk_preprocess_bwd_fn(q, k, w, w2, beta,
-                                  dq, dk, dA_local,
+                                  dq, dq_orig, dk, dA_local,
                                   dw1, dw2,
-                                  A, L, D, do, scale, cu_seqlens=None):
+                                  A, L, D, do, scale, cu_seqlens=None,
+                                  wavelet_decay_table=None, USE_WAVELET_DECAY=False):
     BT = A.shape[-1]
     HQ = q.shape[-2]
     B, T, H, K = k.shape
@@ -132,10 +162,12 @@ def intra_chunk_preprocess_bwd_fn(q, k, w, w2, beta,
     intra_chunk_preprocess_bwd_kernel[grid](
         q=q, k=k, w=w, w2=w2, beta=beta,
         AT=A,
-        dA_local=dA_local, dq=dq, dq_new=dq_new, dk=dk, dk_new=dk_new, dw=dw, dbeta=dbeta, dw1=dw1, dw2=dw2, T=T,
+        dA_local=dA_local, dq=dq, dq_orig=dq_orig, dq_new=dq_new, dk=dk, dk_new=dk_new, dw=dw, dbeta=dbeta, dw1=dw1, dw2=dw2, T=T,
         offsets=cu_seqlens, indices=indices,
         HQ=HQ, G=G, H=H,
         K=K, BT=BT, BK=triton.next_power_of_2(K),
-        num_stages=3 if check_shared_mem('hopper') else 1
+        num_stages=3 if check_shared_mem('hopper') else 1,
+        wavelet_decay_table=wavelet_decay_table if USE_WAVELET_DECAY else None,
+        USE_WAVELET_DECAY= 1 if USE_WAVELET_DECAY else 0,
     )
     return dq_new, dk_new, dbeta, dw
