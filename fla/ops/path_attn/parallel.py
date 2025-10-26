@@ -55,9 +55,9 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             g_cumsum=g_cumsum,
             A=A,
             scale=scale,
-            BT=BS,####!!!!
+            BT=BS,
             cu_seqlens=cu_seqlens,
-            wavelet_decay_table=wavelet_decay_table[:, :BS, :BS] if use_wavelet_decay else None,
+            wavelet_decay_table=wavelet_decay_table[:, :BS, :BS].contiguous() if use_wavelet_decay else None,
             use_wavelet_decay=use_wavelet_decay,
         )
         w_fp16 = w.to(torch.float16)
@@ -118,7 +118,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             scale=ctx.scale,
             cu_seqlens=cu_seqlens,
             return_h=False,
-            wavelet_decay_table=wavelet_decay_table[:, :BS, :BS],
+            wavelet_decay_table=wavelet_decay_table[:, :BS, :BS].contiguous() if ctx.use_wavelet_decay else None,
             USE_WAVELET_DECAY=ctx.use_wavelet_decay,
         )
         w_fp16 = w.to(torch.float16)
@@ -220,7 +220,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             do=do,
             scale=ctx.scale,
             cu_seqlens=cu_seqlens,
-            wavelet_decay_table=wavelet_decay_table[:, :BS, :BS] if ctx.use_wavelet_decay else None,
+            wavelet_decay_table=wavelet_decay_table[:, :BS, :BS].contiguous() if ctx.use_wavelet_decay else None,
             USE_WAVELET_DECAY=ctx.use_wavelet_decay,
         )
         G = q.shape[-2] // k.shape[-2]

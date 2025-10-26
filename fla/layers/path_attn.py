@@ -353,9 +353,9 @@ class PaTHAttention(nn.Module):
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens, wavelet_decay_table=wavelet_decay_table, use_wavelet_decay=wavelet_decay_table is not None)
 
             # 合并回隐维 → 输出投影
-            if self.wavelet_baseline_use:
-                theta = torch.sigmoid(self.path_attention_ratio) if self.wavelet_baseline_use else torch.tensor(1.0)
-                o = theta * o + (1-theta) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
+            # if self.wavelet_baseline_use:
+            #     theta = torch.sigmoid(self.path_attention_ratio) if self.wavelet_baseline_use else torch.tensor(1.0)
+            #     o = theta * o + (1-theta) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
             # o = self.path_attention_ratio * o + (1-self.path_attention_ratio) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
