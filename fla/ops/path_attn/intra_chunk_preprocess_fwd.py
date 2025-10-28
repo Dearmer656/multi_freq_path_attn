@@ -77,8 +77,8 @@ def intra_chunk_preprocess_fwd_kernel(
     p_v = tl.make_block_ptr(v, (T, V), (H*V, 1), (i_t * BT, 0), (BT, BV), (1, 0))
     p_beta = tl.make_block_ptr(beta, (T, ), (H, ), (i_t * BT, ), (BT, ), (0, ))
     p_T = tl.make_block_ptr(A, (T, BT), (BT*H, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-    p_theta = theta + i_h
-    s_theta = tl.load(p_theta)
+    # p_theta = theta + i_h
+    s_theta = tl.load(theta)
     b_beta = tl.load(p_beta, boundary_check=(0, ))
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_kt = tl.load(p_k, boundary_check=(0, 1))

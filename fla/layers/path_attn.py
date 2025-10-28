@@ -176,7 +176,9 @@ class PaTHAttention(nn.Module):
             self.attn_dropout = nn.Dropout(attn_pdrop)
             self.path_attention_ratio = nn.Parameter(torch.tensor(init_theta)) 
         if self.use_soft_wavelet_fox:
-            self.theta = nn.Parameter(torch.randn(num_heads) * 0.02)
+            self.theta = nn.Parameter(torch.randn(1) * 0.02)
+            # self.theta = nn.Parameter(torch.randn(num_heads) * 0.02)
+
         # ===== Wavelet(beta) 参数 =====
         # if use_wavelet_beta or use_soft_wavelet_fox:
         #     H = self.num_kv_heads
@@ -307,13 +309,14 @@ class PaTHAttention(nn.Module):
                             # shift_head   = self.ricker_shift.mean(dim=(0,1,3))                 # [H]
                             wavelet_bias = self.theta
                             for head_idx in range(self.num_heads):
-                                print(f"layer{self.layer_idx}: wavelet weight:",   wavelet_bias[head_idx].item())
+                                print(f"layer{self.layer_idx} head{head_idx}: wavelet weight:",   wavelet_bias[head_idx].item())
                             # 运行时（如果有 wavelet）：psi 的按 head 平均幅值
                             # if self.use_wavelet_beta:
                             #     psi_head_mean = psi.mean(dim=(0,1,3))                           # [H]
                             #     print(f"layer{self.layer_idx}: psi_mean_by_head", psi_head_mean)
                         except Exception as e:
-                            print(f"[PaTHAttention][log error] {e}")
+                            print(f"layer{self.layer_idx}: wavelet weight:",   self.theta.item())
+                            # print(f"[PaTHAttention][log error] {e}")
                 # wavelet_decay_table = self.theta * wavelet_decay_table
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens, wavelet_decay_table=wavelet_decay_table, theta=self.theta, use_wavelet_decay=wavelet_decay_table is not None)
 

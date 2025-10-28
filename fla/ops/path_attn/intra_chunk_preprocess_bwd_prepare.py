@@ -101,7 +101,7 @@ def chunk_transform_qk_bwd_kernel_prepare(
     b_qw = tl.where(m_t, tl.dot(b_q, tl.trans(b_w.to(b_q.dtype))), 0).to(b_q.dtype)
     b_qwT = tl.dot(b_qw, b_T.to(b_q.dtype)).to(b_q.dtype)
     b_wbk = tl.where(o_i[:, None] > o_i[None, :], tl.dot(b_w.to(b_kt.dtype), b_kt), 0).to(b_q.dtype)
-    s_theta = tl.load(theta + i_h)
+    s_theta = tl.load(theta)
     ############################
     ### 2025/10/22 Edit
     ### intra chunk Wavelet Decay

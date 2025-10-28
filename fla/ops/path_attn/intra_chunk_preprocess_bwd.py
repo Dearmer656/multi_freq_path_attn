@@ -49,7 +49,7 @@ def intra_chunk_preprocess_bwd_kernel(
     b_k = tl.load(p_k, boundary_check=(0, 1))
     b_T = tl.load(p_T, boundary_check=(0, 1))
     b_w_beta = (b_w * b_beta[:, None]).to(b_w.dtype)
-    s_theta = tl.load(theta + i_h)
+    s_theta = tl.load(theta)
 
     o_i = tl.arange(0, BT)
     b_qw = tl.where(o_i[:, None] >= o_i[None, :], tl.dot(b_q, tl.trans(b_w)), 0).to(b_q.dtype)
@@ -117,8 +117,8 @@ def intra_chunk_preprocess_bwd_kernel(
             b_dA_row = tl.sum(b_dA_local * row_mask_f32, axis=0)  # (BK,)
             dA_q_wave_local = tl.sum(b_dA_row * q_wave_local)
             b_dtheta += dA_q_wave_local
-        b_dtheta = tl.load(dtheta_inter + i_h) + b_dtheta
-        tl.atomic_add(dtheta + i_h, b_dtheta.to(dtheta.dtype.element_ty))
+        b_dtheta = tl.load(dtheta_inter) + b_dtheta
+        tl.atomic_add(dtheta, b_dtheta.to(dtheta.dtype.element_ty))
     ##############################
     b_dw += tl.dot(tl.trans(b_dqw.to(b_q.dtype)), b_q)
     p_q_new = tl.make_block_ptr(dq_new + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))

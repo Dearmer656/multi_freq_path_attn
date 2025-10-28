@@ -77,7 +77,7 @@ def parallel_path_bwd_intra_chunk_kernel(
     b_dq_orig = tl.zeros([BT, BK], dtype=tl.float32)
     p_q = tl.make_block_ptr(q, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_q = tl.load(p_q, boundary_check=(0, 1))
-    s_theta = tl.load(theta + i_h)
+    s_theta = tl.load(theta)
     if USE_GATE:
         p_gq_cumsum = tl.make_block_ptr(g_cumsum, (T, ), (HQ, ), (i_t * BT, ), (BT, ), (0, ))
         b_gq_cumsum = tl.load(p_gq_cumsum, boundary_check=(0, ))
@@ -174,7 +174,7 @@ def parallel_path_bwd_intra_chunk_kernel(
                 dA_q_wave = tl.sum(b_dA_row * q_wave)
                 b_dtheta_inter += dA_q_wave
     b_dq_orig = s_theta.to(b_dq_orig.dtype) * b_dq_orig
-    tl.atomic_add(dtheta_inter + i_h, b_dtheta_inter.to(dtheta_inter.dtype.element_ty))
+    tl.atomic_add(dtheta_inter, b_dtheta_inter.to(dtheta_inter.dtype.element_ty))
 
         ##############################
     p_dq_new = tl.make_block_ptr(dq_new, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))

@@ -74,7 +74,7 @@ def parallel_path_fwd_kernel(
         b_g_cumsum_q = None
 
     _q_base = _q + (bos*HQ + i_hq) * K
-    s_theta = tl.load(theta + i_h)
+    s_theta = tl.load(theta)
     for offset in range((i_t + 1) * BT - 2 * BS, i_t*BT-BS, -BS):
         p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, K*H), (0, offset), (BK, BS), (0, 1))  # GQA when H!=HQ
         p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (V*H, 1), (offset, 0), (BS, BV), (1, 0))  # GQA when H!=HQ
