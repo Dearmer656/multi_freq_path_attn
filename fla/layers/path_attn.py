@@ -173,7 +173,7 @@ class PaTHAttention(nn.Module):
         self.wavelet_baseline_use = wavelet_baseline_use
         if wavelet_baseline_use:
             self.attn_dropout = nn.Dropout(attn_pdrop)
-            self.path_attention_ratio = nn.Parameter(torch.tensor(init_theta)) 
+            self.path_attention_ratio = nn.Parameter(torch.ones(num_heads)) 
         # ===== Wavelet(beta) 参数 =====
         if use_wavelet_beta:
             H = self.num_kv_heads
@@ -326,22 +326,19 @@ class PaTHAttention(nn.Module):
                 #     raise ValueError(f"Unknown wavelet_mode: {self.wavelet_mode}")
             beta = torch.sigmoid(beta_logits) * 2.0
             # per-head logging（参数 + 运行时）
-            self.steps += 1
+            
             if torch.cuda.current_device() == 0:
+                self.steps += 1
                 if (self.logging_steps > 0) and (self.steps % self.logging_steps == 0):
                     try:
-                        # 参数向量：沿 (B_like=0,1 和 r) reduce，保留 H
-                        # amp_head     = self.ricker_amp.mean(dim=(0,1,3))                   # [H]
-                        # scale_exp_hd = self.ricker_scale_exp.mean(dim=(0,1,3))             # [H]
-                        # shift_head   = self.ricker_shift.mean(dim=(0,1,3))                 # [H]
-                        ratio_head    = self.path_attention_ratio if self.wavelet_baseline_use else torch.tensor(1.0)
-                        print(f"layer{self.layer_idx}: path attention ratio:",   ratio_head)
-                        # 运行时（如果有 wavelet）：psi 的按 head 平均幅值
-                        # if self.use_wavelet_beta:
-                        #     psi_head_mean = psi.mean(dim=(0,1,3))                           # [H]
-                        #     print(f"layer{self.layer_idx}: psi_mean_by_head", psi_head_mean)
+                        ratio_head = self.path_attention_ratio if self.wavelet_baseline_use else torch.tensor(1.0, device=hidden_states.device)
+                        vals = ratio_head.detach().cpu().tolist() if ratio_head.dim() > 0 else float(ratio_head)
+                        print(f"layer{self.layer_idx}: path attention ratio: {vals}")
                     except Exception as e:
-                        print(f"[PaTHAttention][log error] {e}")
+                        ratio_head    = self.path_attention_ratio if self.wavelet_baseline_use else torch.tensor(1.0)
+
+                        vals = ratio_head.detach().cpu().tolist()
+                        print(f"layer{self.layer_idx}: path attention ratio: {vals}")
 
             # g（若开启）扩到 R
             if g is not None:
@@ -354,7 +351,7 @@ class PaTHAttention(nn.Module):
             # 合并回隐维 → 输出投影
             # theta = torch.sigmoid(self.path_attention_ratio) if self.wavelet_baseline_use else torch.tensor(1.0)
             # o = theta * o + (1-theta) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
-            o = self.path_attention_ratio * o + (1-self.path_attention_ratio) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
+            o = self.path_attention_ratio[None, None, :, None] * o + (1-self.path_attention_ratio[None, None, :, None]) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
             return o, None, past_key_values
