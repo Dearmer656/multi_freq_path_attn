@@ -11,11 +11,12 @@ from fla.ops.utils import prepare_chunk_indices
 })
 @triton.jit(do_not_specialize=['T'])
 def parallel_path_bwd_intra_chunk_kernel(
-    q, k, v, g_cumsum, w1, w2,
+    q, k, orig_q, v, g_cumsum, w1, w2,
     L, D,
-    dq, dq_orig, dq_new, dk, dv, dw1, dw2, do, dg_cumsum,
+    dq, dq_orig, dq_new, dtheta_inter, dk, dv, dw1, dw2, do, dg_cumsum,
     offsets, indices,
     T, scale,
+    theta,
     wavelet_decay_table,
     G: tl.constexpr, HQ: tl.constexpr, H: tl.constexpr,
     K: tl.constexpr, V: tl.constexpr, BK: tl.constexpr,  BV: tl.constexpr,
@@ -42,6 +43,7 @@ def parallel_path_bwd_intra_chunk_kernel(
     w2 += (bos * H + i_h) * K
 
     q += (bos * HQ + i_hq) * K
+    orig_q += (bos * HQ + i_hq) * K
     dq += (bos * HQ + i_hq) * K
     dq_new += (bos * HQ + i_hq) * K
     dq_orig += (bos * HQ + i_hq) * K
@@ -71,10 +73,11 @@ def parallel_path_bwd_intra_chunk_kernel(
     b_dq = tl.zeros([BT, BK], dtype=tl.float32)
     p_dq = tl.make_block_ptr(dq, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_dq += tl.load(p_dq, boundary_check=(0, 1))
+    b_dtheta_inter = tl.zeros((), dtype=tl.float32)
     b_dq_orig = tl.zeros([BT, BK], dtype=tl.float32)
     p_q = tl.make_block_ptr(q, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_q = tl.load(p_q, boundary_check=(0, 1))
-
+    s_theta = tl.load(theta + i_h)
     if USE_GATE:
         p_gq_cumsum = tl.make_block_ptr(g_cumsum, (T, ), (HQ, ), (i_t * BT, ), (BT, ), (0, ))
         b_gq_cumsum = tl.load(p_gq_cumsum, boundary_check=(0, ))
@@ -145,6 +148,12 @@ def parallel_path_bwd_intra_chunk_kernel(
         if USE_WAVELET_DECAY:
             rows = tl.arange(0, BT)                               # (BT,)
             for tt in tl.static_range(0, BT):
+                p_orig_q_row = tl.make_block_ptr(
+                    orig_q, (T, K), (HQ * K, 1),
+                    (i_t * BT + tt, 0), (1, BK), (1, 0)
+                )
+                b_orig_q_row_2d = tl.load(p_orig_q_row, boundary_check=(0, 1))
+                # b_orig_q_row = tl.reshape(b_orig_q_row_2d, (BK,))  # (BK,)
                 # 读取 wavelet(i = i_t*BT + tt, j ∈ [offset, offset+BT)) -> (K, BT)，再转成 (BT, K)
                 base = wavelet_decay_table + (i_t * BT + tt) * T + offset
                 p_wdec = tl.make_block_ptr(base, (K, T), (T * T, 1), (0, 0), (K, BT), (1, 0))
@@ -157,6 +166,16 @@ def parallel_path_bwd_intra_chunk_kernel(
                 # 只向第 tt 行写入：用 float 掩码避免 bool 运算参与乘法
                 row_mask_f32 = (rows == tt).to(tl.float32)[:, None]                 # (BT,1), float
                 b_dq_orig += (row_mask_f32 * contrib_all).to(b_dq_orig.dtype)         # (BT, BK)
+
+                row_k = tl.reshape(b_orig_q_row_2d.to(tl.float32), (K,))   # (K,)
+                # 逐列加权求和： (K, BT) * (K, 1) -> (K, BT) ，沿 K 求和 -> (BT,)
+                q_wave = tl.sum(wdec_KBT * row_k[:, None], axis=0)         # (BT,)
+                b_dA_row = tl.sum(b_dA * row_mask_f32, axis=0)  # (BK,)
+                dA_q_wave = tl.sum(b_dA_row * q_wave)
+                b_dtheta_inter += dA_q_wave
+    b_dq_orig = s_theta.to(b_dq_orig.dtype) * b_dq_orig
+    tl.atomic_add(dtheta_inter + i_h, b_dtheta_inter.to(dtheta_inter.dtype.element_ty))
+
         ##############################
     p_dq_new = tl.make_block_ptr(dq_new, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     tl.store(p_dq_new, b_dq.to(dq_new.dtype.element_ty), boundary_check=(0, 1))
@@ -168,11 +187,11 @@ def parallel_path_bwd_intra_chunk_kernel(
 
 
 def parallel_path_bwd_intra_chunk_fn(
-    q, k, v, g_cumsum, w1, w2,
+    q, k, orig_q, v, g_cumsum, w1, w2,
     dq, dk, dv, dg_cumsum, dw1, dw2, do,
     scale, L, D,
     cu_seqlens,
-    S, BT,
+    S, BT, theta=None,
     wavelet_decay_table=None,
     USE_WAVELET_DECAY=False
 ):
@@ -187,16 +206,18 @@ def parallel_path_bwd_intra_chunk_fn(
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(indices)
     dq_new = torch.empty_like(dq, dtype=q.dtype)
     dq_orig = torch.empty_like(dq, dtype=q.dtype)
+    dtheta_inter = torch.zeros_like(theta, dtype=theta.dtype) if theta is not None else None
     parallel_path_bwd_intra_chunk_kernel[(NT, B*HQ)](
-        q=q, k=k, v=v, g_cumsum=g_cumsum,
+        q=q, k=k, orig_q=orig_q, v=v, g_cumsum=g_cumsum,
         w1=w1, w2=w2, L=L, D=D,
-        dq=dq, dq_new=dq_new, dq_orig=dq_orig, dk=dk, dv=dv, dw1=dw1, dw2=dw2,
+        dq=dq, dq_new=dq_new, dtheta_inter=dtheta_inter, dq_orig=dq_orig, dk=dk, dv=dv, dw1=dw1, dw2=dw2,
         do=do, dg_cumsum=dg_cumsum,
         offsets=cu_seqlens, indices=indices,
         T=T, S=S, BT=BT, scale=scale,
         G=G, HQ=HQ, H=H, K=K, V=V,
         BK=triton.next_power_of_2(K), BV=triton.next_power_of_2(V),
+        theta=theta,
         wavelet_decay_table=wavelet_decay_table if USE_WAVELET_DECAY else None,
         USE_WAVELET_DECAY= 1 if USE_WAVELET_DECAY else 0,
     )
-    return dq_new, dk, dv, dw1, dw2, dg_cumsum, dq_orig
+    return dq_new, dk, dv, dw1, dw2, dg_cumsum, dq_orig, dtheta_inter

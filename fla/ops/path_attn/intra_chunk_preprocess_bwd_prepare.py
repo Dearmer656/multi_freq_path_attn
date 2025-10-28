@@ -32,6 +32,7 @@ def chunk_transform_qk_bwd_kernel_prepare(
     offsets,  # varlen helper
     chunk_offsets,  # varlen helper
     T,
+    theta,
     wavelet_decay_table,
     G: tl.constexpr,
     HQ: tl.constexpr,
@@ -100,6 +101,7 @@ def chunk_transform_qk_bwd_kernel_prepare(
     b_qw = tl.where(m_t, tl.dot(b_q, tl.trans(b_w.to(b_q.dtype))), 0).to(b_q.dtype)
     b_qwT = tl.dot(b_qw, b_T.to(b_q.dtype)).to(b_q.dtype)
     b_wbk = tl.where(o_i[:, None] > o_i[None, :], tl.dot(b_w.to(b_kt.dtype), b_kt), 0).to(b_q.dtype)
+    s_theta = tl.load(theta + i_h)
     ############################
     ### 2025/10/22 Edit
     ### intra chunk Wavelet Decay
@@ -133,7 +135,7 @@ def chunk_transform_qk_bwd_kernel_prepare(
             decay_btbk += tl.where(mask, row_bt[None, :], 0.0)
 
         # 若后续 b_A 用的是 b_q.dtype，这里再转回
-        decay_btbk = decay_btbk.to(b_q.dtype)
+        decay_btbk = s_theta.to(b_q.dtype) * decay_btbk.to(b_q.dtype)
         b_A = tl.where(m_t, tl.dot(b_q, b_kt) - tl.dot(b_qwT, b_wbk) + decay_btbk, 0)
     else:
         b_A = tl.where(m_t, tl.dot(b_q, b_kt) - tl.dot(b_qwT, b_wbk), 0)
@@ -180,7 +182,7 @@ def chunk_transform_qk_bwd_kernel_prepare(
     tl.store(p_dA, b_dA.to(p_dA.dtype.element_ty), boundary_check=(0, 1))
 
 
-def intra_chunk_preprocess_bwd_prepare_fn(q, k, v, w, beta, g_cumsum, A, L, D, do, scale, return_h=True, cu_seqlens=None, wavelet_decay_table=None, USE_WAVELET_DECAY=False):
+def intra_chunk_preprocess_bwd_prepare_fn(q, k, v, w, beta, g_cumsum, A, L, D, do, scale, return_h=True, cu_seqlens=None, theta=None, wavelet_decay_table=None, USE_WAVELET_DECAY=False):
     BT = A.shape[-1]
     HQ = q.shape[-2]
     B, T, H, K = k.shape
@@ -230,6 +232,7 @@ def intra_chunk_preprocess_bwd_prepare_fn(q, k, v, w, beta, g_cumsum, A, L, D, d
         BV=triton.next_power_of_2(V),
         BT=BT,
         RETURN_H=return_h,
+        theta=theta,
         wavelet_decay_table=wavelet_decay_table,
         USE_WAVELET_DECAY=1 if USE_WAVELET_DECAY else 0,
     )

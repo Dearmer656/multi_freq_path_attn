@@ -27,6 +27,7 @@ def parallel_path_fwd_kernel(
     cu_seqlens,
     indices,
     T,
+    theta,
     wavelet_decay_table,
     G: tl.constexpr,
     HQ: tl.constexpr,
@@ -72,6 +73,8 @@ def parallel_path_fwd_kernel(
     else:
         b_g_cumsum_q = None
 
+    _q_base = _q + (bos*HQ + i_hq) * K
+    s_theta = tl.load(theta + i_h)
     for offset in range((i_t + 1) * BT - 2 * BS, i_t*BT-BS, -BS):
         p_k = tl.make_block_ptr(k + (bos * H + i_h) * K, (K, T), (1, K*H), (0, offset), (BK, BS), (0, 1))  # GQA when H!=HQ
         p_v = tl.make_block_ptr(v + (bos * H + i_h) * V, (T, V), (V*H, 1), (offset, 0), (BS, BV), (1, 0))  # GQA when H!=HQ
@@ -102,7 +105,6 @@ def parallel_path_fwd_kernel(
                 base_slice = wavelet_decay_table + (i_t * BT  + tt) * T + offset
                 p_wdec = tl.make_block_ptr(base_slice, (BK, T), (T*T, 1), (0, 0), (BK, BS), (1, 0))
                 b_decay = tl.load(p_wdec, boundary_check=(0, 1))  # (BK, T)
-                _q_base = _q + (bos*HQ + i_hq) * K
                 p_q_row = tl.make_block_ptr(
                     _q_base, (T, K), (HQ*K, 1),
                     (i_t * BT + tt, 0),
@@ -121,7 +123,7 @@ def parallel_path_fwd_kernel(
 
             # 若后续 b_A 用的是 b_q.dtype，这里再转回
             decay_btbk = decay_btbk.to(b_q.dtype)
-            b_s = tl.dot(b_q.to(b_k.dtype), b_k) + decay_btbk
+            b_s = tl.dot(b_q.to(b_k.dtype), b_k) + decay_btbk * s_theta.to(b_q.dtype)
         else:
             b_s = tl.dot(b_q.to(b_k.dtype), b_k)
     ###########################
@@ -189,7 +191,7 @@ def parallel_path_fwd_kernel(
 
             # 若后续 b_A 用的是 b_q.dtype，这里再转回
             decay_btbk = decay_btbk.to(b_q.dtype)
-            b_s = tl.dot(b_q.to(b_k.dtype), b_k) + decay_btbk
+            b_s = tl.dot(b_q.to(b_k.dtype), b_k) + decay_btbk * s_theta.to(b_q.dtype)
         else:
             b_s = tl.dot(b_q.to(b_k.dtype), b_k)
     ###########################
@@ -231,6 +233,7 @@ def parallel_path_fwd_fn(
     cu_seqlens,
     BT,
     BS,
+    theta,
     wavelet_decay_table,
     use_wavelet_decay,
 ):
@@ -273,5 +276,6 @@ def parallel_path_fwd_fn(
         num_warps=8 if (BT == 128 and K == 128) else 4,
         USE_WAVELET_DECAY=use_wavelet_decay,
         wavelet_decay_table=wavelet_decay_table,
+        theta=theta,
     )
     return o_new, L_new

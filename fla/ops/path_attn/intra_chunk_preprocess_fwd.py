@@ -28,6 +28,7 @@ def intra_chunk_preprocess_fwd_kernel(
     scale,
     indices,  # varlen helper
     offsets,  # varlen helper
+    theta,
     wavelet_decay_table,
     T,
     H: tl.constexpr,
@@ -76,7 +77,8 @@ def intra_chunk_preprocess_fwd_kernel(
     p_v = tl.make_block_ptr(v, (T, V), (H*V, 1), (i_t * BT, 0), (BT, BV), (1, 0))
     p_beta = tl.make_block_ptr(beta, (T, ), (H, ), (i_t * BT, ), (BT, ), (0, ))
     p_T = tl.make_block_ptr(A, (T, BT), (BT*H, 1), (i_t * BT, 0), (BT, BT), (1, 0))
-
+    p_theta = theta + i_h
+    s_theta = tl.load(p_theta)
     b_beta = tl.load(p_beta, boundary_check=(0, ))
     b_q = tl.load(p_q, boundary_check=(0, 1))
     b_kt = tl.load(p_k, boundary_check=(0, 1))
@@ -120,7 +122,7 @@ def intra_chunk_preprocess_fwd_kernel(
             decay_btbk += tl.where(mask, row_bt[None, :], 0.0)
 
         # 若后续 b_A 用的是 b_q.dtype，这里再转回
-        decay_btbk = decay_btbk.to(b_q.dtype)
+        decay_btbk = s_theta.to(b_q.dtype) * decay_btbk.to(b_q.dtype)
 ###########################
     b_qw = tl.where(m_t, tl.dot(b_q, tl.trans(b_w.to(b_q.dtype))), 0).to(b_q.dtype)
     b_qwT = tl.dot(b_qw, b_T.to(b_q.dtype)).to(b_q.dtype)
@@ -161,7 +163,7 @@ def intra_chunk_preprocess_fwd_kernel(
     tl.store(p_l, l_i.to(p_l.dtype.element_ty), boundary_check=(0,))
 
 
-def intra_chunk_preprocess_fwd_fn(q, k, v, w, beta, g_cumsum, A, scale, BT, cu_seqlens, wavelet_decay_table, use_wavelet_decay):
+def intra_chunk_preprocess_fwd_fn(q, k, v, w, beta, g_cumsum, A, scale, BT, cu_seqlens, theta, wavelet_decay_table, use_wavelet_decay):
     HQ = q.shape[-2]
     B, T, H, K = k.shape
     V = v.shape[-1]
@@ -204,6 +206,7 @@ def intra_chunk_preprocess_fwd_fn(q, k, v, w, beta, g_cumsum, A, scale, BT, cu_s
         BV=triton.next_power_of_2(V),
         BT=BT,
         num_warps=4 if BT == 64 else 2,
+        theta=theta,
         wavelet_decay_table=wavelet_decay_table,
         USE_WAVELET_DECAY=1 if use_wavelet_decay else 0,
     )

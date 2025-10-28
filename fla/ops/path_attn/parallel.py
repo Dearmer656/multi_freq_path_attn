@@ -28,7 +28,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, w, beta, g, scale, cu_seqlens, use_cache=False, wavelet_decay_table=None, use_wavelet_decay=False):
+    def forward(ctx, q, k, v, w, beta, g, scale, cu_seqlens, use_cache=False, theta=None, wavelet_decay_table=None, use_wavelet_decay=False):
 
         g_cumsum = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, output_dtype=torch.float32) if g is not None else None
         BS = 64 if check_shared_mem('hopper') else 32
@@ -57,6 +57,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             scale=scale,
             BT=BS,
             cu_seqlens=cu_seqlens,
+            theta=theta,
             wavelet_decay_table=wavelet_decay_table[:, :BS, :BS].contiguous() if use_wavelet_decay else None,
             use_wavelet_decay=use_wavelet_decay,
         )
@@ -77,12 +78,14 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             BT=BT,
             BS=BS,
+            theta=theta,
             wavelet_decay_table=wavelet_decay_table if use_wavelet_decay else None,
             use_wavelet_decay=use_wavelet_decay,
         )
         saved = [q, k, v, w, g_cumsum, o, beta, L, A]
         if use_wavelet_decay:
             saved.append(wavelet_decay_table)
+            saved.append(theta)
             ctx.use_wavelet_decay = True
         ctx.save_for_backward(*saved)
         k_cache = prepare_k_cache_fn(k=k_new, w1=w, w2=w2, cu_seqlens=cu_seqlens, BS=BS, use_cache=use_cache)
@@ -95,7 +98,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
     @autocast_custom_bwd
     def backward(ctx, do, dk_new):
         if ctx.use_wavelet_decay:
-            q, k, v, w, g_cumsum, o, beta, L, A, wavelet_decay_table = ctx.saved_tensors
+            q, k, v, w, g_cumsum, o, beta, L, A, wavelet_decay_table, theta = ctx.saved_tensors
         else:
             q, k, v, w, g_cumsum, o, beta, L, A = ctx.saved_tensors
         BT = 128 if check_shared_mem('ampere') else 64
@@ -118,6 +121,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             scale=ctx.scale,
             cu_seqlens=cu_seqlens,
             return_h=False,
+            theta=theta,
             wavelet_decay_table=wavelet_decay_table[:, :BS, :BS].contiguous() if ctx.use_wavelet_decay else None,
             USE_WAVELET_DECAY=ctx.use_wavelet_decay,
         )
@@ -179,9 +183,10 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             S=S,
             BT=BS
         )
-        dq, dk, dv, dw1, dw2, dg_cumsum, dq_orig = parallel_path_bwd_intra_chunk_fn(
+        dq, dk, dv, dw1, dw2, dg_cumsum, dq_orig, dtheta_inter = parallel_path_bwd_intra_chunk_fn(
             q=q_new,
             k=k_new,
+            orig_q=q,
             v=v,
             g_cumsum=g_cumsum,
             w1=w,
@@ -199,10 +204,11 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             S=S,
             BT=BS,
+            theta=theta,
             wavelet_decay_table=wavelet_decay_table if ctx.use_wavelet_decay else None,
             USE_WAVELET_DECAY=ctx.use_wavelet_decay,
         )
-        dq, dk, dbeta, dw = intra_chunk_preprocess_bwd_fn(
+        dq, dk, dbeta, dw, dtheta = intra_chunk_preprocess_bwd_fn(
             q=q,
             k=k,
             w=w,
@@ -220,6 +226,8 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             do=do,
             scale=ctx.scale,
             cu_seqlens=cu_seqlens,
+            theta=theta,
+            dtheta_inter=dtheta_inter,
             wavelet_decay_table=wavelet_decay_table[:, :BS, :BS].contiguous() if ctx.use_wavelet_decay else None,
             USE_WAVELET_DECAY=ctx.use_wavelet_decay,
         )
@@ -235,7 +243,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
         return (dq.to(q.dtype), dk.to(k.dtype), dv.to(v.dtype), dw.to(w.dtype),
                 dbeta.to(beta.dtype),
                 dg_cumsum.to(g_cumsum.dtype) if g_cumsum is not None else None,
-                None, None, None, None, None)
+                None, None, None, dtheta, None, None)
 
 
 @torch.compiler.disable
@@ -249,6 +257,7 @@ def parallel_path_attn(
     scale: float = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     use_cache: bool = False,
+    theta: Optional[torch.Tensor] = None,
     wavelet_decay_table: Optional[torch.Tensor] = None,
     use_wavelet_decay: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -294,7 +303,7 @@ def parallel_path_attn(
     if g is not None:
         assert g.shape[:3] == q.shape[:3], 'g should have the same number of heads as q'
     assert q.shape[-2] % k.shape[-2] == 0, 'the number of query heads should be divisible by the number of key heads'
-    o, k_cache = ParallelPATHAttentionFunction.apply(q, k, v, w, beta, g, scale, cu_seqlens, use_cache, wavelet_decay_table, use_wavelet_decay)
+    o, k_cache = ParallelPATHAttentionFunction.apply(q, k, v, w, beta, g, scale, cu_seqlens, use_cache, theta, wavelet_decay_table, use_wavelet_decay)
     return o, k_cache
 
 parallel_path_attention = parallel_path_attn

@@ -14,8 +14,8 @@ from fla.utils import check_shared_mem
 def intra_chunk_preprocess_bwd_kernel(
     q, k, w, w2, beta,
     AT,
-    dA_local, dq, dq_orig, dq_new, dk, dk_new, dw, dbeta, dw1, dw2, T,
-    offsets, indices, wavelet_decay_table,
+    dA_local, dq, dq_orig, dtheta, dq_new, dk, dk_new, dw, dbeta, dw1, dw2, T,
+    offsets, indices, theta, dtheta_inter, wavelet_decay_table,
     HQ: tl.constexpr, G: tl.constexpr, H: tl.constexpr,
     K: tl.constexpr, BT: tl.constexpr, BK: tl.constexpr,
     IS_VARLEN: tl.constexpr, USE_WAVELET_DECAY: tl.constexpr,
@@ -49,6 +49,7 @@ def intra_chunk_preprocess_bwd_kernel(
     b_k = tl.load(p_k, boundary_check=(0, 1))
     b_T = tl.load(p_T, boundary_check=(0, 1))
     b_w_beta = (b_w * b_beta[:, None]).to(b_w.dtype)
+    s_theta = tl.load(theta + i_h)
 
     o_i = tl.arange(0, BT)
     b_qw = tl.where(o_i[:, None] >= o_i[None, :], tl.dot(b_q, tl.trans(b_w)), 0).to(b_q.dtype)
@@ -83,6 +84,7 @@ def intra_chunk_preprocess_bwd_kernel(
     # wavelet decay table backward
     ##############################
     if USE_WAVELET_DECAY:
+        b_dtheta = tl.zeros([], dtype=tl.float32)
         rows = tl.arange(0, BT)  # (BT,)
         for tt in tl.static_range(0, BT):
             # 取固定 query 行 i=tt，对应 keys 的本地块 j∈[0, BT)
@@ -93,7 +95,7 @@ def intra_chunk_preprocess_bwd_kernel(
                 (0, 0), (BK, BT),
                 (1, 0)
             )
-            b_decay_KBT = tl.load(p_wdec, boundary_check=(0, 1)).to(tl.float32)  # (BK, BT)
+            b_decay_KBT = s_theta * tl.load(p_wdec, boundary_check=(0, 1)).to(tl.float32)  # (BK, BT)
             b_decay_BTK = tl.trans(b_decay_KBT)                                  # (BT, BK)
 
             # 整块贡献：(BT, BT) @ (BT, BK) -> (BT, BK)
@@ -102,6 +104,21 @@ def intra_chunk_preprocess_bwd_kernel(
             # 仅向第 tt 行写入增量（用 float 掩码，避免 bool 参与算术）
             row_mask_f32 = (rows == tt).to(tl.float32)[:, None]                  # (BT, 1)
             b_dq += (row_mask_f32 * contrib_all).to(b_dq.dtype)          # (BT, BK)
+            p_q_row = tl.make_block_ptr(
+                q + (bos * HQ + i_hq) * K, (T, K), (HQ*K, 1),
+                (i_t * BT + tt, 0),
+                (1, BK),
+                (1, 0)
+            )
+            d_q_row_2d = tl.load(p_q_row, boundary_check=(0, 1)).to(tl.float32)  # (1, BK)
+            row_k = tl.reshape(d_q_row_2d, (K,))   # (K,)
+            q_wave_local = tl.sum(b_decay_KBT * row_k[:, None], axis=0)         # (BT,)
+            # q_wave_local_2d = tl.dot(d_q_row_2d, b_decay_KBT)  # (BT,) ### 之所以错 是因为 我估计是因为生成的BTK覆盖了原本的KBT。
+            b_dA_row = tl.sum(b_dA_local * row_mask_f32, axis=0)  # (BK,)
+            dA_q_wave_local = tl.sum(b_dA_row * q_wave_local)
+            b_dtheta += dA_q_wave_local
+        b_dtheta = tl.load(dtheta_inter + i_h) + b_dtheta
+        tl.atomic_add(dtheta + i_h, b_dtheta.to(dtheta.dtype.element_ty))
     ##############################
     b_dw += tl.dot(tl.trans(b_dqw.to(b_q.dtype)), b_q)
     p_q_new = tl.make_block_ptr(dq_new + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
@@ -144,6 +161,7 @@ def intra_chunk_preprocess_bwd_fn(q, k, w, w2, beta,
                                   dq, dq_orig, dk, dA_local,
                                   dw1, dw2,
                                   A, L, D, do, scale, cu_seqlens=None,
+                                  theta=None, dtheta_inter=None,
                                   wavelet_decay_table=None, USE_WAVELET_DECAY=False):
     BT = A.shape[-1]
     HQ = q.shape[-2]
@@ -158,16 +176,17 @@ def intra_chunk_preprocess_bwd_fn(q, k, w, w2, beta,
     dw = torch.empty(B, T, HQ, K, device=q.device, dtype=k.dtype if G == 1 else torch.float32)
     dk_new = torch.empty_like(dk, dtype=k.dtype if G == 1 else torch.float32)  # float32 reduction
     dq_new = torch.empty_like(dq, dtype=q.dtype)
-
+    dtheta = torch.zeros_like(theta, dtype=torch.float32)
     intra_chunk_preprocess_bwd_kernel[grid](
         q=q, k=k, w=w, w2=w2, beta=beta,
         AT=A,
-        dA_local=dA_local, dq=dq, dq_orig=dq_orig, dq_new=dq_new, dk=dk, dk_new=dk_new, dw=dw, dbeta=dbeta, dw1=dw1, dw2=dw2, T=T,
+        dA_local=dA_local, dq=dq, dq_orig=dq_orig, dtheta=dtheta, dq_new=dq_new, dk=dk, dk_new=dk_new, dw=dw, dbeta=dbeta, dw1=dw1, dw2=dw2, T=T,
         offsets=cu_seqlens, indices=indices,
         HQ=HQ, G=G, H=H,
         K=K, BT=BT, BK=triton.next_power_of_2(K),
         num_stages=3 if check_shared_mem('hopper') else 1,
+        theta=theta, dtheta_inter=dtheta_inter,
         wavelet_decay_table=wavelet_decay_table if USE_WAVELET_DECAY else None,
         USE_WAVELET_DECAY= 1 if USE_WAVELET_DECAY else 0,
     )
-    return dq_new, dk_new, dbeta, dw
+    return dq_new, dk_new, dbeta, dw, dtheta
