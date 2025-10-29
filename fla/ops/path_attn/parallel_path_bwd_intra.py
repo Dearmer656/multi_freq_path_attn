@@ -78,6 +78,12 @@ def parallel_path_bwd_intra_chunk_kernel(
     p_q = tl.make_block_ptr(q, (T, K), (HQ*K, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_q = tl.load(p_q, boundary_check=(0, 1))
     s_theta = tl.load(theta)
+    if USE_WAVELET_DECAY:
+        wave_coeff = s_theta.to(tl.float32)
+        path_coeff = 1.0 - wave_coeff
+    else:
+        wave_coeff = tl.zeros((), dtype=tl.float32)
+        path_coeff = tl.zeros((), dtype=tl.float32) + 1.0
     if USE_GATE:
         p_gq_cumsum = tl.make_block_ptr(g_cumsum, (T, ), (HQ, ), (i_t * BT, ), (BT, ), (0, ))
         b_gq_cumsum = tl.load(p_gq_cumsum, boundary_check=(0, ))
@@ -101,7 +107,8 @@ def parallel_path_bwd_intra_chunk_kernel(
             b_A_tmp = tl.dot(b_q_tmp.to(b_w1.dtype), tl.trans(b_w1))
             b_q_tmp -= tl.dot(b_A_tmp.to(b_w1.dtype), b_w2)
         b_q2 = b_q_tmp.to(b_k.dtype)
-        b_A = tl.dot(b_q2, tl.trans(b_k))
+        b_path = tl.dot(b_q2, tl.trans(b_k))
+        b_A = b_path
         if USE_GATE:
             p_gk_cumsum = tl.make_block_ptr(g_cumsum, (T, ), (HQ, ), (offset, ), (BT, ), (0, ))
             b_gk_cumsum = tl.load(p_gk_cumsum, boundary_check=(0, ))
@@ -124,7 +131,8 @@ def parallel_path_bwd_intra_chunk_kernel(
             tl.atomic_add(dg_cumsum + (offset + tl.arange(0, BT)) * HQ, b_dgk, mask=mask, sem='relaxed')
             b_dgq += tl.sum(b_dA, axis=1)
         b_dA = b_dA.to(b_v.dtype)
-        b_dk = tl.dot(tl.trans(b_dA), b_q2)
+        b_dA_path = path_coeff.to(b_dA.dtype) * b_dA
+        b_dk = tl.dot(tl.trans(b_dA_path), b_q2)
         tl.atomic_add(dk + (offset + tl.arange(0, BT))[:, None] * HQ*K + tl.arange(0,
                       BK)[None, :], b_dk, mask=mask[:, None], sem='relaxed')
         p_w1 = tl.make_block_ptr(w1, (T, K), (H*K, 1), (offset, 0), (BT, BK), (1, 0))
@@ -140,13 +148,14 @@ def parallel_path_bwd_intra_chunk_kernel(
         tl.atomic_add(dw1 + (offset + tl.arange(0, BT))[:, None] * HQ*K + tl.arange(0,
                       BK)[None, :], b_dw1, mask=mask[:, None], sem='relaxed')
         b_dq -= tl.dot(b_dA2, b_w1.to(b_v.dtype))
-        b_dq += tl.dot(b_dA.to(b_k.dtype), b_k)
+        b_dq += tl.dot(b_dA_path.to(b_k.dtype), b_k)
         ##############################
         # 2025/10/25 edit
         # wavelet decay table backward
         ##############################
         if USE_WAVELET_DECAY:
             rows = tl.arange(0, BT)                               # (BT,)
+            masked_path = tl.where(mask[:, None], b_path.to(tl.float32), 0)
             for tt in tl.static_range(0, BT):
                 p_orig_q_row = tl.make_block_ptr(
                     orig_q, (T, K), (HQ * K, 1),
@@ -172,7 +181,9 @@ def parallel_path_bwd_intra_chunk_kernel(
                 q_wave = tl.sum(wdec_KBT * row_k[:, None], axis=0)         # (BT,)
                 b_dA_row = tl.sum(b_dA * row_mask_f32, axis=0)  # (BK,)
                 dA_q_wave = tl.sum(b_dA_row * q_wave)
-                b_dtheta_inter += dA_q_wave
+                path_row = tl.sum(masked_path * row_mask_f32, axis=0)
+                dA_q_path = tl.sum(b_dA_row * path_row)
+                b_dtheta_inter += dA_q_wave - dA_q_path
     b_dq_orig = s_theta.to(b_dq_orig.dtype) * b_dq_orig
     tl.atomic_add(dtheta_inter, b_dtheta_inter.to(dtheta_inter.dtype.element_ty))
 

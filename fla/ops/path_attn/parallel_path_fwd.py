@@ -94,6 +94,7 @@ def parallel_path_fwd_kernel(
     ### 2025-10-24 Edit
     ### debug the problem of operating with head0 all the time
     ###########################
+        path_scores = tl.dot(b_q.to(b_k.dtype), b_k)
         if USE_WAVELET_DECAY:
             # 用 fp32 累加，最后再转回
             decay_btbk = tl.zeros((BT, BS), dtype=tl.float32)
@@ -123,9 +124,12 @@ def parallel_path_fwd_kernel(
 
             # 若后续 b_A 用的是 b_q.dtype，这里再转回
             decay_btbk = decay_btbk.to(b_q.dtype)
-            b_s = tl.dot(b_q.to(b_k.dtype), b_k) + decay_btbk * s_theta.to(b_q.dtype)
+            wave_coeff = s_theta.to(b_q.dtype)
+            path_coeff = 1.0 - wave_coeff
+            path_scores = path_scores.to(b_q.dtype)
+            b_s = path_coeff * tl.where(m_s[:, None], path_scores, 0) + wave_coeff * decay_btbk
         else:
-            b_s = tl.dot(b_q.to(b_k.dtype), b_k)
+            b_s = path_scores
     ###########################
         if USE_GATE:
             p_g_cumsum_k = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq), (T, ), (HQ, ), (offset, ), (BS, ), (0,))
@@ -161,6 +165,7 @@ def parallel_path_fwd_kernel(
     ### 2025-10-24 Edit
     ### debug the problem of operating with head0 all the time
     ###########################
+        path_scores = tl.dot(b_q.to(b_k.dtype), b_k)
         if USE_WAVELET_DECAY:
             # 用 fp32 累加，最后再转回
             decay_btbk = tl.zeros((BT, BS), dtype=tl.float32)
@@ -191,9 +196,12 @@ def parallel_path_fwd_kernel(
 
             # 若后续 b_A 用的是 b_q.dtype，这里再转回
             decay_btbk = decay_btbk.to(b_q.dtype)
-            b_s = tl.dot(b_q.to(b_k.dtype), b_k) + decay_btbk * s_theta.to(b_q.dtype)
+            wave_coeff = s_theta.to(b_q.dtype)
+            path_coeff = 1.0 - wave_coeff
+            path_scores = path_scores.to(b_q.dtype)
+            b_s = path_coeff * path_scores + wave_coeff * decay_btbk
         else:
-            b_s = tl.dot(b_q.to(b_k.dtype), b_k)
+            b_s = path_scores
     ###########################
         if USE_GATE:
             p_g_cumsum_k = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq), (T, ), (HQ, ), (offset, ), (BS, ), (0,))

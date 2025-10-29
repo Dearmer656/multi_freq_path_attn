@@ -135,8 +135,11 @@ def chunk_transform_qk_bwd_kernel_prepare(
             decay_btbk += tl.where(mask, row_bt[None, :], 0.0)
 
         # 若后续 b_A 用的是 b_q.dtype，这里再转回
-        decay_btbk = s_theta.to(b_q.dtype) * decay_btbk.to(b_q.dtype)
-        b_A = tl.where(m_t, tl.dot(b_q, b_kt) - tl.dot(b_qwT, b_wbk) + decay_btbk, 0)
+        decay_btbk = decay_btbk.to(b_q.dtype)
+        path_scores = tl.dot(b_q, b_kt) - tl.dot(b_qwT, b_wbk)
+        wave_coeff = s_theta.to(b_q.dtype)
+        path_coeff = 1.0 - wave_coeff
+        b_A = tl.where(m_t, path_coeff * path_scores + wave_coeff * decay_btbk, 0)
     else:
         b_A = tl.where(m_t, tl.dot(b_q, b_kt) - tl.dot(b_qwT, b_wbk), 0)
     ############################

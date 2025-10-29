@@ -50,14 +50,24 @@ def intra_chunk_preprocess_bwd_kernel(
     b_T = tl.load(p_T, boundary_check=(0, 1))
     b_w_beta = (b_w * b_beta[:, None]).to(b_w.dtype)
     s_theta = tl.load(theta)
+    if USE_WAVELET_DECAY:
+        wave_coeff = s_theta.to(tl.float32)
+        path_coeff = 1.0 - wave_coeff
+    else:
+        wave_coeff = tl.zeros((), dtype=tl.float32)
+        path_coeff = tl.zeros((), dtype=tl.float32) + 1.0
 
     o_i = tl.arange(0, BT)
     b_qw = tl.where(o_i[:, None] >= o_i[None, :], tl.dot(b_q, tl.trans(b_w)), 0).to(b_q.dtype)
+    b_qwT = tl.dot(b_qw, b_T.to(b_q.dtype)).to(b_q.dtype)
     b_wbk = tl.where(o_i[:, None] > o_i[None, :], tl.dot(b_w_beta, tl.trans(b_k)), 0).to(b_k.dtype)
     b_Twbk = tl.dot(b_T, b_wbk).to(b_w.dtype)
+    path_scores = tl.dot(b_q, tl.trans(b_k)) - tl.dot(b_qwT.to(b_q.dtype), b_wbk)
+    path_scores_masked = tl.where(o_i[:, None] >= o_i[None, :], path_scores.to(tl.float32), 0.0)
 
     p_dA_local = tl.make_block_ptr(dA_local + (bos * HQ + i_hq) * BT, (T, BT), (BT*HQ, 1), (i_t * BT, 0), (BT, BT), (1, 0))
     b_dA_local = tl.load(p_dA_local, boundary_check=(0, 1))
+    b_dA_local_path = path_coeff.to(b_dA_local.dtype) * b_dA_local
 
     # # Twb part qw part.
     p_dq_orig = tl.make_block_ptr(dq_orig + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
@@ -69,14 +79,14 @@ def intra_chunk_preprocess_bwd_kernel(
     p_dw1 = tl.make_block_ptr(dw1 + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_dw += tl.load(p_dw1, boundary_check=(0, 1))
 
-    b_dqw = -tl.dot(b_dA_local, tl.trans(b_Twbk)) - tl.dot(b_dq.to(b_Twb.dtype), tl.trans(b_Twb))
+    b_dqw = -tl.dot(b_dA_local_path, tl.trans(b_Twbk)) - tl.dot(b_dq.to(b_Twb.dtype), tl.trans(b_Twb))
     p_dw2 = tl.make_block_ptr(dw2 + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_dTwb = -tl.dot(tl.trans(b_qw), b_dq) + tl.load(p_dw2, boundary_check=(0, 1))
     b_dT += tl.dot(b_dTwb.to(b_w_beta.dtype), tl.trans(b_w_beta))
     b_dw_beta += tl.dot(tl.trans(b_T), b_dTwb.to(b_T.dtype))
 
     b_dqw = tl.where(tl.arange(0, BT)[:, None] >= tl.arange(0, BT)[None, :], b_dqw, 0)
-    b_dq += tl.dot(b_dA_local.to(b_k.dtype), b_k)
+    b_dq += tl.dot(b_dA_local_path.to(b_k.dtype), b_k)
     b_dq += tl.dot(b_dqw.to(b_w.dtype), b_w)
     b_dq += b_dq_orig
     ##############################
@@ -95,7 +105,8 @@ def intra_chunk_preprocess_bwd_kernel(
                 (0, 0), (BK, BT),
                 (1, 0)
             )
-            b_decay_KBT = s_theta * tl.load(p_wdec, boundary_check=(0, 1)).to(tl.float32)  # (BK, BT)
+            raw_decay_KBT = tl.load(p_wdec, boundary_check=(0, 1)).to(tl.float32)  # (BK, BT)
+            b_decay_KBT = wave_coeff * raw_decay_KBT
             b_decay_BTK = tl.trans(b_decay_KBT)                                  # (BT, BK)
 
             # 整块贡献：(BT, BT) @ (BT, BK) -> (BT, BK)
@@ -112,11 +123,12 @@ def intra_chunk_preprocess_bwd_kernel(
             )
             d_q_row_2d = tl.load(p_q_row, boundary_check=(0, 1)).to(tl.float32)  # (1, BK)
             row_k = tl.reshape(d_q_row_2d, (K,))   # (K,)
-            q_wave_local = tl.sum(b_decay_KBT * row_k[:, None], axis=0)         # (BT,)
-            # q_wave_local_2d = tl.dot(d_q_row_2d, b_decay_KBT)  # (BT,) ### 之所以错 是因为 我估计是因为生成的BTK覆盖了原本的KBT。
+            q_wave_local = tl.sum(raw_decay_KBT * row_k[:, None], axis=0)         # (BT,)
             b_dA_row = tl.sum(b_dA_local * row_mask_f32, axis=0)  # (BK,)
             dA_q_wave_local = tl.sum(b_dA_row * q_wave_local)
-            b_dtheta += dA_q_wave_local
+            path_row = tl.sum(path_scores_masked * row_mask_f32, axis=0)
+            dA_q_path_local = tl.sum(b_dA_row * path_row)
+            b_dtheta += dA_q_wave_local - dA_q_path_local
         b_dtheta = tl.load(dtheta_inter) + b_dtheta
         tl.atomic_add(dtheta, b_dtheta.to(dtheta.dtype.element_ty))
     ##############################
@@ -127,14 +139,14 @@ def intra_chunk_preprocess_bwd_kernel(
     # Twbk part
     p_dk = tl.make_block_ptr(dk + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     b_dk = tl.load(p_dk, boundary_check=(0, 1))
-    b_dTwbk = -tl.dot(tl.trans(b_qw), b_dA_local.to(b_qw.dtype)) - tl.dot(b_w, tl.trans(b_dk.to(b_w.dtype)))
+    b_dTwbk = -tl.dot(tl.trans(b_qw), b_dA_local_path.to(b_qw.dtype)) - tl.dot(b_w, tl.trans(b_dk.to(b_w.dtype)))
     b_dw -= tl.dot(b_Twbk, b_dk.to(b_w.dtype))
     b_dT += tl.dot(b_dTwbk.to(b_wbk.dtype), tl.trans(b_wbk))
     b_dwbk = tl.where(o_i[:, None] > o_i[None, :], tl.dot(tl.trans(b_T), b_dTwbk.to(b_T.dtype)), 0).to(b_w.dtype)
     b_dw_beta += tl.dot(b_dwbk, b_k)
 
     b_dk += tl.dot(tl.trans(b_dwbk), b_w_beta)
-    b_dk += tl.dot(tl.trans(b_dA_local), b_q)
+    b_dk += tl.dot(tl.trans(b_dA_local_path), b_q)
     p_dk_new = tl.make_block_ptr(dk_new + (bos * HQ + i_hq) * K, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, BK), (1, 0))
     tl.store(p_dk_new, b_dk.to(dk_new.dtype.element_ty), boundary_check=(0, 1))
 

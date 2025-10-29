@@ -122,15 +122,18 @@ def intra_chunk_preprocess_fwd_kernel(
             decay_btbk += tl.where(mask, row_bt[None, :], 0.0)
 
         # 若后续 b_A 用的是 b_q.dtype，这里再转回
-        decay_btbk = s_theta.to(b_q.dtype) * decay_btbk.to(b_q.dtype)
+        decay_btbk = decay_btbk.to(b_q.dtype)
 ###########################
     b_qw = tl.where(m_t, tl.dot(b_q, tl.trans(b_w.to(b_q.dtype))), 0).to(b_q.dtype)
     b_qwT = tl.dot(b_qw, b_T.to(b_q.dtype)).to(b_q.dtype)
     b_wbk = tl.where(o_i[:, None] > o_i[None, :], tl.dot(b_w.to(b_q.dtype), b_kt), 0).to(b_q.dtype)
+    path_scores = tl.dot(b_q, b_kt) - tl.dot(b_qwT.to(b_q.dtype), b_wbk)
     if USE_WAVELET_DECAY:
-        b_A = tl.where(m_t, tl.dot(b_q, b_kt) - tl.dot(b_qwT.to(b_q.dtype), b_wbk) + decay_btbk, 0)
+        wave_coeff = s_theta.to(b_q.dtype)
+        path_coeff = 1.0 - wave_coeff
+        b_A = tl.where(m_t, path_coeff * path_scores + wave_coeff * decay_btbk, 0)
     else:
-        b_A = tl.where(m_t, tl.dot(b_q, b_kt) - tl.dot(b_qwT.to(b_q.dtype), b_wbk), 0)
+        b_A = tl.where(m_t, path_scores, 0)
 
     b_q = b_q.to(tl.float32) - tl.dot(b_qwT, b_w.to(b_q.dtype))
     p_q_new = tl.make_block_ptr(q_new, (T, K), (K*HQ, 1), (i_t * BT, 0), (BT, K), (1, 0))
