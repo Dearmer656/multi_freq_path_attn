@@ -26,115 +26,91 @@ if TYPE_CHECKING:
 
 
 import pdb
-def sample_index_pairs(
+@torch.no_grad()
+def sample_j_for_each_i_unique(
     block_size: int,
-    num_samples: int,
+    num_samples: int,        # S
+    num_j_per_i: int = 16,   # K
     *,
-    deltas: torch.Tensor | None = None,
-    min_delta: int = 1,
+    min_delta: int = 1,      # 要求 i - j >= min_delta
     max_delta: int | None = None,
-    method: str = "mix",           # "mix" | "uniform" | "geometric"
-    geom_p: float = 0.2,           # 几何分布参数（期望 ~ 1/p），仅当 method in {"mix","geometric"} 时使用
-    uniform_frac: float = 0.3,     # mix 模式下，均匀采样比例
+    allow_delta_zero: bool = False,  # True 时允许 j==i（即 min_delta 可以为 0）
     device: torch.device | None = None,
     generator: torch.Generator | None = None,
-    allow_delta_zero: bool = False # 如需 Δ=0（自指）则设 True
 ):
     """
-    随机采样 (i, j) 索引对，满足 j = i + Δ，且 0 <= i < j < block_size（若 allow_delta_zero=True 则允许 i==j）。
-    - 若提供 deltas，则按给定 Δ 向量逐一采样 (i, j)；
-    - 否则按 method 生成长度为 num_samples 的 Δ 向量。
-
+    目标：先采 S 个 i（右端点），对每个 i 采 K 个 j（左侧，且不放回）。
     返回:
-        i_idx: LongTensor[num_samples]
-        j_idx: LongTensor[num_samples]
-        deltas: LongTensor[num_samples]  # 实际使用的 Δ
+      i_idx:  [S]
+      j_idx:  [S, K]     （同一 i 内均匀不放回）
+      deltas: [S, K]     （= i - j，非负）
+    约束: 对每个 i，合法 j 的数量 span(i) >= K，否则重采 i。
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    if max_delta is None:
-        max_delta = block_size - 1
 
-    # 边界处理
+    # 规范最小间隔
     if allow_delta_zero:
         min_delta = 0
     else:
         min_delta = max(1, min_delta)
-    max_delta = max(min_delta, min(max_delta, block_size - (0 if allow_delta_zero else 1)))
 
-    if max_delta < min_delta:
-        raise ValueError(f"无可用的 Δ 范围：min_delta={min_delta}, max_delta={max_delta}, block_size={block_size}")
-
-    # 1) 生成/规范化 Δ
-    if deltas is None:
-        if method == "uniform":
-            deltas = torch.randint(
-                low=min_delta,
-                high=max_delta + 1,
-                size=(num_samples,),
-                device=device,
-                generator=generator,
-            )
-        elif method == "geometric":
-            # 采几何分布，截断到 [min_delta, max_delta]
-            # PyTorch 没有直接的几何分布，这里用伯努利和求首个成功的思路不高效；
-            # 用近似：先按几何的 PMF 构造离散表，再从表中采样（高效且可向量化）
-            support = torch.arange(min_delta, max_delta + 1, device=device)
-            # 几何分布（从1开始）的PMF: p*(1-p)^(k-1)，这里平移到 min_delta 起点
-            shifted = support - (1 if not allow_delta_zero else 0)
-            pmf = (geom_p * torch.pow(1 - geom_p, shifted - 1)).clamp_min(1e-12)
-            pmf = pmf / pmf.sum()
-            # 多项式采样
-            deltas = support[torch.multinomial(pmf, num_samples, replacement=True, generator=generator)]
-        elif method == "mix":
-            # 按 uniform_frac 混合均匀与几何
-            num_u = int(num_samples * uniform_frac)
-            num_g = num_samples - num_u
-            deltas_u = torch.randint(
-                low=min_delta, high=max_delta + 1, size=(num_u,), device=device, generator=generator
-            )
-            support = torch.arange(min_delta, max_delta + 1, device=device)
-            shifted = support - (1 if not allow_delta_zero else 0)
-            pmf = (geom_p * torch.pow(1 - geom_p, shifted - 1)).clamp_min(1e-12)
-            pmf = pmf / pmf.sum()
-            deltas_g = support[torch.multinomial(pmf, num_g, replacement=True, generator=generator)]
-            deltas = torch.empty(num_samples, device=device, dtype=torch.long)
-            deltas[:num_u] = deltas_u
-            deltas[num_u:] = deltas_g
-            # 打乱
-            perm = torch.randperm(num_samples, device=device, generator=generator)
-            deltas = deltas[perm]
-        else:
-            raise ValueError(f"未知 method: {method}")
+    # —— 可行性检查（最大可能 span 是否 >= K）——
+    # 对给定 i，合法 j 范围：
+    #   jL(i) = max(0, i - max_delta)   （当 max_delta=None 时 jL=0）
+    #   jU(i) = i - min_delta           （若 min_delta=0 则 jU=i）
+    #   span(i) = jU - jL + 1
+    # 最大 span 出现在 i 越大越有利（更靠右可选 j 更多）：
+    if max_delta is None:
+        max_span = (block_size - 1) - min_delta + 1    # = block_size - min_delta
     else:
-        deltas = deltas.to(device=device, dtype=torch.long)
-        if (deltas < min_delta).any() or (deltas > max_delta).any():
-            raise ValueError(f"deltas 超出范围 [{min_delta}, {max_delta}]")
+        max_span = min(block_size - min_delta, max_delta - min_delta + 1)
+    if max_span < num_j_per_i:
+        raise ValueError(
+            f"不可行: 最大可选 j 数 {max_span} < 需要的不放回数 {num_j_per_i}。"
+        )
 
-        if deltas.numel() != num_samples:
-            # 若用户给的 deltas 数量与 num_samples 不一致，则循环扩展或截断
-            reps = (num_samples + deltas.numel() - 1) // deltas.numel()
-            deltas = deltas.repeat(reps)[:num_samples]
+    S, K = num_samples, num_j_per_i
 
-    # 2) 对每个 Δ 采样左索引 i，使得 i ∈ [0, block_size - 1 - Δ]（包含），然后 j = i + Δ
-    # 先计算各样本对应的上界（含）
-    # 有的 Δ 可能接近 block_size-1，此时合法 i 的选择很少；下面逐样本向量化处理。
-    # 构造每个样本的 i_max = block_size - 1 - Δ
-    i_max = (block_size - 1) - deltas
-    # 对应的“可采样长度” = i_max + 1，最小为 1（保证至少一个位置）
-    span = i_max + 1
-    # 为了一次性采样，先对每个样本生成一个 [0, span_s) 的随机数，再拼成 i
-    # 方案：先采 [0, 1) 浮点，再乘以 span，取 floor
-    # 但要保证 span>0，这里根据构造一定成立
-    rand_u = torch.rand(num_samples, device=device, generator=generator)
-    i_idx = (rand_u * span.to(rand_u.dtype)).floor().to(torch.long)
-    # i 的真实值 = i_idx（已是合法范围内）
-    j_idx = i_idx + deltas
+    # —— 采样 i，确保每个 i 的 span(i) ≥ K —— #
+    i_low = min_delta if (not allow_delta_zero or min_delta > 0) else 0  # 要保证 jU=i-min_delta >= 0
+    i_high = block_size - 1
+    i_idx = torch.empty(S, device=device, dtype=torch.long)
+    filled = torch.zeros(S, dtype=torch.bool, device=device)
 
-    # 3) 安全断言（可选）
-    # (i_idx >= 0).all(), (j_idx < block_size).all()
+    while not filled.all():
+        need = (~filled).sum().item()
+        i_try = torch.randint(i_low, i_high + 1, (need,), device=device,
+                              generator=generator, dtype=torch.long)  # [need]
 
+        if max_delta is None:
+            jL_try = torch.zeros_like(i_try)
+        else:
+            jL_try = (i_try - max_delta).clamp_min(0)
+        jU_try = i_try - min_delta   # 若 min_delta=0 则等于 i_try
+        span_try = (jU_try - jL_try + 1).clamp_min(0)
+
+        ok = span_try >= K
+        tgt = (~filled).nonzero(as_tuple=False).squeeze(1)
+        sel = tgt[ok]
+        i_idx[sel] = i_try[ok]
+        filled[sel] = True
+
+    # —— 对每个 i，不放回采样 K 个 j —— #
+    j_idx = torch.empty(S, K, device=device, dtype=torch.long)
+    for s in range(S):
+        i = int(i_idx[s].item())
+        jL = 0 if (max_delta is None) else max(i - max_delta, 0)
+        jU = i - min_delta
+        n = jU - jL + 1   # 保证 n >= K
+
+        perm = torch.randperm(n, device=device, generator=generator)
+        choices = perm[:K]                 # 无放回
+        j_idx[s] = jL + choices
+
+    deltas = i_idx.unsqueeze(1) - j_idx   # 非负
     return i_idx, j_idx, deltas
+
 def build_causal_mask(q_len: int,
                       k_len: int | None = None,
                       past_kv_len: int = 0,
@@ -200,45 +176,84 @@ def log_heatmap(tensor, name = '', vmin=-1, vmax = 0):
 
     # 记录到 wandb
     # wandb.log({f"heatmap_{name}": wandb.Image(f"heatmap.png")})
-def compute_wavelet_score_single(q_j, k_i, wavelet_decay_list, i_idx, j_idx, *, sqrt_d_scale=True):
-    H, D = q_j.shape
-    rel = j_idx - i_idx                        # 假设 0<=rel<R
-    d = wavelet_decay_list[:, rel].to(q_j)     # [D]
-    q_w = q_j * d                              # [H,D]
-    score = torch.einsum('hd,hd->', q_w, k_i)  # 标量
+def compute_wavelet_logits_many_j_for_one_i(
+    q_i: torch.Tensor,               # [H, D]
+    k_j_list: torch.Tensor,          # [K, H, D]
+    wavelet_decay_rel: torch.Tensor, # [D, R]
+    deltas: torch.Tensor,            # [K]
+):
+    assert q_i.dim()==2 and k_j_list.dim()==3
+    H, D = q_i.shape
+    K = k_j_list.size(0)
+    R = wavelet_decay_rel.size(1)
 
-    return score / math.sqrt(D)
-def compute_path_score_single(
-    q_j: torch.Tensor,      # [H, D]
-    k_i: torch.Tensor,      # [H, D]
-    w: torch.Tensor,        # [T, H, D]
-    beta: torch.Tensor,     # [T, H]
-    i_idx: int,
-    j_idx: int,
+    deltas = deltas.to(dtype=torch.long, device=q_i.device)
+    if (deltas < 0).any() or (deltas >= R).any():
+        raise ValueError(f"deltas 超界: 需在 [0,{R-1}]")
+
+    # q⊙k：[K,H,D]
+    qk = q_i.unsqueeze(0) * k_j_list
+
+    R = wavelet_decay_rel.size(1)
+    idx = (R - 1) - deltas.to(torch.long)          # [K]
+    decay_KD = wavelet_decay_rel.index_select(1, idx).t()  # [K, D]
+
+    # 逐维缩放 -> [K,H,D]
+    dim_wise_score = qk * decay_KD.unsqueeze(1)
+    return dim_wise_score / math.sqrt(D)
+
+def compute_path_scores_many_j_for_one_i(
+    q_i: torch.Tensor,          # [H, D]         固定的 q(i)
+    k_j_list: torch.Tensor,     # [K, H, D]      K 个候选的 k(j_k)
+    w: torch.Tensor,            # [T, H, D]
+    beta: torch.Tensor,         # [T, H]
+    i_idx: torch.Tensor | int,  # 标量或 size=1 的 tensor（query 的位置 i）
+    j_idx: torch.Tensor,        # [K]，每个候选的 j_k（要求 j_k < i）
     *,
     sqrt_d_scale: bool = True,
-    show_progress: bool = False,
 ) -> torch.Tensor:
-    assert q_j.dim() == 2 and k_i.dim() == 2, "q_j/k_i 应是 [H,D]"
-    assert w.dim() == 3 and beta.dim() == 2, "w:[T,H,D], beta:[T,H]"
-    H, D = q_j.shape
+    """
+    返回: scores [K]，其中第 k 个是 < q_i, (Π_{t=j_k}^{i-1} (I - β_t w_t w_t^T)) k_{j_k} >
+    复杂度 O((i - min(j)) * K * H * D)
+    """
+    assert q_i.dim() == 2 and k_j_list.dim() == 3, "q_i:[H,D], k_j_list:[K,H,D]"
+    H, D = q_i.shape
+    K = k_j_list.shape[0]
     T = w.shape[0]
     assert w.shape[1:] == (H, D) and beta.shape == (T, H)
-    if not (0 <= i_idx < j_idx <= T - 1):
-        raise ValueError(f"i/j 越界或 i>=j: i={i_idx}, j={j_idx}, T={T}")
 
-    x = k_i.clone()                     # [H,D] 作为被变换的向量
-    it = range(i_idx, j_idx)
+    # i_idx 可能是 size=1 的 tensor，转成 Python int
+    if isinstance(i_idx, torch.Tensor):
+        if i_idx.numel() != 1:
+            raise ValueError("i_idx 需为标量或 size=1 的 tensor")
+        i_idx = int(i_idx.item())
+    else:
+        i_idx = int(i_idx)
 
-    for t in it:
-        w_t = w[t]                      # [H,D]
-        b_t = beta[t].unsqueeze(-1)     # [H,1]
-        dot = (x * w_t).sum(dim=-1, keepdim=True)  # [H,1] 逐 head 的 <x_h, w_th>
-        x = x - b_t * dot * w_t         # x_h ← x_h - beta * <x_h,w_th> * w_th
+    j_idx = j_idx.to(torch.long)
+    if not (0 <= j_idx.min() < i_idx <= T - 1):
+        raise ValueError(f"索引越界或不满足 j<i：min(j)={int(j_idx.min())}, i={i_idx}, T={T}")
 
-    score_h = (q_j * x).sum(dim=-1)     # 每个 head 的标量
-    score = score_h.sum()               # 跨 head 求和 -> 标量
-    return score/math.sqrt(D)
+    # 待变换的向量，从各自 k_j 开始
+    x = k_j_list.clone()  # [K,H,D]
+
+    t_start = int(j_idx.min().item())
+    t_end   = i_idx  # 终止前一个位置 i-1
+
+    for t in range(t_start, t_end):
+        # 在时间步 t，只有那些 j_k ≤ t 的候选被“激活”并参与更新
+        mask = (j_idx <= t).to(x.dtype).view(K, 1, 1)   # [K,1,1]
+
+        if mask.any():
+            w_t = w[t].unsqueeze(0)                    # [1,H,D]
+            b_t = beta[t].unsqueeze(0).unsqueeze(-1)   # [1,H,1]
+            dot = (x * w_t).sum(dim=-1, keepdim=True)  # [K,H,1]  逐 head 的 <x_h,w_t_h>
+            x = x - mask * (b_t * dot * w_t)           # 仅对激活样本更新
+
+    scores = (q_i.unsqueeze(0) * x)  # [K, H, D]
+
+    return scores / math.sqrt(D)
+
 import random
 class PaTHAttention(nn.Module):
     def __init__(
@@ -476,17 +491,37 @@ class PaTHAttention(nn.Module):
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
             if self.layer_idx == 5 and self.training:
-                i_idx, j_idx, deltas = sample_index_pairs(self.config.block_size, num_samples=self.config.sample_num, geom_p=geom_p)
+                num_j_per_i = 16
+                _, _, H, D = q.shape
+                i_idx, j_idx, deltas = sample_j_for_each_i_unique(self.config.block_size, num_samples=self.config.sample_num, num_j_per_i=num_j_per_i)
                 for idx in range(self.config.sample_num):
-                    wavelet_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)
-                    path_attn_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)
+                    wavelet_scores = torch.empty((self.config.sample_num, num_j_per_i, H, D), device=q.device, dtype=q.dtype)
+                    path_attn_scores = torch.empty((self.config.sample_num, num_j_per_i, H, D), device=q.device, dtype=q.dtype)
                     i = i_idx[idx]
-                    j = j_idx[idx]
+                    j_per_i = j_idx[idx]
                     delta = deltas[idx]
                     b_idx = random.randint(0, 15)
-                    path_attn_scores[idx] = compute_path_score_single(q[b_idx, j], k[b_idx, i], w[b_idx], beta[b_idx], i.item(), j.item())
-                    wavelet_scores[idx] = compute_wavelet_score_single(q[b_idx, j], k[b_idx, i], wavelet_decay_table[:, -1, :], i.item(), j.item())
-                dis_loss = F.mse_loss(path_attn_scores, wavelet_scores)
+                    path_attn_scores[idx] = compute_path_scores_many_j_for_one_i(q[b_idx, i], k[b_idx, j_per_i], w[b_idx], beta[b_idx], i, j_per_i)
+                    wavelet_scores[idx] = compute_wavelet_logits_many_j_for_one_i(q[b_idx, i], k[b_idx, j_per_i], wavelet_decay_table[:, -1, :], deltas[idx])
+                    
+                path_logits  = path_attn_scores.permute(0,2,3,1).contiguous()   # [S,H,D,K]
+                wave_logits  = wavelet_scores.permute(0,2,3,1).contiguous()   # [S,H,D,K]
+
+                # 可选：对每条 (s,h,d) 的 logits 做中心化，去掉平移不变性
+                path_logits  = path_logits - path_logits.mean(dim=-1, keepdim=True)
+                wave_logits  = wave_logits - wave_logits.mean(dim=-1, keepdim=True)
+
+                tau = 1.0  # 维度级别通常不用 sqrt(D)；可设为 1.0 或学一个温度
+                log_p_s = torch.log_softmax(path_logits / tau, dim=-1)   # [S,H,D,K]
+                p_t     = torch.softmax(    wave_logits / tau, dim=-1)   # [S,H,D,K]
+
+                # 展平 (s,h,d) 为 batch，沿 K 做 KL
+                S,H,D,K = log_p_s.shape
+                dis_loss = (tau**2) * F.kl_div(
+                    log_p_s.view(-1, K),
+                    p_t.view(-1, K),
+                    reduction='batchmean'
+                )           
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
