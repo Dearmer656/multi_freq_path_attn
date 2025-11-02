@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
+import torch.distributed as dist
 
 from fla.layers.utils import pad_input, unpad_input
 from fla.modules import RMSNorm, ShortConvolution
@@ -25,6 +26,115 @@ if TYPE_CHECKING:
 
 
 import pdb
+def sample_index_pairs(
+    block_size: int,
+    num_samples: int,
+    *,
+    deltas: torch.Tensor | None = None,
+    min_delta: int = 1,
+    max_delta: int | None = None,
+    method: str = "mix",           # "mix" | "uniform" | "geometric"
+    geom_p: float = 0.2,           # 几何分布参数（期望 ~ 1/p），仅当 method in {"mix","geometric"} 时使用
+    uniform_frac: float = 0.3,     # mix 模式下，均匀采样比例
+    device: torch.device | None = None,
+    generator: torch.Generator | None = None,
+    allow_delta_zero: bool = False # 如需 Δ=0（自指）则设 True
+):
+    """
+    随机采样 (i, j) 索引对，满足 j = i + Δ，且 0 <= i < j < block_size（若 allow_delta_zero=True 则允许 i==j）。
+    - 若提供 deltas，则按给定 Δ 向量逐一采样 (i, j)；
+    - 否则按 method 生成长度为 num_samples 的 Δ 向量。
+
+    返回:
+        i_idx: LongTensor[num_samples]
+        j_idx: LongTensor[num_samples]
+        deltas: LongTensor[num_samples]  # 实际使用的 Δ
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if max_delta is None:
+        max_delta = block_size - 1
+
+    # 边界处理
+    if allow_delta_zero:
+        min_delta = 0
+    else:
+        min_delta = max(1, min_delta)
+    max_delta = max(min_delta, min(max_delta, block_size - (0 if allow_delta_zero else 1)))
+
+    if max_delta < min_delta:
+        raise ValueError(f"无可用的 Δ 范围：min_delta={min_delta}, max_delta={max_delta}, block_size={block_size}")
+
+    # 1) 生成/规范化 Δ
+    if deltas is None:
+        if method == "uniform":
+            deltas = torch.randint(
+                low=min_delta,
+                high=max_delta + 1,
+                size=(num_samples,),
+                device=device,
+                generator=generator,
+            )
+        elif method == "geometric":
+            # 采几何分布，截断到 [min_delta, max_delta]
+            # PyTorch 没有直接的几何分布，这里用伯努利和求首个成功的思路不高效；
+            # 用近似：先按几何的 PMF 构造离散表，再从表中采样（高效且可向量化）
+            support = torch.arange(min_delta, max_delta + 1, device=device)
+            # 几何分布（从1开始）的PMF: p*(1-p)^(k-1)，这里平移到 min_delta 起点
+            shifted = support - (1 if not allow_delta_zero else 0)
+            pmf = (geom_p * torch.pow(1 - geom_p, shifted - 1)).clamp_min(1e-12)
+            pmf = pmf / pmf.sum()
+            # 多项式采样
+            deltas = support[torch.multinomial(pmf, num_samples, replacement=True, generator=generator)]
+        elif method == "mix":
+            # 按 uniform_frac 混合均匀与几何
+            num_u = int(num_samples * uniform_frac)
+            num_g = num_samples - num_u
+            deltas_u = torch.randint(
+                low=min_delta, high=max_delta + 1, size=(num_u,), device=device, generator=generator
+            )
+            support = torch.arange(min_delta, max_delta + 1, device=device)
+            shifted = support - (1 if not allow_delta_zero else 0)
+            pmf = (geom_p * torch.pow(1 - geom_p, shifted - 1)).clamp_min(1e-12)
+            pmf = pmf / pmf.sum()
+            deltas_g = support[torch.multinomial(pmf, num_g, replacement=True, generator=generator)]
+            deltas = torch.empty(num_samples, device=device, dtype=torch.long)
+            deltas[:num_u] = deltas_u
+            deltas[num_u:] = deltas_g
+            # 打乱
+            perm = torch.randperm(num_samples, device=device, generator=generator)
+            deltas = deltas[perm]
+        else:
+            raise ValueError(f"未知 method: {method}")
+    else:
+        deltas = deltas.to(device=device, dtype=torch.long)
+        if (deltas < min_delta).any() or (deltas > max_delta).any():
+            raise ValueError(f"deltas 超出范围 [{min_delta}, {max_delta}]")
+
+        if deltas.numel() != num_samples:
+            # 若用户给的 deltas 数量与 num_samples 不一致，则循环扩展或截断
+            reps = (num_samples + deltas.numel() - 1) // deltas.numel()
+            deltas = deltas.repeat(reps)[:num_samples]
+
+    # 2) 对每个 Δ 采样左索引 i，使得 i ∈ [0, block_size - 1 - Δ]（包含），然后 j = i + Δ
+    # 先计算各样本对应的上界（含）
+    # 有的 Δ 可能接近 block_size-1，此时合法 i 的选择很少；下面逐样本向量化处理。
+    # 构造每个样本的 i_max = block_size - 1 - Δ
+    i_max = (block_size - 1) - deltas
+    # 对应的“可采样长度” = i_max + 1，最小为 1（保证至少一个位置）
+    span = i_max + 1
+    # 为了一次性采样，先对每个样本生成一个 [0, span_s) 的随机数，再拼成 i
+    # 方案：先采 [0, 1) 浮点，再乘以 span，取 floor
+    # 但要保证 span>0，这里根据构造一定成立
+    rand_u = torch.rand(num_samples, device=device, generator=generator)
+    i_idx = (rand_u * span.to(rand_u.dtype)).floor().to(torch.long)
+    # i 的真实值 = i_idx（已是合法范围内）
+    j_idx = i_idx + deltas
+
+    # 3) 安全断言（可选）
+    # (i_idx >= 0).all(), (j_idx < block_size).all()
+
+    return i_idx, j_idx, deltas
 def build_causal_mask(q_len: int,
                       k_len: int | None = None,
                       past_kv_len: int = 0,
@@ -90,6 +200,46 @@ def log_heatmap(tensor, name = '', vmin=-1, vmax = 0):
 
     # 记录到 wandb
     # wandb.log({f"heatmap_{name}": wandb.Image(f"heatmap.png")})
+def compute_wavelet_score_single(q_j, k_i, wavelet_decay_list, i_idx, j_idx, *, sqrt_d_scale=True):
+    H, D = q_j.shape
+    rel = j_idx - i_idx                        # 假设 0<=rel<R
+    d = wavelet_decay_list[:, rel].to(q_j)     # [D]
+    q_w = q_j * d                              # [H,D]
+    score = torch.einsum('hd,hd->', q_w, k_i)  # 标量
+
+    return score / math.sqrt(D)
+def compute_path_score_single(
+    q_j: torch.Tensor,      # [H, D]
+    k_i: torch.Tensor,      # [H, D]
+    w: torch.Tensor,        # [T, H, D]
+    beta: torch.Tensor,     # [T, H]
+    i_idx: int,
+    j_idx: int,
+    *,
+    sqrt_d_scale: bool = True,
+    show_progress: bool = False,
+) -> torch.Tensor:
+    assert q_j.dim() == 2 and k_i.dim() == 2, "q_j/k_i 应是 [H,D]"
+    assert w.dim() == 3 and beta.dim() == 2, "w:[T,H,D], beta:[T,H]"
+    H, D = q_j.shape
+    T = w.shape[0]
+    assert w.shape[1:] == (H, D) and beta.shape == (T, H)
+    if not (0 <= i_idx < j_idx <= T - 1):
+        raise ValueError(f"i/j 越界或 i>=j: i={i_idx}, j={j_idx}, T={T}")
+
+    x = k_i.clone()                     # [H,D] 作为被变换的向量
+    it = range(i_idx, j_idx)
+
+    for t in it:
+        w_t = w[t]                      # [H,D]
+        b_t = beta[t].unsqueeze(-1)     # [H,1]
+        dot = (x * w_t).sum(dim=-1, keepdim=True)  # [H,1] 逐 head 的 <x_h, w_th>
+        x = x - b_t * dot * w_t         # x_h ← x_h - beta * <x_h,w_th> * w_th
+
+    score_h = (q_j * x).sum(dim=-1)     # 每个 head 的标量
+    score = score_h.sum()               # 跨 head 求和 -> 标量
+    return score/math.sqrt(D)
+import random
 class PaTHAttention(nn.Module):
     def __init__(
         self,
@@ -111,12 +261,15 @@ class PaTHAttention(nn.Module):
         wavelet_baseline_use: bool = False,
         attn_pdrop=0.1,
         init_theta=0.847,   # initial theta for path attention ratio
+        use_soft_wavelet_fox=False,
+        config=None,
     ):
         super().__init__()
         # logging / steps
+        self.config=    config
         self.logging_steps = 1000
         self.steps = 0
-
+        self.total_steps = 100000
         self.use_wavelet_beta = use_wavelet_beta
         self.wavelet_mode = wavelet_mode
         self.hidden_size = hidden_size
@@ -226,6 +379,7 @@ class PaTHAttention(nn.Module):
         output_attentions: bool = False,
         use_cache: bool = False,
         wavelet_decay_table: Optional[torch.Tensor] = None,  # [B,T,H,] or None
+        geom_p = 0,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
@@ -280,10 +434,6 @@ class PaTHAttention(nn.Module):
                 wavelet_bias = nn.functional.softmax(wavelet_bias, dim=-1)
                 wavelet_bias = self.attn_dropout(wavelet_bias)
                 attn_output = torch.matmul(wavelet_bias, v.transpose(1, 2))
-            # rank 展开
-            q = q.repeat_interleave(self.r, dim=2)                                         # [B,T,HQ*R,d]
-            k = k.repeat_interleave(self.r, dim=2)                                         # [B,T,H*R,d]
-            v = v.repeat_interleave(self.r, dim=2)                                         # [B,T,H*R,d]
             w = rearrange(W, 'b t h r d -> b t (h r) d')                                   # [B,T,H*R,d]
 
             # === Wavelet(beta)（可选）===
@@ -297,48 +447,26 @@ class PaTHAttention(nn.Module):
                 e = self.ricker_scale_exp.to(hidden_states.dtype)                          # [1,1,H,r]
                 scale = torch.exp2(e)                                                      # [1,1,H,r]
                 shift = self.ricker_shift.to(hidden_states.dtype)                          # [1,1,H,r]
-
-                # 扩展到 [B,T,H,r]
-                # scale = scale.expand(1, T, self.num_kv_heads, self.r).expand(B, T, self.num_kv_heads, self.r)
-                # shift = shift.expand(1, T, self.num_kv_heads, self.r).expand_as(scale)
-
-                # t_affine = scale * (pos_end - shift)
                 t_affine = scale * (pos_end - shift)                                       # [B,T,H,r]
 
                 # Ricker（无 σ 版本）
                 psi = (1.0 - t_affine**2) * torch.exp(-0.5 * t_affine**2)     
                 wave = (psi - psi.min(dim=1, keepdim=True)[0]) / (psi.max(dim=1, keepdim=True)[0] - psi.min(dim=1, keepdim=True)[0] + 1e-6)             # [B,T,H,r]
-                # wave = psi - psi.mean(dim=1, keepdim=True)
-                # psi = psi - psi.mean(dim=1, keepdim=True)
-
-                # wave = (self.ricker_amp.to(beta_logits.dtype).expand_as(psi) * psi).to(beta_logits.dtype)  # [B,T,H,r]
-                # wave = rearrange(wave, 'b t h r -> b t (h r)')                             # [B,T,H*R]
-
-                # if self.wavelet_mode == "additive":
-                #     beta_logits = beta_logits + wave
-                #     beta = torch.sigmoid(beta_logits) * 2.0
-                # elif self.wavelet_mode == "softmix":
-                #     beta_base = torch.sigmoid(beta_logits) * 2.0
-                #     beta_gate = torch.sigmoid(beta_logits + wave) * 2.0
-                #     lam = torch.sigmoid(self.mix_logit)
-                #     beta = (1 - lam) * beta_base + lam * beta_gate
-                # else:
-                #     raise ValueError(f"Unknown wavelet_mode: {self.wavelet_mode}")
             beta = torch.sigmoid(beta_logits) * 2.0
             # per-head logging（参数 + 运行时）
             
-            if torch.cuda.current_device() == 0:
-                self.steps += 1
-                if (self.logging_steps > 0) and (self.steps % self.logging_steps == 0):
-                    try:
-                        ratio_head = self.path_attention_ratio if self.wavelet_baseline_use else torch.tensor(1.0, device=hidden_states.device)
-                        vals = ratio_head.detach().cpu().tolist() if ratio_head.dim() > 0 else float(ratio_head)
-                        print(f"layer{self.layer_idx}: path attention ratio: {vals}")
-                    except Exception as e:
-                        ratio_head    = self.path_attention_ratio if self.wavelet_baseline_use else torch.tensor(1.0)
+            # if torch.cuda.current_device() == 0:
+            #     self.steps += 1
+            #     if (self.logging_steps > 0) and (self.steps % self.logging_steps == 0):
+            #         try:
+            #             ratio_head = self.path_attention_ratio if self.wavelet_baseline_use else torch.tensor(1.0, device=hidden_states.device)
+            #             vals = ratio_head.detach().cpu().tolist() if ratio_head.dim() > 0 else float(ratio_head)
+            #             print(f"layer{self.layer_idx}: path attention ratio: {vals}")
+            #         except Exception as e:
+            #             ratio_head    = self.path_attention_ratio if self.wavelet_baseline_use else torch.tensor(1.0)
 
-                        vals = ratio_head.detach().cpu().tolist()
-                        print(f"layer{self.layer_idx}: path attention ratio: {vals}")
+            #             vals = ratio_head.detach().cpu().tolist()
+            #             print(f"layer{self.layer_idx}: path attention ratio: {vals}")
 
             # g（若开启）扩到 R
             if g is not None:
@@ -347,14 +475,23 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-
-            # 合并回隐维 → 输出投影
-            # theta = torch.sigmoid(self.path_attention_ratio) if self.wavelet_baseline_use else torch.tensor(1.0)
-            # o = theta * o + (1-theta) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
-            o = self.path_attention_ratio[None, None, :, None] * o + (1-self.path_attention_ratio[None, None, :, None]) * attn_output.transpose(1,2)  if self.wavelet_baseline_use else o
+            if self.layer_idx == 5 and self.training:
+                i_idx, j_idx, deltas = sample_index_pairs(self.config.block_size, num_samples=self.config.sample_num, geom_p=geom_p)
+                for idx in range(self.config.sample_num):
+                    wavelet_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)
+                    path_attn_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)
+                    i = i_idx[idx]
+                    j = j_idx[idx]
+                    delta = deltas[idx]
+                    b_idx = random.randint(0, 15)
+                    path_attn_scores[idx] = compute_path_score_single(q[b_idx, j], k[b_idx, i], w[b_idx], beta[b_idx], i.item(), j.item())
+                    wavelet_scores[idx] = compute_wavelet_score_single(q[b_idx, j], k[b_idx, i], wavelet_decay_table[:, -1, :], i.item(), j.item())
+                dis_loss = F.mse_loss(path_attn_scores, wavelet_scores)
+            else:
+                dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
-            return o, None, past_key_values
+            return o, None, past_key_values, dis_loss
 
         # ========= 其它路径（mask!=None）：最小实现 =========
         if self.use_w_shortconv:
