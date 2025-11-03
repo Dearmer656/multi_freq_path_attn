@@ -202,7 +202,7 @@ def log_heatmap(tensor, name = '', vmin=-1, vmax = 0):
     # wandb.log({f"heatmap_{name}": wandb.Image(f"heatmap.png")})
 def compute_wavelet_score_single(q_j, k_i, wavelet_decay_list, i_idx, j_idx, *, sqrt_d_scale=True):
     H, D = q_j.shape
-    rel = j_idx - i_idx                        # 假设 0<=rel<R
+    rel = i_idx - j_idx                     # 假设 0<=rel<R
     d = wavelet_decay_list[:, rel].to(q_j)     # [D]
     q_w = q_j * d                              # [H,D]
     score = torch.einsum('hd,hd->', q_w, k_i)  # 标量
@@ -419,21 +419,21 @@ class PaTHAttention(nn.Module):
             v = rearrange(v, 'b t (h d) -> b t h d', d=self.head_dim)                     # H
             W = rearrange(w, 'b t (h r d) -> b t h r d', h=self.num_kv_heads, r=self.r, d=self.head_dim)  # [B,T,H,R,d]
             W = l2_norm(W)
-            if self.wavelet_baseline_use:
-                qk = torch.matmul(q.transpose(1, 2), k.transpose(1, 2).transpose(-1, -2))
-                rel = torch.einsum("blhd,dln->blhn", q, wavelet_decay_table)
-                rel= rel.transpose(1, 2)
-                wavelet_bias = (qk + rel) / torch.full(
-                    [], self.head_dim ** 0.5, dtype=q.dtype, device=q.device
-                )
-                mask_value = torch.finfo(wavelet_bias.dtype).min
-                # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-                # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-                mask_value = torch.full([], mask_value, dtype=wavelet_bias.dtype, device=wavelet_bias.device)
-                wavelet_bias = torch.where(build_causal_mask(rel.size(-1),rel.size(-1), device='cuda'), wavelet_bias.to(wavelet_bias.dtype), mask_value)
-                wavelet_bias = nn.functional.softmax(wavelet_bias, dim=-1)
-                wavelet_bias = self.attn_dropout(wavelet_bias)
-                attn_output = torch.matmul(wavelet_bias, v.transpose(1, 2))
+            # if self.wavelet_baseline_use:
+            #     qk = torch.matmul(q.transpose(1, 2), k.transpose(1, 2).transpose(-1, -2))
+            #     rel = torch.einsum("blhd,dln->blhn", q, wavelet_decay_table)
+            #     rel= rel.transpose(1, 2)
+            #     wavelet_bias = (qk + rel) / torch.full(
+            #         [], self.head_dim ** 0.5, dtype=q.dtype, device=q.device
+            #     )
+            #     mask_value = torch.finfo(wavelet_bias.dtype).min
+            #     # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+            #     # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+            #     mask_value = torch.full([], mask_value, dtype=wavelet_bias.dtype, device=wavelet_bias.device)
+            #     wavelet_bias = torch.where(build_causal_mask(rel.size(-1),rel.size(-1), device='cuda'), wavelet_bias.to(wavelet_bias.dtype), mask_value)
+            #     wavelet_bias = nn.functional.softmax(wavelet_bias, dim=-1)
+            #     wavelet_bias = self.attn_dropout(wavelet_bias)
+            #     attn_output = torch.matmul(wavelet_bias, v.transpose(1, 2))
             w = rearrange(W, 'b t h r d -> b t (h r) d')                                   # [B,T,H*R,d]
 
             # === Wavelet(beta)（可选）===
