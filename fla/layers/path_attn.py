@@ -494,15 +494,16 @@ class PaTHAttention(nn.Module):
                 num_j_per_i = 16
                 _, _, H, D = q.shape
                 i_idx, j_idx, deltas = sample_j_for_each_i_unique(self.config.block_size, num_samples=self.config.sample_num, num_j_per_i=num_j_per_i)
+                wavelet_scores = torch.empty((self.config.sample_num, num_j_per_i, H, D), device=q.device, dtype=q.dtype)
+                path_attn_scores = torch.empty((self.config.sample_num, num_j_per_i, H, D), device=q.device, dtype=q.dtype)                
                 for idx in range(self.config.sample_num):
-                    wavelet_scores = torch.empty((self.config.sample_num, num_j_per_i, H, D), device=q.device, dtype=q.dtype)
-                    path_attn_scores = torch.empty((self.config.sample_num, num_j_per_i, H, D), device=q.device, dtype=q.dtype)
                     i = i_idx[idx]
                     j_per_i = j_idx[idx]
                     delta = deltas[idx]
                     b_idx = random.randint(0, 15)
                     path_attn_scores[idx] = compute_path_scores_many_j_for_one_i(q[b_idx, i], k[b_idx, j_per_i], w[b_idx], beta[b_idx], i, j_per_i)
-                    wavelet_scores[idx] = compute_wavelet_logits_many_j_for_one_i(q[b_idx, i], k[b_idx, j_per_i], wavelet_decay_table[:, -1, :], deltas[idx])
+                    with torch.no_grad():                    
+                        wavelet_scores[idx] = compute_wavelet_logits_many_j_for_one_i(q[b_idx, i], k[b_idx, j_per_i], wavelet_decay_table[:, -1, :], deltas[idx])
                     
                 path_logits  = path_attn_scores.permute(0,2,3,1).contiguous()   # [S,H,D,K]
                 wave_logits  = wavelet_scores.permute(0,2,3,1).contiguous()   # [S,H,D,K]
