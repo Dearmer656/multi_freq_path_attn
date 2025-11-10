@@ -475,7 +475,7 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if self.layer_idx == 0 and self.training:
+            if (self.layer_idx == 0 or self.layer_idx == 5) and self.training:
                 wavelet_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)
                 path_attn_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)                
                 i_idx, j_idx, deltas = sample_index_pairs(self.config.block_size, num_samples=self.config.sample_num, geom_p=geom_p)
