@@ -475,17 +475,22 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if self.layer_idx == 5 and self.training:
+            if self.layer_idx == 0 and self.training:
+                wavelet_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)
+                path_attn_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)                
                 i_idx, j_idx, deltas = sample_index_pairs(self.config.block_size, num_samples=self.config.sample_num, geom_p=geom_p)
                 for idx in range(self.config.sample_num):
-                    wavelet_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)
-                    path_attn_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)
                     i = i_idx[idx]
                     j = j_idx[idx]
-                    delta = deltas[idx]
+                    # delta = deltas[idx]
+                    # b_idx_all = torch.randint(0, q.size(0), (self.config.sample_num,), device=q.device, generator=generator)
                     b_idx = random.randint(0, 15)
                     path_attn_scores[idx] = compute_path_score_single(q[b_idx, j], k[b_idx, i], w[b_idx], beta[b_idx], i.item(), j.item())
                     wavelet_scores[idx] = compute_wavelet_score_single(q[b_idx, j], k[b_idx, i], wavelet_decay_table[:, -1, :], i.item(), j.item())
+                    with torch.no_grad():  # 4) teacher 不反传
+                        wavelet_scores[idx] = compute_wavelet_score_single(
+                            q[b_idx, j], k[b_idx, i], wavelet_decay_table[:, -1, :], i.item(), j.item()
+                        )                    
                 dis_loss = F.mse_loss(path_attn_scores, wavelet_scores)
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
