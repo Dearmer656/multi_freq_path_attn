@@ -200,14 +200,65 @@ def log_heatmap(tensor, name = '', vmin=-1, vmax = 0):
 
     # 记录到 wandb
     # wandb.log({f"heatmap_{name}": wandb.Image(f"heatmap.png")})
-def compute_wavelet_score_single(q_j, k_i, wavelet_decay_list, i_idx, j_idx, *, sqrt_d_scale=True):
-    H, D = q_j.shape
-    rel = i_idx - j_idx                     # 假设 0<=rel<R
-    d = wavelet_decay_list[:, rel].to(q_j)     # [D]
-    q_w = q_j * d                              # [H,D]
-    score = torch.einsum('hd,hd->', q_w, k_i)  # 标量
+def compute_wavelet_scores_batched(
+    q: torch.Tensor,                  # [S, H, D]
+    k: torch.Tensor,                  # [S, H, D]
+    wavelet_decay_list: torch.Tensor, # [D, L]  相对距离表
+    i_idx: torch.Tensor,              # [S]
+    j_idx: torch.Tensor,              # [S]
+    *,
+    sqrt_d_scale: bool = True,
+    table_direction: str = "near_to_far",  # or "far_to_near"
+) -> torch.Tensor:
+    """
+    对 S 组 (q_i, k_j) 批量计算 wavelet 打分：
+      score_s = < q_s ⊙ ψ(Δ_s), k_s > ,  其中 Δ_s = i_s - j_s
+    返回: scores [S]
+    """
+    assert q.dim()==3 and k.dim()==3, "q,k 应为 [S,H,D]"
+    assert q.shape == k.shape, "q,k 形状必须一致"
+    S, H, D = q.shape
+    assert wavelet_decay_list.dim()==2 and wavelet_decay_list.size(0)==D, "wavelet_decay_list 应为 [D,L]"
 
-    return score / math.sqrt(D)
+    device = q.device
+    dtype  = q.dtype
+    L = wavelet_decay_list.size(1)
+
+    # Δ = i - j
+    rel = (i_idx.to(device=device, dtype=torch.long)
+           - j_idx.to(device=device, dtype=torch.long))
+
+    # 方向与边界
+    idx = L - 1 + rel
+    # if table_direction == "near_to_far":
+    #     idx = rel
+    # elif table_direction == "far_to_near":
+    #     idx = (L - 1) - rel
+    # else:
+    #     raise ValueError("table_direction 必须是 'near_to_far' 或 'far_to_near'")
+
+    # if (idx < 0).any() or (idx >= L).any():
+    #     raise ValueError(f"Δ 索引越界: 需在 [0, {L-1}]，但收到最小 {int(idx.min())} 最大 {int(idx.max())}")
+
+    # 一次性从表中取出每个样本对应的 ψ(Δ)：[D,S] -> [S,1,D]
+    psi_SD = wavelet_decay_list.index_select(dim=1, index=idx) \
+                                 .to(device=device, dtype=dtype)  # [D,S]
+    psi_SD = psi_SD.transpose(0, 1).unsqueeze(1).contiguous()      # [S,1,D]
+    # 逐维缩放并与 k 点乘；对 (H,D) 求和得到标量分数
+    q_weighted = q * psi_SD                  # [S,H,D]
+    scores = (q_weighted * k).sum(dim=(1, 2))  # [S]
+
+    if sqrt_d_scale:
+        scores = scores / math.sqrt(D)
+    return scores
+# def compute_wavelet_score_single(q_j, k_i, wavelet_decay_list, i_idx, j_idx, *, sqrt_d_scale=True):
+#     H, D = q_j.shape
+#     rel = i_idx - j_idx                     # 假设 0<=rel<R
+#     d = wavelet_decay_list[:, rel].to(q_j)     # [D]
+#     q_w = q_j * d                              # [H,D]
+#     score = torch.einsum('hd,hd->', q_w, k_i)  # 标量
+
+#     return score / math.sqrt(D)
 def compute_path_score_single(
     q_j: torch.Tensor,      # [H, D]
     k_i: torch.Tensor,      # [H, D]
@@ -475,22 +526,30 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if (self.layer_idx == 0 or self.layer_idx == 5) and self.training:
+            if (self.layer_idx == 0) and self.training:
                 wavelet_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)
                 path_attn_scores = torch.empty(self.config.sample_num, device=q.device, dtype=q.dtype)                
                 i_idx, j_idx, deltas = sample_index_pairs(self.config.block_size, num_samples=self.config.sample_num, geom_p=geom_p)
+                b_idx_all = torch.randint(
+                                            low=0,
+                                            high=16,  # 注意上界是开区间 → high=16 才能包含15
+                                            size=(self.config.sample_num,),
+                                            device=q.device,
+                                        )
+                wavelet_scores = compute_wavelet_scores_batched(q[b_idx_all, j_idx, :, :], k[b_idx_all, i_idx, :, :], wavelet_decay_table[:, -1, :], i_idx, j_idx)
                 for idx in range(self.config.sample_num):
                     i = i_idx[idx]
                     j = j_idx[idx]
                     # delta = deltas[idx]
                     # b_idx_all = torch.randint(0, q.size(0), (self.config.sample_num,), device=q.device, generator=generator)
-                    b_idx = random.randint(0, 15)
+                    # b_idx = random.randint(0, 15)
+                    b_idx = b_idx_all[idx].item()
                     path_attn_scores[idx] = compute_path_score_single(q[b_idx, j], k[b_idx, i], w[b_idx], beta[b_idx], i.item(), j.item())
-                    wavelet_scores[idx] = compute_wavelet_score_single(q[b_idx, j], k[b_idx, i], wavelet_decay_table[:, -1, :], i.item(), j.item())
-                    with torch.no_grad():  # 4) teacher 不反传
-                        wavelet_scores[idx] = compute_wavelet_score_single(
-                            q[b_idx, j], k[b_idx, i], wavelet_decay_table[:, -1, :], i.item(), j.item()
-                        )                    
+                    # wavelet_scores[idx] = compute_wavelet_score_single(q[b_idx, j], k[b_idx, i], wavelet_decay_table[:, -1, :], i.item(), j.item())
+                    # with torch.no_grad():  # 4) teacher 不反传
+                    #     wavelet_scores[idx] = compute_wavelet_score_single(
+                    #         q[b_idx, j], k[b_idx, i], wavelet_decay_table[:, -1, :], i.item(), j.item()
+                    #     )                    
                 dis_loss = F.mse_loss(path_attn_scores, wavelet_scores)
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
