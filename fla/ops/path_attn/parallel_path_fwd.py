@@ -12,6 +12,7 @@ from fla.ops.utils import prepare_chunk_indices
 @triton.jit(do_not_specialize=['T'])
 def parallel_path_fwd_kernel(
     q,
+    # last_wq,
     k,
     v,
     o,
@@ -131,7 +132,29 @@ def parallel_path_fwd_kernel(
         b_o += tl.dot(b_s.to(b_v.dtype), b_v)
         b_s2 = tl.dot(b_q.to(b_w1.dtype), b_w1)
         b_q -= tl.dot(b_s2.to(b_w2.dtype), b_w2)
+    # i_t_last = (T - 1) // BT
+    # if i_t == i_t_last:
+    #     sample_idx = i_n if IS_VARLEN else i_b
 
+    #     # 我们要写入 last_wq[sample_idx, i_hq, :, :] 这一块
+    #     # last_wq 的 shape 是 [B, HQ, BT, K]，内存默认连续
+    #     # flatten 后这一块的起始偏移 = ((sample_idx * HQ + i_hq) * BT) * K
+    #     base_offset = ((sample_idx * HQ + i_hq) * BT) * K
+
+    #     # 创建一个 [BT, K] 的 block_ptr
+    #     p_last = tl.make_block_ptr(
+    #         last_wq + base_offset,
+    #         (BT, K),        # shape
+    #         (K, 1),         # strides: row stride = K, col stride = 1
+    #         (0, 0),         # offsets
+    #         (BT, K),        # block shape: 整块
+    #         (1, 0),         # row-major
+    #     )
+    #     tl.store(
+    #         p_last,
+    #         b_q.to(p_last.dtype.element_ty),
+    #         boundary_check=(0, 1),
+    #     )
     b_o = b_o / b_l[:, None]
     p_o_new = tl.make_block_ptr(o_new + (bos * HQ + i_hq) * V, (T, V), (HQ*V, 1), (i_t*BT, 0), (BT, BV), (1, 0))
     tl.store(p_o_new, b_o.to(p_o_new.dtype.element_ty), boundary_check=(0, 1))
@@ -164,7 +187,6 @@ def parallel_path_fwd_fn(
     grid = (NT, B * HQ)
     o_new = torch.empty_like(o, dtype=v.dtype)
     L_new = torch.empty_like(L)
-
     parallel_path_fwd_kernel[grid](
         q=q,
         k=k,

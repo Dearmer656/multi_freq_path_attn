@@ -298,16 +298,22 @@ def compute_path_scores_batched_last_q(
 
     return scores
 import random
-def spectrum_over_L(x: torch.Tensor, eps: float = 1e-6):
+def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
     """
-    x: [B, L, H, D]
-    沿 L 维做 rFFT
+    x: [B, Q, T, H, D]
+    沿 T 维 (dim=2) 做 rFFT，得到每个 (B,Q,H,D) 上的频谱。
+    
+    返回:
+        A    : [B, Q, K, H, D]   幅值
+        A_log: [B, Q, K, H, D]   log 幅值
+        其中 K = T//2 + 1
     """
-    L = x.size(1)
-    # hann = torch.hann_window(L, device=x.device, dtype=x.dtype)
-    # xw = x * hann.view(1, L, 1, 1)
-    X  = torch.fft.rfft(x, dim=1, norm='ortho')   # 沿 L 做 FFT
-    A  = X.abs()
+    assert x.dim() == 5, "x 应为 [B, Q, T, H, D]"
+    B, Q, T, H, D = x.shape
+
+    # rFFT over T dimension
+    X = torch.fft.rfft(x, dim=2, norm='ortho')   # [B, Q, K, H, D]
+    A = X.abs()
     A_log = torch.log(A.clamp_min(eps))
     return A, A_log
 
@@ -321,8 +327,8 @@ def spectral_distill_over_L(
     lambda_cos: float = 0.0,             # 需要时再开
 ):
     with torch.no_grad():
-        A_t, A_t_log = spectrum_over_L(teacher)   # [B,L,H,K]  teacher不反传
-    A_s, A_s_log = spectrum_over_L(student)       # [B,L,H,K]
+        A_t, A_t_log = spectrum_over_T_multi(teacher)   # [B,Q,K,H,D]  teacher不反传
+    A_s, A_s_log = spectrum_over_T_multi(student)       # [B,Q,K,H,D]
 
     # 频带加权（可选）
     if w_band is not None:
@@ -334,6 +340,272 @@ def spectral_distill_over_L(
     # 1) 对数幅值 MSE
     loss_spec_mse = ((A_s_log - A_t_log)**2 * w).mean()
     return loss_spec_mse
+def path_attn_last_query_elementwise(Q_last, K, W, beta):
+    """
+    使用 UT 分解计算 PaTH 的“有效 q 向量”，只针对最后一个 query token。
+    
+    参数:
+        Q_last : [B, 1, H, D]
+            已经是「最后一个 token」的 query，通常来自：
+                Q_last = Q_all[:, -1:, :, :]
+        K      : [B, T, H, D]
+        W      : [B, T, H, D]    PaTH 中的 Householder 向量 w_t
+        beta   : [B, T, H]       Householder 系数 β_t
+
+    返回:
+        out    : [B, T, H, D]
+            out[b, t, h, d] = K[b, t, h, d] * (Q_last[b, 0, h, d] - S_{b,h,t+1,d})
+            其中 S_{b,h,t+1} 是根据 UT 分解得到的修正向量。
+            对最后一位 t = T-1，S_{b,h,T} 视为 0。
+    """
+    B, one, H, D = Q_last.shape
+    assert one == 1, "Q_last 应为 [B, 1, H, D]，且只包含最后一个 token"
+    assert K.shape == (B, K.shape[1], H, D)
+    assert W.shape == K.shape
+    assert beta.shape == (B, K.shape[1], H)
+
+    B_, T, H_, D_ = K.shape
+    assert B_ == B and H_ == H and D_ == D
+
+    device = Q_last.device
+    dtype = Q_last.dtype
+
+    # 把 (B, H) 拉平成一个大的 batch 维 BH，方便用 batched 矩阵运算
+    BH = B * H
+
+    # Q_last: [B, 1, H, D] -> [BH, D]
+    # 注意：这里的这个 token 就是“原序列的最后一个 token”
+    q_last = Q_last.reshape(B, 1, H, D)[:, 0, :, :].reshape(BH, D)  # [BH, D]
+
+    # K_flat, W_flat: [B, T, H, D] -> [BH, T, D]
+    K_flat = K.permute(0, 2, 1, 3).reshape(BH, T, D)      # [BH, T, D]
+    W_flat = W.permute(0, 2, 1, 3).reshape(BH, T, D)      # [BH, T, D]
+
+    # beta_flat: [B, T, H] -> [BH, T]
+    beta_flat = beta.permute(0, 2, 1).reshape(BH, T)      # [BH, T]
+
+    # ===== 1) 构造 batched 的 WDWT = (W * beta) @ W^T =====
+    B_scaled = W_flat * beta_flat.unsqueeze(-1)           # [BH, T, D]
+    WDWT = B_scaled @ W_flat.transpose(1, 2)              # [BH, T, T]
+
+    # strict lower 部分 + I -> T_basic = I + strictLower(WDW^T)
+    Lmat = torch.tril(WDWT, diagonal=-1)                  # [BH, T, T]
+    I = torch.eye(T, device=device, dtype=dtype).expand(BH, T, T)
+    T_basic = I + Lmat                                    # [BH, T, T] 下三角
+
+    # ===== 2) 计算 x = T_basic^{-1} (beta ⊙ (W q_last)) =====
+    # t = W q_last : [BH, T]，用逐元素乘再 sum 避免多一次 @
+    t = (W_flat * q_last.unsqueeze(1)).sum(dim=-1)        # [BH, T]
+    z = beta_flat * t                                     # [BH, T]
+
+    x = torch.linalg.solve_triangular(
+        T_basic, z.unsqueeze(-1), upper=False
+    ).squeeze(-1)                                         # [BH, T]
+
+    # ===== 3) U_m = x_m * w_m, 做 suffix sum 得到 S_t =====
+    U = W_flat * x.unsqueeze(-1)                          # [BH, T, D]
+
+    # S[t] = sum_{m=t}^{T-1} U[m]
+    U_flip = torch.flip(U, dims=[1])                      # 反转时间维
+    S_flip = torch.cumsum(U_flip, dim=1)
+    S = torch.flip(S_flip, dims=[1])                      # [BH, T, D]
+
+    # S_shift[j] = S[j+1]，最后一个位置的修正为 0
+    S_shift = torch.zeros_like(S)
+    if T > 1:
+        S_shift[:, :-1] = S[:, 1:]                        # S_shift[:, j] = S[:, j+1]
+
+    # ===== 4) 有效 q: q_eff[j] = q_last - S_{j+1} =====
+    q_eff = q_last.unsqueeze(1) - S_shift                 # [BH, T, D]
+
+    # 按维度乘以 key，得到你要的 [BH, T, D]
+    out_flat = K_flat * q_eff                             # [BH, T, D]
+
+    # reshape 回 [B, T, H, D]
+    out = out_flat.reshape(B, H, T, D).permute(0, 2, 1, 3)
+
+    return out
+def path_attn_multi_query_elementwise(Q_sel, K, W, beta, offsets=(1, 8, 16, 32)):
+    """
+    使用 UT 分解，针对多个 query 位置一次性计算 PaTH 的“有效 q 向量”，
+    并输出与所有 K 的逐维乘积（带严格 causal：未来 reflectors 不影响当前 query）。
+
+    参数:
+        Q_sel  : [B, Q, H, D]，这里 Q = 4
+                 第 q 个 query 是从原序列末尾数 offsets[q] 个位置：
+                     idx_q = T - offsets[q]
+        K      : [B, T, H, D]
+        W      : [B, T, H, D]
+        beta   : [B, T, H]
+        offsets: 长度 Q 的 tuple，例如 (1, 8, 16, 32)，表示相对末尾的偏移
+
+    返回:
+        out    : [B, Q, T, H, D]
+                 out[b, q, j, h, d]
+                 = 1_{j <= i_q} * K[b, j, h, d] * ( q_{b,q,h,d} - S^{(b,h,q)}_{j+1,d} )
+    """
+    B, Q, H, D = Q_sel.shape
+    assert Q == len(offsets), "Q_sel 第二维和 offsets 长度必须一致"
+    assert K.shape == (B, K.shape[1], H, D)
+    assert W.shape == K.shape
+    assert beta.shape == (B, K.shape[1], H)
+
+    B_, T, H_, D_ = K.shape
+    assert B_ == B and H_ == H and D_ == D
+
+    device = Q_sel.device
+    dtype = Q_sel.dtype
+    BH = B * H   # 把 (B,H) 合并成大 batch 维
+
+    # ---- 0) 预处理：把 (B,H) 拉平 ----
+    # Q_sel: [B, Q, H, D] -> [BH, Q, D]
+    q_sel = Q_sel.permute(0, 2, 1, 3).reshape(BH, Q, D)          # [BH, Q, D]
+
+    # K, W: [B, T, H, D] -> [BH, T, D]
+    K_flat = K.permute(0, 2, 1, 3).reshape(BH, T, D)             # [BH, T, D]
+    W_flat = W.permute(0, 2, 1, 3).reshape(BH, T, D)             # [BH, T, D]
+
+    # beta: [B, T, H] -> [BH, T]
+    beta_flat = beta.permute(0, 2, 1).reshape(BH, T)             # [BH, T]
+
+    # ---- 1) 构造 T_basic = I + strictLower(W D W^T) ----
+    B_scaled = W_flat * beta_flat.unsqueeze(-1)                  # [BH, T, D]
+    WDWT = B_scaled @ W_flat.transpose(1, 2)                     # [BH, T, T]
+
+    Lmat = torch.tril(WDWT, diagonal=-1)                         # strict lower
+    I = torch.eye(T, device=device, dtype=dtype).expand(BH, T, T)
+    T_basic = I + Lmat                                           # [BH, T, T] 下三角
+
+    # ---- 2) 为每个 query 位置 i_q 构造右侧 mask M_R^{(i_q)} ----
+    offsets = torch.tensor(offsets, device=device, dtype=torch.long)  # [Q]
+    pos = T - offsets                                            # [Q], 绝对下标 i_q
+    pos = torch.clamp(pos, 0, T - 1)
+
+    t_idx = torch.arange(T, device=device)                       # [T]
+    # 对 reflector 索引 m: mask_R[q, m] = 1_{ m <= i_q }
+    mask_R = (t_idx.unsqueeze(0) <= pos.unsqueeze(1))            # [Q, T]
+    mask_R = mask_R.to(dtype)                                    # float 型
+
+    # ---- 3) 计算 y^{(q)} = T^{-1} (W⊙M_R^{(i_q)}) q^{(q)} ----
+    # t_all[b,h,q,t] = w_t^T q^{(q)}
+    t_all = (W_flat.unsqueeze(1) * q_sel.unsqueeze(2)).sum(dim=-1)    # [BH, Q, T]
+
+    # z = beta ⊙ mask_R ⊙ (W q)
+    z = beta_flat.unsqueeze(1) * t_all * mask_R.unsqueeze(0)          # [BH, Q, T]
+
+    x = torch.linalg.solve_triangular(
+        T_basic.unsqueeze(1),    # [BH, 1, T, T]
+        z.unsqueeze(-1),         # [BH, Q, T, 1]
+        upper=False
+    ).squeeze(-1)                                                    # [BH, Q, T]
+
+    # 🔴 关键修复：显式清零 m > i_q 的系数，防止未来 reflectors 泄漏进来
+    mask_R_bh = mask_R.unsqueeze(0)                                  # [1, Q, T]
+    x = x * mask_R_bh                                                # [BH, Q, T]
+
+    # ---- 4) U_m^{(q)} = x_m^{(q)} w_m，suffix sum 得到 S_t^{(q)} ----
+    U = W_flat.unsqueeze(1) * x.unsqueeze(-1)                        # [BH, Q, T, D]
+
+    U_flip = torch.flip(U, dims=[2])                                 # [BH, Q, T, D]
+    S_flip = torch.cumsum(U_flip, dim=2)
+    S = torch.flip(S_flip, dims=[2])                                 # [BH, Q, T, D]
+
+    S_shift = torch.zeros_like(S)
+    if T > 1:
+        S_shift[:, :, :-1, :] = S[:, :, 1:, :]                       # [BH, Q, T, D]
+
+    # ---- 5) q_eff^{(q)}[j] = q^{(q)} - S^{(q)}_{j+1} ----
+    q_eff = q_sel.unsqueeze(2) - S_shift                             # [BH, Q, T, D]
+
+    # ---- 6) 与 K 做逐维乘积 ----
+    out_flat = K_flat.unsqueeze(1) * q_eff                           # [BH, Q, T, D]
+
+    # ---- 7) key 维度的 causal mask：对 j > i_q 置 0（可选，但建议保留）----
+    mask_key = (t_idx.unsqueeze(0) <= pos.unsqueeze(1)).to(dtype)    # [Q, T]
+    mask_key = mask_key.unsqueeze(0).unsqueeze(-1)                   # [1, Q, T, 1]
+    out_flat = out_flat * mask_key                                   # [BH, Q, T, D]
+
+    # reshape 回 [B, Q, T, H, D]
+    out = out_flat.reshape(B, H, Q, T, D).permute(0, 2, 3, 1, 4)
+
+    return out
+def compute_wavelet_scores_multi_causal(
+    q: torch.Tensor,                  # [B, Q, H, D]
+    k: torch.Tensor,                  # [B, T, H, D]
+    wavelet_decay_list: torch.Tensor, # [D, L]  相对距离表 (delta >= 0)
+    query_indices,                    # 长度 Q，可迭代，存放每个 query 的绝对位置 i_q
+    *,
+    table_direction: str = "near_to_far",  # or "far_to_near"
+) -> torch.Tensor:
+    """
+    多个 query 的 wavelet PE teacher 版本（因果：只看左边）。
+    对于第 q 个 query:
+        - 位置 i_q = query_indices[q]
+        - 只对 j <= i_q 的 key 生效
+        - 相对距离 delta = i_q - j (>=0)，用 wavelet_decay_list[:, delta]
+
+    参数:
+        q  : [B, Q, H, D]
+        k  : [B, T, H, D]
+        wavelet_decay_list: [D, L]
+        query_indices     : 长度 Q 的 list/1D tensor，元素在 [0, T-1]
+        table_direction   : wavelet 表列方向
+
+    返回:
+        scores: [B, Q, T, H, D]
+    """
+    assert q.dim() == 4, "q 应为 [B, Q, H, D]"
+    B, Q, H, D = q.shape
+    assert k.shape[0] == B and k.shape[2] == H and k.shape[3] == D, "k 维度不匹配"
+    _, T, _, _ = k.shape
+
+    assert wavelet_decay_list.dim() == 2 and wavelet_decay_list.size(0) == D, \
+        "wavelet_decay_list 应为 [D, L]"
+    L = wavelet_decay_list.size(1)
+
+    device = q.device
+    dtype  = q.dtype
+
+    # 1) 处理 query 的绝对位置 i_q
+    query_indices = torch.as_tensor(query_indices, device=device, dtype=torch.long)  # [Q]
+    assert query_indices.numel() == Q, "query_indices 长度必须和 Q 相同"
+
+    # 2) 计算每个 (q, j) 的相对距离 delta = i_q - j
+    t_idx = torch.arange(T, device=device)              # [T]
+    # rel[q, j] = i_q - j
+    rel = query_indices.unsqueeze(1) - t_idx.unsqueeze(0)  # [Q, T]
+
+    # 合法区间：0 <= delta < L  (delta < 0 是右侧，将被 mask 掉)
+    valid = (rel >= 0) & (rel < L)                      # [Q, T]
+    rel_clamped = rel.clamp(0, L - 1)                   # [Q, T]
+
+    # 3) 准备 wavelet 表（处理 near_to_far / far_to_near）
+    decay_table = wavelet_decay_list.to(device=device, dtype=dtype)  # [D, L]
+    if table_direction == "near_to_far":
+        # 列 0 是 delta=0，列 1 是 delta=1，...
+        base_table = decay_table.transpose(0, 1)        # [L, D]
+    elif table_direction == "far_to_near":
+        # 列 0 是最远的，flip 一下再当 near_to_far 用
+        base_table = torch.flip(decay_table, dims=[1]).transpose(0, 1)  # [L, D]
+    else:
+        raise ValueError(f"未知 table_direction: {table_direction}")
+
+    # 4) 为每个 (q, j) 按 delta 取出对应的 D 维衰减
+    # decay_qt_d[q, j, d] = base_table[rel_clamped[q, j], d]
+    decay_qt_d = base_table[rel_clamped]                # [Q, T, D]
+    # 把右侧 (delta<0) 或超出 L 的位置置零
+    decay_qt_d = decay_qt_d * valid.unsqueeze(-1)       # [Q, T, D]
+
+    # 5) 扩展成 [1, Q, T, 1, D] 以便和 (B,Q,T,H,D) 广播
+    decay = decay_qt_d.unsqueeze(0).unsqueeze(3)        # [1, Q, T, 1, D]
+
+    # 6) 主体计算：q * k * decay
+    # q: [B,Q,H,D] -> [B,Q,1,H,D]
+    # k: [B,T,H,D] -> [B,1,T,H,D]
+    scores = q[:, :, None, :, :] * k[:, None, :, :, :]  # [B,Q,T,H,D]
+    scores = scores * decay                             # [B,Q,T,H,D]
+
+    return scores
 
 class PaTHAttention(nn.Module):
     def __init__(
@@ -570,9 +842,17 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if (self.layer_idx == 0) and self.training:
-                wavelet_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
-                path_attn_scores = compute_path_scores_batched_last_q(q[:,-1,...], k, w, beta)
+            if (self.layer_idx < 1) and self.training:
+                offsets = (1, 8, 16, 32)
+                idx = [k.size(1) - o for o in offsets]       # 绝对下标
+                Q_sel = q[:, idx, :, :]                
+                with torch.no_grad():
+                    # 计算 wavelet 分数
+                    wavelet_scores = compute_wavelet_scores_multi_causal(Q_sel, k, wavelet_decay_table[:, -1, :], query_indices=idx, table_direction="near_to_far")
+                    # wavelet_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
+               
+                path_attn_scores = path_attn_multi_query_elementwise(Q_sel, k, w, beta)
+                # pdb.set_trace()
                 dis_loss = spectral_distill_over_L(path_attn_scores, wavelet_scores)
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
@@ -1004,7 +1284,6 @@ class PaTHAttentionWfreq(nn.Module):
 
         # === ③ β（忘记门）===
         beta_logits = self.bt_proj(hidden_states)                      # [B,T,H*R]
-        # pdb.set_trace()
         if self.use_beta_modulation:
             Hf = c.size(2)                                            # 1 or H
             amp = self.beta_amp                                       # [1,1,Hf,r]
