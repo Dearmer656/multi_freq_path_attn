@@ -536,7 +536,8 @@ class PaTHAttention(nn.Module):
                                             size=(self.config.sample_num,),
                                             device=q.device,
                                         )
-                wavelet_scores = compute_wavelet_scores_batched(q[b_idx_all, j_idx, :, :], k[b_idx_all, i_idx, :, :], wavelet_decay_table[:, -1, :], i_idx, j_idx)
+                with torch.no_grad():
+                    wavelet_scores = compute_wavelet_scores_batched(q[b_idx_all, j_idx, :, :], k[b_idx_all, i_idx, :, :], wavelet_decay_table[:, -1, :], i_idx, j_idx)
                 for idx in range(self.config.sample_num):
                     i = i_idx[idx]
                     j = j_idx[idx]
