@@ -26,6 +26,78 @@ if TYPE_CHECKING:
 
 
 import pdb
+import os
+import torch
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+
+def plot_out_head_dim_traces(
+    out: torch.Tensor,
+    name="",
+    save_dir: str = "plots_out_traces",
+    step: int = 16,
+    separate_plots: bool = False,
+):
+    """
+    对 out[B, T, H, D] 的最后一维每 step 个维度取一个（默认 0,16,32,48...），
+    在 B 维上平均后，画出 H * (D/step) 条折线图，并保存为 png。
+
+    Args:
+        out: Tensor, 形状 [B, T, H, D]
+        save_dir: 保存图片的目录
+        step: 从最后一维每 step 取一个维度（默认 16）
+        separate_plots:
+            True: 每个 (head, dim) 一张图 -> H * (D/step) 张
+            False: 每个 head 一张图，里面画多个 dim 的曲线 -> H 张
+    """
+    assert out.dim() == 4, f"out 需要是 [B, T, H, D]，当前形状为 {out.shape}"
+    B, T, H, D = out.shape
+    assert D % step == 0, f"D={D} 必须能被 step={step} 整除"
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 取最后一维中每 step 个位置：0, step, 2*step, ...
+    device = out.device
+    selected_indices = torch.arange(0, D, step, device=device)  # [D/step]
+
+    # 选出这些维度: [B, T, H, D/step]
+    out_selected = out[..., selected_indices]
+
+    # 沿 B 维度平均: [T, H, D/step]
+    out_mean = out_selected.mean(dim=0)
+
+    # 搬到 CPU，转 numpy 画图
+    out_mean_np = out_mean.cpu().numpy()  # [T, H, D/step]
+    time = range(T)
+    idx_list = selected_indices.tolist()
+
+    if separate_plots:
+        # 每个 (head, dim) 一张图
+        for h in tqdm(range(H), desc="heads"):
+            for i, d_idx in enumerate(idx_list):
+                plt.figure()
+                plt.plot(time, out_mean_np[:, h, i])
+                plt.xlabel("T (time index)")
+                plt.ylabel("value")
+                plt.title(f"head={h}, dim={d_idx}")
+                plt.tight_layout()
+                plt.savefig(os.path.join(save_dir, f"head{h}_dim{d_idx}.png"))
+                plt.close()
+    else:
+        # 每个 head 一张图，里面画多个 dim 曲线
+        for h in tqdm(range(H), desc="heads"):
+            plt.figure()
+            for i, d_idx in enumerate(idx_list):
+                plt.plot(time, out_mean_np[:, h, i], label=f"dim={d_idx}")
+            plt.xlabel("T (time index)")
+            plt.ylabel("value")
+            plt.title(f"head={h}")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(save_dir, f"{name}_head{h}_multi_dims.png"))
+            plt.close()
+
 def sample_index_pairs(
     block_size: int,
     num_samples: int,
@@ -320,6 +392,7 @@ def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
 def spectral_distill_over_L(
     student: torch.Tensor,   # [B, L, H, D]  (path_attn_scores 映射/reshape到该形状)
     teacher: torch.Tensor,   # [B, L, H, D]  (wavelet_scores 映射/reshape到该形状)
+    layer_idx:int,
     *, tau: float = 1.0,
     w_band: torch.Tensor | None = None,  # [K] 可选频带权重
     lambda_mse: float = 1.0,
@@ -329,6 +402,8 @@ def spectral_distill_over_L(
     with torch.no_grad():
         A_t, A_t_log = spectrum_over_T_multi(teacher)   # [B,Q,K,H,D]  teacher不反传
     A_s, A_s_log = spectrum_over_T_multi(student)       # [B,Q,K,H,D]
+    plot_out_head_dim_traces(A_t_log.squeeze(1), save_dir='spectrum_domain_plots', name=f"layer{layer_idx}_teacher")
+    plot_out_head_dim_traces(A_s_log.squeeze(1), save_dir='spectrum_domain_plots', name=f"layer{layer_idx}_student")
 
     # 频带加权（可选）
     if w_band is not None:
@@ -425,7 +500,7 @@ def path_attn_last_query_elementwise(Q_last, K, W, beta):
     out = out_flat.reshape(B, H, T, D).permute(0, 2, 1, 3)
 
     return out
-def path_attn_multi_query_elementwise(Q_sel, K, W, beta, offsets=(1, 8, 16, 32)):
+def path_attn_multi_query_elementwise(Q_sel, K, W, beta, offsets=(1)):
     """
     使用 UT 分解，针对多个 query 位置一次性计算 PaTH 的“有效 q 向量”，
     并输出与所有 K 的逐维乘积（带严格 causal：未来 reflectors 不影响当前 query）。
@@ -842,20 +917,22 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if (self.layer_idx < 1) and self.training:
-                offsets = (1, 8, 16, 32)
-                idx = [k.size(1) - o for o in offsets]       # 绝对下标
-                Q_sel = q[:, idx, :, :]                
-                with torch.no_grad():
-                    # 计算 wavelet 分数
-                    wavelet_scores = compute_wavelet_scores_multi_causal(Q_sel, k, wavelet_decay_table[:, -1, :], query_indices=idx, table_direction="near_to_far")
-                    # wavelet_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
-               
-                path_attn_scores = path_attn_multi_query_elementwise(Q_sel, k, w, beta)
-                # pdb.set_trace()
-                dis_loss = spectral_distill_over_L(path_attn_scores, wavelet_scores)
-            else:
-                dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
+            # if (self.layer_idx < 2) and self.training:
+            offsets = (1, 8, 16, 32)
+            # idx = [k.size(1) - o for o in offsets]       # 绝对下标
+            # Q_sel = q[:, idx, :, :]
+            with torch.no_grad():
+                # 计算 wavelet 分数
+                # wavelet_scores = compute_wavelet_scores_multi_causal(Q_sel, k, wavelet_decay_table[:, -1, :], query_indices=idx, table_direction="near_to_far")
+                wavelet_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
+            
+            path_attn_scores = compute_path_scores_batched_last_q(q[:, -1, ...], k, w, beta)
+            plot_out_head_dim_traces(path_attn_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_student")
+            plot_out_head_dim_traces(wavelet_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_teacher")
+            pdb.set_trace()
+            dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), wavelet_scores.unsqueeze(1), self.layer_idx)
+            # else:
+            #     dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
             return o, None, past_key_values, dis_loss
