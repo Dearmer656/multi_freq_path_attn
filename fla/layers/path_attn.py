@@ -12,6 +12,7 @@ from einops import rearrange, repeat
 import torch.distributed as dist
 
 from fla.layers.utils import pad_input, unpad_input
+from fla.layers.freq_analysis_utils import spectrum_stats_from_logits, spectrum_over_T_multi
 from fla.modules import RMSNorm, ShortConvolution
 from fla.modules.l2norm import l2_norm
 from fla.ops.attn.decoding import attn_decoding_one_step
@@ -23,7 +24,7 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
 if TYPE_CHECKING:
     from fla.models.utils import Cache
-
+from rotary_embedding_torch import RotaryEmbedding
 
 import pdb
 def sample_index_pairs(
@@ -633,7 +634,7 @@ class PaTHAttention(nn.Module):
     ):
         super().__init__()
         # logging / steps
-        self.config=    config
+        self.config= config
         self.logging_steps = 1000
         self.steps = 0
         self.total_steps = 100000
@@ -682,7 +683,8 @@ class PaTHAttention(nn.Module):
 
         # 每个 (head, rank) 一个 beta
         self.bt_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.r, bias=True)
-
+        if self.config.distill_teacher == 'rotary':
+            self.rotary_emb = RotaryEmbedding(dim=64)
         # 可选 FoX 遗忘门
         self.use_forget_gate = use_forget_gate
         if use_forget_gate:
@@ -842,18 +844,23 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if (self.layer_idx < 1) and self.training:
-                offsets = (1, 8, 16, 32)
-                idx = [k.size(1) - o for o in offsets]       # 绝对下标
-                Q_sel = q[:, idx, :, :]                
+            if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
+                # offsets = (1, 8, 16, 32)
+                # idx = [k.size(1) - o for o in offsets]       # 绝对下标
+                # Q_sel = q[:, idx, :, :]                
                 with torch.no_grad():
                     # 计算 wavelet 分数
-                    wavelet_scores = compute_wavelet_scores_multi_causal(Q_sel, k, wavelet_decay_table[:, -1, :], query_indices=idx, table_direction="near_to_far")
-                    # wavelet_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
+                    # wavelet_scores = compute_wavelet_scores_multi_causal(Q_sel, k, wavelet_decay_table[:, -1, :], query_indices=idx, table_direction="near_to_far")
+                    if self.config.distill_teacher == 'rotary':
+                        dim_wise_scores = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()) * self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous())
+                        teacher_scores = dim_wise_scores.permute(0, 2, 1, 3)
+                    elif self.config.distill_teacher == 'wavelet':
+                        teacher_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
+                    else:
+                        raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
                
-                path_attn_scores = path_attn_multi_query_elementwise(Q_sel, k, w, beta)
-                # pdb.set_trace()
-                dis_loss = spectral_distill_over_L(path_attn_scores, wavelet_scores)
+                path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
+                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1))
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
