@@ -33,71 +33,124 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 
-def plot_out_head_dim_traces(
+import os
+import torch
+import matplotlib.pyplot as plt
+from tqdm.auto import tqdm
+
+def plot_out_head_dim_groups_or_grouped(
     out: torch.Tensor,
-    name="",
+    name: str = "",
     save_dir: str = "plots_out_traces",
-    step: int = 16,
+    group_size: int = 8,
     separate_plots: bool = False,
 ):
     """
-    对 out[B, T, H, D] 的最后一维每 step 个维度取一个（默认 0,16,32,48...），
-    在 B 维上平均后，画出 H * (D/step) 条折线图，并保存为 png。
+    支持两种输入：
+
+    1) out.shape == [B, T, H, D]
+       - 对 D 维按 group_size 分组 (默认 8 维一组)，在组内平均，
+         得到 [B, T, H, S]，再在 B 上平均 -> [T, H, S]，
+         最后画 head×S 条曲线（K=T 为横轴）。
+
+    2) out.shape == [H, S, K]
+       - 认为已经分好组，无需再 group/平均，
+         直接把 K 作为横轴画 head×S 条曲线。
 
     Args:
-        out: Tensor, 形状 [B, T, H, D]
+        out: Tensor, shape [B, T, H, D] 或 [H, S, K]
+        name: 文件名前缀，用于区分不同实验
         save_dir: 保存图片的目录
-        step: 从最后一维每 step 取一个维度（默认 16）
+        group_size: 当 out 为 4 维时，按多少 dim 一组做平均（默认 8）
         separate_plots:
-            True: 每个 (head, dim) 一张图 -> H * (D/step) 张
-            False: 每个 head 一张图，里面画多个 dim 的曲线 -> H 张
+            True: 每个 (head, group) 一张图 -> H * S 张
+            False: 每个 head 一张图，里面画多个 group 的曲线 -> H 张
     """
-    assert out.dim() == 4, f"out 需要是 [B, T, H, D]，当前形状为 {out.shape}"
-    B, T, H, D = out.shape
-    assert D % step == 0, f"D={D} 必须能被 step={step} 整除"
-
     os.makedirs(save_dir, exist_ok=True)
 
-    # 取最后一维中每 step 个位置：0, step, 2*step, ...
-    device = out.device
-    selected_indices = torch.arange(0, D, step, device=device)  # [D/step]
+    if out.dim() == 4:
+        # --------- 情况 1: [B, T, H, D]，需要分组+batch 平均 ---------
+        B, T, H, D = out.shape
+        assert D % group_size == 0, f"D={D} 必须能被 group_size={group_size} 整除"
 
-    # 选出这些维度: [B, T, H, D/step]
-    out_selected = out[..., selected_indices]
+        # [B, T, H, D] -> [B, T, H, S, group_size]
+        S = D // group_size
+        out_grouped = out.view(B, T, H, S, group_size)
 
-    # 沿 B 维度平均: [T, H, D/step]
-    out_mean = out_selected.mean(dim=0)
+        # 在 group_size 上平均 -> [B, T, H, S]
+        out_group_mean = out_grouped.mean(dim=-1)
 
-    # 搬到 CPU，转 numpy 画图
-    out_mean_np = out_mean.cpu().numpy()  # [T, H, D/step]
-    time = range(T)
-    idx_list = selected_indices.tolist()
+        # 在 batch 上平均 -> [T, H, S]
+        data = out_group_mean.mean(dim=0).cpu().numpy()
+        K_len = T
+        x_axis = range(K_len)
+
+        group_labels = [
+            f"group{g} (dims {g*group_size}-{(g+1)*group_size-1})"
+            for g in range(S)
+        ]
+
+    elif out.dim() == 3:
+        # --------- 情况 2: [H, S, K]，已经分好组 ---------
+        H, S, K_len = out.shape
+        data = out.cpu().numpy()          # [H, S, K]
+        x_axis = range(K_len)
+
+        group_labels = [
+            f"group{g}"
+            for g in range(S)
+        ]
+    else:
+        raise ValueError(
+            f"out 维度必须是 3 或 4，当前形状 {out.shape} (dim={out.dim()})"
+        )
+
+    # --------- 统一画图逻辑 ---------
+    # 对于 4 维输入，此时 data.shape == [T, H, S]
+    # 我们想要 [K, H, S] 的风格，K 是横轴
+    if out.dim() == 4:
+        # data: [T, H, S] -> [K, H, S]，这里 K=T
+        data = data  # 就是 [K, H, S]
+        # 下面统一认为 data[k, h, s]
+        # 实际绘制时 index：data[:, h, s]
+    else:
+        # 3 维时 data: [H, S, K] -> [K, H, S]，方便统一处理
+        data = data.transpose(2, 0, 1)  # [K, H, S]
+
+    K, H, S = data.shape  # 统一的布局：data[k, h, s]
 
     if separate_plots:
-        # 每个 (head, dim) 一张图
+        # 每个 (head, group) 一张图
         for h in tqdm(range(H), desc="heads"):
-            for i, d_idx in enumerate(idx_list):
+            for g in range(S):
                 plt.figure()
-                plt.plot(time, out_mean_np[:, h, i])
-                plt.xlabel("T (time index)")
+                plt.plot(x_axis, data[:, h, g])
+                plt.xlabel("index (T or freq)")
                 plt.ylabel("value")
-                plt.title(f"head={h}, dim={d_idx}")
+                plt.title(f"{name} | head={h}, {group_labels[g]}")
                 plt.tight_layout()
-                plt.savefig(os.path.join(save_dir, f"head{h}_dim{d_idx}.png"))
+                plt.savefig(
+                    os.path.join(save_dir, f"{name}_head{h}_group{g}.png"),
+                    dpi=200,
+                )
                 plt.close()
     else:
-        # 每个 head 一张图，里面画多个 dim 曲线
+        # 每个 head 一张图，里面画多个 group 曲线
         for h in tqdm(range(H), desc="heads"):
             plt.figure()
-            for i, d_idx in enumerate(idx_list):
-                plt.plot(time, out_mean_np[:, h, i], label=f"dim={d_idx}")
-            plt.xlabel("T (time index)")
+            for g in range(S):
+                plt.plot(x_axis, data[:, h, g], label=group_labels[g])
+            plt.xlabel("index (T or freq)")
             plt.ylabel("value")
-            plt.title(f"head={h}")
+            plt.title(f"{name} | head={h}")
             plt.legend()
             plt.tight_layout()
-            plt.savefig(os.path.join(save_dir, f"{name}_head{h}_multi_dims.png"))
+            plt.savefig(
+                os.path.join(save_dir, f"{name}_head{h}_groups.png"),
+                dpi=200,
+            )
             plt.close()
+
 
 def sample_index_pairs(
     block_size: int,
@@ -403,9 +456,36 @@ def spectral_distill_over_L(
     with torch.no_grad():
         A_t, A_t_log = spectrum_over_T_multi(teacher)   # [B,Q,K,H,D]  teacher不反传
     A_s, A_s_log = spectrum_over_T_multi(student)       # [B,Q,K,H,D]
-    plot_out_head_dim_traces(A_t_log.squeeze(1), save_dir='spectrum_domain_plots', name=f"layer{layer_idx}_teacher")
-    plot_out_head_dim_traces(A_s_log.squeeze(1), save_dir='spectrum_domain_plots', name=f"layer{layer_idx}_student")
+    A_t_scale = aggregate_spectrum_by_scale(A_t, group_size=8)  # [H, S, K]
+    A_s_scale = aggregate_spectrum_by_scale(A_s, group_size=8)
+    os.makedirs('freq_analysis_logs/spectrum_domain_plots', exist_ok=True)
+    # plot_out_head_dim_groups_or_grouped(A_t_scale, save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_teacher")
+    # plot_out_head_dim_groups_or_grouped(A_s_scale, save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_student")
+    t_mean, s_mean, kl_mat, row_ind, col_ind = match_heads_by_kl_over_S(
+        A_t_scale, A_s_scale
+    )
 
+    plot_matched_heads_over_freq(
+        t_mean,
+        s_mean,
+        row_ind,
+        col_ind,
+        save_path="layer0_matched_heads_freq.png",
+        title_prefix="Layer 0"
+    )
+    pdb.set_trace()
+    if layer_idx == 0:
+        print("layer0 teacher power sum:", A_t_scale.abs().sum())
+        print("layer0 student power sum:", A_s_scale.abs().sum())
+    pdb.set_trace()
+    stats = spectrum_stats_teacher_student(A_t_scale, A_s_scale, low_ratio=0.25)
+    all_stats_per_layer.append(stats)
+    out_dir = 'freq_analysis_logs'
+    plot_layer_dashboard(stats, layer_idx, out_dir)
+    if layer_idx == 11:
+        summarize_over_layers(all_stats_per_layer, out_dir)
+        plot_kl_cos_heatmap_over_layers(all_stats_per_layer, out_dir)
+        os._exit(0)
     # 频带加权（可选）
     if w_band is not None:
         # w_band: [K] -> [1,1,1,K]
@@ -928,9 +1008,8 @@ class PaTHAttention(nn.Module):
                 wavelet_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
             
             path_attn_scores = compute_path_scores_batched_last_q(q[:, -1, ...], k, w, beta)
-            plot_out_head_dim_traces(path_attn_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_student")
-            plot_out_head_dim_traces(wavelet_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_teacher")
-            pdb.set_trace()
+            # plot_out_head_dim_groups_or_grouped(path_attn_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_student")
+            # plot_out_head_dim_groups_or_grouped(wavelet_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_teacher")
             dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), wavelet_scores.unsqueeze(1), self.layer_idx)
             # else:
             #     dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
