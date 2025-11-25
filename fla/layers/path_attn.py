@@ -12,7 +12,7 @@ from einops import rearrange, repeat
 import torch.distributed as dist
 
 from fla.layers.utils import pad_input, unpad_input
-from fla.layers.freq_analysis_utils import spectrum_stats_from_logits, spectrum_over_T_multi
+# from fla.layers.freq_analysis_utils import spectrum_stats_from_logits, spectrum_over_T_multi
 from fla.modules import RMSNorm, ShortConvolution
 from fla.modules.l2norm import l2_norm
 from fla.ops.attn.decoding import attn_decoding_one_step
