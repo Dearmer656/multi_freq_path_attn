@@ -44,14 +44,19 @@ def plot_out_head_dim_groups_or_grouped(
     save_dir: str = "plots_out_traces",
     group_size: int = 8,
     separate_plots: bool = False,
+    distill_teacher: str = "wavelet",  # "wavelet" or "rotary"
 ):
     """
     支持两种输入：
 
     1) out.shape == [B, T, H, D]
-       - 对 D 维按 group_size 分组 (默认 8 维一组)，在组内平均，
-         得到 [B, T, H, S]，再在 B 上平均 -> [T, H, S]，
-         最后画 head×S 条曲线（K=T 为横轴）。
+       - distill_teacher == "wavelet":
+           对 D 维按 group_size 分组 (默认 8 维一组)，在组内平均，
+           得到 [B, T, H, S]，再在 B 上平均 -> [T, H, S]，
+           最后画 head×S 条曲线（K=T 为横轴）。
+       - distill_teacher == "rotary":
+           不分组，直接每 group_size 维取一个 dim (0, group_size, 2*group_size, ...)，
+           得到 [B, T, H, S]，在 B 上平均 -> [T, H, S]，画这些具体 dim 的曲线。
 
     2) out.shape == [H, S, K]
        - 认为已经分好组，无需再 group/平均，
@@ -61,34 +66,64 @@ def plot_out_head_dim_groups_or_grouped(
         out: Tensor, shape [B, T, H, D] 或 [H, S, K]
         name: 文件名前缀，用于区分不同实验
         save_dir: 保存图片的目录
-        group_size: 当 out 为 4 维时，按多少 dim 一组做平均（默认 8）
+        group_size: 
+            wavelet: 每组的大小（默认 8 维一组）
+            rotary : 作为 stride，每 group_size 维取一个 dim（默认每 8 维取一个）
         separate_plots:
-            True: 每个 (head, group) 一张图 -> H * S 张
-            False: 每个 head 一张图，里面画多个 group 的曲线 -> H 张
+            True: 每个 (head, group/dim) 一张图 -> H * S 张
+            False: 每个 head 一张图，里面画多个 group/dim 的曲线 -> H 张
+        distill_teacher:
+            "wavelet": 使用分组平均显示 scale
+            "rotary" : 每 group_size 维取一个具体 dim 显示
     """
     os.makedirs(save_dir, exist_ok=True)
 
     if out.dim() == 4:
-        # --------- 情况 1: [B, T, H, D]，需要分组+batch 平均 ---------
+        # --------- 情况 1: [B, T, H, D] ---------
         B, T, H, D = out.shape
-        assert D % group_size == 0, f"D={D} 必须能被 group_size={group_size} 整除"
 
-        # [B, T, H, D] -> [B, T, H, S, group_size]
-        S = D // group_size
-        out_grouped = out.view(B, T, H, S, group_size)
+        if distill_teacher == "wavelet":
+            # [B, T, H, D] -> [B, T, H, S, group_size]
+            assert D % group_size == 0, f"D={D} 必须能被 group_size={group_size} 整除"
 
-        # 在 group_size 上平均 -> [B, T, H, S]
-        out_group_mean = out_grouped.mean(dim=-1)
+            S = D // group_size
+            out_grouped = out.view(B, T, H, S, group_size)
 
-        # 在 batch 上平均 -> [T, H, S]
-        data = out_group_mean.mean(dim=0).cpu().numpy()
-        K_len = T
-        x_axis = range(K_len)
+            # 在 group_size 上平均 -> [B, T, H, S]
+            out_group_mean = out_grouped.mean(dim=-1)
 
-        group_labels = [
-            f"group{g} (dims {g*group_size}-{(g+1)*group_size-1})"
-            for g in range(S)
-        ]
+            # 在 batch 上平均 -> [T, H, S]
+            data = out_group_mean.mean(dim=0).cpu().numpy()
+            K_len = T
+            x_axis = range(K_len)
+
+            group_labels = [
+                f"group{g} (dims {g*group_size}-{(g+1)*group_size-1})"
+                for g in range(S)
+            ]
+
+        elif distill_teacher == "rotary":
+            # 每 group_size 维取一个具体 dim：0, group_size, 2*group_size, ...
+            assert group_size > 0, "group_size 必须为正整数"
+            device = out.device
+            selected_indices = torch.arange(0, D, group_size, device=device)  # [S]
+            S = selected_indices.numel()
+
+            # 选出这些维度: [B, T, H, S]
+            out_selected = out[..., selected_indices]
+
+            # 在 batch 上平均 -> [T, H, S]
+            data = out_selected.mean(dim=0).cpu().numpy()
+            K_len = T
+            x_axis = range(K_len)
+
+            idx_list = selected_indices.tolist()
+            group_labels = [
+                f"dim{d_idx}"
+                for d_idx in idx_list
+            ]
+        else:
+            raise ValueError(f"未知的 distill_teacher='{distill_teacher}'，应为 'wavelet' 或 'rotary'")
 
     elif out.dim() == 3:
         # --------- 情况 2: [H, S, K]，已经分好组 ---------
@@ -110,9 +145,7 @@ def plot_out_head_dim_groups_or_grouped(
     # 我们想要 [K, H, S] 的风格，K 是横轴
     if out.dim() == 4:
         # data: [T, H, S] -> [K, H, S]，这里 K=T
-        data = data  # 就是 [K, H, S]
-        # 下面统一认为 data[k, h, s]
-        # 实际绘制时 index：data[:, h, s]
+        data = data  # [K, H, S]
     else:
         # 3 维时 data: [H, S, K] -> [K, H, S]，方便统一处理
         data = data.transpose(2, 0, 1)  # [K, H, S]
@@ -120,7 +153,7 @@ def plot_out_head_dim_groups_or_grouped(
     K, H, S = data.shape  # 统一的布局：data[k, h, s]
 
     if separate_plots:
-        # 每个 (head, group) 一张图
+        # 每个 (head, group/dim) 一张图
         for h in tqdm(range(H), desc="heads"):
             for g in range(S):
                 plt.figure()
@@ -135,7 +168,7 @@ def plot_out_head_dim_groups_or_grouped(
                 )
                 plt.close()
     else:
-        # 每个 head 一张图，里面画多个 group 曲线
+        # 每个 head 一张图，里面画多个 group/dim 曲线
         for h in tqdm(range(H), desc="heads"):
             plt.figure()
             for g in range(S):
@@ -447,6 +480,7 @@ def spectral_distill_over_L(
     student: torch.Tensor,   # [B, L, H, D]  (path_attn_scores 映射/reshape到该形状)
     teacher: torch.Tensor,   # [B, L, H, D]  (wavelet_scores 映射/reshape到该形状)
     layer_idx:int,
+    distill_teacher:str,
     *, tau: float = 1.0,
     w_band: torch.Tensor | None = None,  # [K] 可选频带权重
     lambda_mse: float = 1.0,
@@ -456,11 +490,11 @@ def spectral_distill_over_L(
     with torch.no_grad():
         A_t, A_t_log = spectrum_over_T_multi(teacher)   # [B,Q,K,H,D]  teacher不反传
     A_s, A_s_log = spectrum_over_T_multi(student)       # [B,Q,K,H,D]
-    A_t_scale = aggregate_spectrum_by_scale(A_t, group_size=8)  # [H, S, K]
-    A_s_scale = aggregate_spectrum_by_scale(A_s, group_size=8)
+    A_t_scale = aggregate_spectrum_by_scale(A_t, group_size=8, distill_teacher=distill_teacher)  # [H, S, K]
+    A_s_scale = aggregate_spectrum_by_scale(A_s, group_size=8, distill_teacher=distill_teacher)
     os.makedirs('freq_analysis_logs/spectrum_domain_plots', exist_ok=True)
-    # plot_out_head_dim_groups_or_grouped(A_t_scale, save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_teacher")
-    # plot_out_head_dim_groups_or_grouped(A_s_scale, save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_student")
+    plot_out_head_dim_groups_or_grouped(A_t[:, 0, ...], save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_teacher", distill_teacher=distill_teacher)
+    plot_out_head_dim_groups_or_grouped(A_s[:, 0, ...], save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_student", distill_teacher=distill_teacher)
     t_mean, s_mean, kl_mat, row_ind, col_ind = match_heads_by_kl_over_S(
         A_t_scale, A_s_scale
     )
@@ -470,14 +504,14 @@ def spectral_distill_over_L(
         s_mean,
         row_ind,
         col_ind,
-        save_path="layer0_matched_heads_freq.png",
-        title_prefix="Layer 0"
+        save_path=f"freq_analysis_logs/layer{layer_idx}_matched_heads_freq.png",
+        title_prefix=f"Layer {layer_idx}"
     )
-    pdb.set_trace()
+    # pdb.set_trace()
     if layer_idx == 0:
         print("layer0 teacher power sum:", A_t_scale.abs().sum())
         print("layer0 student power sum:", A_s_scale.abs().sum())
-    pdb.set_trace()
+    # pdb.set_trace()
     stats = spectrum_stats_teacher_student(A_t_scale, A_s_scale, low_ratio=0.25)
     all_stats_per_layer.append(stats)
     out_dir = 'freq_analysis_logs'
@@ -763,6 +797,7 @@ def compute_wavelet_scores_multi_causal(
 
     return scores
 
+from rotary_embedding_torch import RotaryEmbedding
 class PaTHAttention(nn.Module):
     def __init__(
         self,
@@ -851,6 +886,8 @@ class PaTHAttention(nn.Module):
             self.attn_dropout = nn.Dropout(attn_pdrop)
             self.path_attention_ratio = nn.Parameter(torch.ones(num_heads)) 
         # ===== Wavelet(beta) 参数 =====
+        if self.config.distill_teacher == 'rotary':
+            self.rotary_emb = RotaryEmbedding(dim=64)
         if use_wavelet_beta:
             H = self.num_kv_heads
 
@@ -1003,14 +1040,26 @@ class PaTHAttention(nn.Module):
             # idx = [k.size(1) - o for o in offsets]       # 绝对下标
             # Q_sel = q[:, idx, :, :]
             with torch.no_grad():
-                # 计算 wavelet 分数
-                # wavelet_scores = compute_wavelet_scores_multi_causal(Q_sel, k, wavelet_decay_table[:, -1, :], query_indices=idx, table_direction="near_to_far")
-                wavelet_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
+                if self.config.distill_teacher == 'rotary':
+                    dim_wise_scores = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()) * self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous())
+                    teacher_scores = dim_wise_scores.permute(0, 2, 1, 3)
+                elif self.config.distill_teacher == 'wavelet':
+                    teacher_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
+                else:
+                    raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")            
+            # with torch.no_grad():
+            #     # 计算 wavelet 分数
+            #     # wavelet_scores = compute_wavelet_scores_multi_causal(Q_sel, k, wavelet_decay_table[:, -1, :], query_indices=idx, table_direction="near_to_far")
+            #     wavelet_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
             
             path_attn_scores = compute_path_scores_batched_last_q(q[:, -1, ...], k, w, beta)
-            # plot_out_head_dim_groups_or_grouped(path_attn_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_student")
-            # plot_out_head_dim_groups_or_grouped(wavelet_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_teacher")
-            dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), wavelet_scores.unsqueeze(1), self.layer_idx)
+            diff = path_attn_scores[..., 1:] - path_attn_scores[..., :-1]
+            E_diff = torch.mean(diff**2)
+            print(E_diff)
+            pdb.set_trace()
+            plot_out_head_dim_groups_or_grouped(path_attn_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_student", distill_teacher=self.config.distill_teacher)
+            plot_out_head_dim_groups_or_grouped(teacher_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_teacher", distill_teacher=self.config.distill_teacher)
+            dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), self.layer_idx, distill_teacher=self.config.distill_teacher)
             # else:
             #     dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
