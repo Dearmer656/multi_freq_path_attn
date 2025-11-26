@@ -493,20 +493,20 @@ def spectral_distill_over_L(
     A_t_scale = aggregate_spectrum_by_scale(A_t, group_size=8, distill_teacher=distill_teacher)  # [H, S, K]
     A_s_scale = aggregate_spectrum_by_scale(A_s, group_size=8, distill_teacher=distill_teacher)
     os.makedirs('freq_analysis_logs/spectrum_domain_plots', exist_ok=True)
-    plot_out_head_dim_groups_or_grouped(A_t[:, 0, ...], save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_teacher", distill_teacher=distill_teacher)
-    plot_out_head_dim_groups_or_grouped(A_s[:, 0, ...], save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_student", distill_teacher=distill_teacher)
-    t_mean, s_mean, kl_mat, row_ind, col_ind = match_heads_by_kl_over_S(
-        A_t_scale, A_s_scale
-    )
+    # plot_out_head_dim_groups_or_grouped(A_t[:, 0, ...], save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_teacher", distill_teacher=distill_teacher)
+    # plot_out_head_dim_groups_or_grouped(A_s[:, 0, ...], save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_student", distill_teacher=distill_teacher)
+    # t_mean, s_mean, kl_mat, row_ind, col_ind = match_heads_by_kl_over_S(
+    #     A_t_scale, A_s_scale
+    # )
 
-    plot_matched_heads_over_freq(
-        t_mean,
-        s_mean,
-        row_ind,
-        col_ind,
-        save_path=f"freq_analysis_logs/layer{layer_idx}_matched_heads_freq.png",
-        title_prefix=f"Layer {layer_idx}"
-    )
+    # plot_matched_heads_over_freq(
+    #     t_mean,
+    #     s_mean,
+    #     row_ind,
+    #     col_ind,
+    #     save_path=f"freq_analysis_logs/layer{layer_idx}_matched_heads_freq.png",
+    #     title_prefix=f"Layer {layer_idx}"
+    # )
     # pdb.set_trace()
     if layer_idx == 0:
         print("layer0 teacher power sum:", A_t_scale.abs().sum())
@@ -1055,10 +1055,13 @@ class PaTHAttention(nn.Module):
             path_attn_scores = compute_path_scores_batched_last_q(q[:, -1, ...], k, w, beta)
             diff = path_attn_scores[..., 1:] - path_attn_scores[..., :-1]
             E_diff = torch.mean(diff**2)
-            print(E_diff)
-            pdb.set_trace()
-            plot_out_head_dim_groups_or_grouped(path_attn_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_student", distill_teacher=self.config.distill_teacher)
-            plot_out_head_dim_groups_or_grouped(teacher_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_teacher", distill_teacher=self.config.distill_teacher)
+            # print(E_diff)
+            # pdb.set_trace()
+            # teacher_scores = F.softmax(teacher_scores, dim=-3)
+            # path_attn_scores = F.softmax(path_attn_scores, dim=-3)
+            # plot_out_head_dim_groups_or_grouped(path_attn_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_student", distill_teacher=self.config.distill_teacher)
+            # plot_out_head_dim_groups_or_grouped(teacher_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_teacher", distill_teacher=self.config.distill_teacher)
+            
             dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), self.layer_idx, distill_teacher=self.config.distill_teacher)
             # else:
             #     dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
