@@ -612,7 +612,71 @@ def compute_wavelet_scores_multi_causal(
     scores = scores * decay                             # [B,Q,T,H,D]
 
     return scores
+def temporal_lipschitz_loss(
+    logits: torch.Tensor,
+    pos_dim: int = -1,
+    max_delta: float | None = None,
+    mask: torch.Tensor | None = None,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """
+    对 logits 在 pos_dim 维上做“Lipschitz / 平滑”正则。
 
+    参数:
+        logits: 任意形状的张量，例如
+            - [B, T]                 (最后一维是 position)
+            - [B, T, V]              (LM logits)
+            - [B, H, Q, K]           (attention logits, K 为 position)
+            - [B, L, H, D]           (path scores，L 为 position)
+        pos_dim: 哪一维是“position 维”，在该维上做相邻差分。
+        max_delta: 如果为 None，直接惩罚 (Δ)^2；
+                   如果为标量 c，惩罚 max(|Δ|-c, 0)^2，相当于希望 Lipschitz 常数 ≤ c。
+        mask: 可选 [*] 的 0/1 掩码，和 logits 在 pos_dim 上对齐，用来忽略 padding。
+              例如 [B, T]，1 表示真实 token，0 表示 pad。
+        eps: 数值稳定项。
+
+    返回:
+        标量 loss
+    """
+    # 把 pos_dim 变成正索引，方便处理
+    ndim = logits.dim()
+    if pos_dim < 0:
+        pos_dim = ndim + pos_dim
+
+    # 在 pos_dim 上做相邻差分: Δ = f(t) - f(t-1)
+    # 使用 slice 实现，兼容老版本 torch
+    # shape: same as logits, except pos_dim -> (size-1)
+    slices_curr = [slice(None)] * ndim
+    slices_prev = [slice(None)] * ndim
+    slices_curr[pos_dim] = slice(1, None)
+    slices_prev[pos_dim] = slice(0, -1)
+    diff = logits[tuple(slices_curr)] - logits[tuple(slices_prev)]  # Δ
+
+    # 如果有 mask, 只在有效位置计算
+    if mask is not None:
+        # mask: [..., T]，需要在 pos_dim 上对齐
+        if mask.dim() != logits.dim():
+            # 尝试自动 broadcast：在非 pos_dim 位置加维度
+            _shape = [1] * logits.dim()
+            _shape[pos_dim] = mask.shape[-1]  # 假设 mask 的最后一维是 T
+            mask = mask.view(*_shape)
+
+        # 相邻有效 token 才算
+        m_curr = mask[tuple(slices_curr)]
+        m_prev = mask[tuple(slices_prev)]
+        m_pair = (m_curr * m_prev).to(diff)   # 0/1
+    else:
+        m_pair = torch.ones_like(diff)
+
+    if max_delta is None:
+        # 纯平滑正则: E[(Δ)^2]
+        loss = ((diff ** 2) * m_pair).sum() / (m_pair.sum() + eps)
+    else:
+        # 限制 Lipschitz 常数 ≤ max_delta: 惩罚 |Δ| > max_delta 的部分
+        excess = torch.relu(diff.abs() - max_delta)
+        loss = ((excess ** 2) * m_pair).sum() / (m_pair.sum() + eps)
+
+    return loss
 class PaTHAttention(nn.Module):
     def __init__(
         self,
@@ -854,7 +918,8 @@ class PaTHAttention(nn.Module):
                 # Q_sel = q[:, idx, :, :]                
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
                 
-                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1))
+                dis_loss = temporal_lipschitz_loss(logits=path_attn_scores, pos_dim=1)
+                # dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1))
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
