@@ -706,7 +706,7 @@ class PaTHAttention(nn.Module):
         self.kv_dim = self.num_kv_heads * self.head_dim
 
         self.layer_idx = layer_idx
-
+        
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
@@ -748,9 +748,9 @@ class PaTHAttention(nn.Module):
         # 输出层（H*R*d → hidden_size）
         self.o_proj = nn.Linear(self.hidden_size * self.r, self.hidden_size, bias=False)
         self.wavelet_baseline_use = wavelet_baseline_use
-        if wavelet_baseline_use:
+        if layer_idx < config.distill_in_which_layers:
             self.attn_dropout = nn.Dropout(attn_pdrop)
-            self.path_attention_ratio = nn.Parameter(torch.ones(num_heads)) 
+            # self.path_attention_ratio = nn.Parameter(torch.ones(num_heads)) 
         # ===== Wavelet(beta) 参数 =====
         if use_wavelet_beta:
             H = self.num_kv_heads
@@ -844,20 +844,25 @@ class PaTHAttention(nn.Module):
             W = rearrange(w, 'b t (h r d) -> b t h r d', h=self.num_kv_heads, r=self.r, d=self.head_dim)  # [B,T,H,R,d]
             W = l2_norm(W)
             # if self.wavelet_baseline_use:
-            #     qk = torch.matmul(q.transpose(1, 2), k.transpose(1, 2).transpose(-1, -2))
-            #     rel = torch.einsum("blhd,dln->blhn", q, wavelet_decay_table)
-            #     rel= rel.transpose(1, 2)
-            #     wavelet_bias = (qk + rel) / torch.full(
-            #         [], self.head_dim ** 0.5, dtype=q.dtype, device=q.device
-            #     )
-            #     mask_value = torch.finfo(wavelet_bias.dtype).min
-            #     # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
-            #     # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
-            #     mask_value = torch.full([], mask_value, dtype=wavelet_bias.dtype, device=wavelet_bias.device)
-            #     wavelet_bias = torch.where(build_causal_mask(rel.size(-1),rel.size(-1), device='cuda'), wavelet_bias.to(wavelet_bias.dtype), mask_value)
-            #     wavelet_bias = nn.functional.softmax(wavelet_bias, dim=-1)
-            #     wavelet_bias = self.attn_dropout(wavelet_bias)
-            #     attn_output = torch.matmul(wavelet_bias, v.transpose(1, 2))
+            if self.layer_idx < self.config.distill_in_which_layers:
+                qk = torch.matmul(q.transpose(1, 2), k.transpose(1, 2).transpose(-1, -2))
+                rel = torch.einsum("blhd,dln->blhn", q, wavelet_decay_table)
+                rel= rel.transpose(1, 2)
+                wavelet_bias = (qk + rel) / torch.full(
+                    [], self.head_dim ** 0.5, dtype=q.dtype, device=q.device
+                )
+                mask_value = torch.finfo(wavelet_bias.dtype).min
+                # Need to be a tensor, otherwise we get error: `RuntimeError: expected scalar type float but found double`.
+                # Need to be on the same device, otherwise `RuntimeError: ..., x and y to be on the same device`
+                mask_value = torch.full([], mask_value, dtype=wavelet_bias.dtype, device=wavelet_bias.device)
+                wavelet_bias = torch.where(build_causal_mask(rel.size(-1),rel.size(-1), device='cuda'), wavelet_bias.to(wavelet_bias.dtype), mask_value)
+                wavelet_bias = nn.functional.softmax(wavelet_bias, dim=-1)
+                wavelet_bias = self.attn_dropout(wavelet_bias)
+                attn_output = torch.matmul(wavelet_bias, v.transpose(1, 2))
+                dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
+                attn_output = attn_output.transpose(1, 2)           # [B, T, H, D]
+                attn_output = attn_output.reshape(q.size(0), self.config.block_size, -1)   
+                return attn_output, None, past_key_values, dis_loss
             w = rearrange(W, 'b t h r d -> b t (h r) d')                                   # [B,T,H*R,d]
 
             # === Wavelet(beta)（可选）===
@@ -899,25 +904,8 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
-                # offsets = (1, 8, 16, 32)
-                # idx = [k.size(1) - o for o in offsets]       # 绝对下标
-                # Q_sel = q[:, idx, :, :]                
-                with torch.no_grad():
-                    # 计算 wavelet 分数
-                    # wavelet_scores = compute_wavelet_scores_multi_causal(Q_sel, k, wavelet_decay_table[:, -1, :], query_indices=idx, table_direction="near_to_far")
-                    if self.config.distill_teacher == 'rotary':
-                        dim_wise_scores = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()) * self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous())
-                        teacher_scores = dim_wise_scores.permute(0, 2, 1, 3)
-                    elif self.config.distill_teacher == 'wavelet':
-                        teacher_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
-                    else:
-                        raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
-               
-                path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
-                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), lambda_kl=1, lambda_mse=0)
-            else:
-                dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
+
+            dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
             return o, None, past_key_values, dis_loss
