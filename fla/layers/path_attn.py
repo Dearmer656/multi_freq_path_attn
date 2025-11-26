@@ -299,6 +299,8 @@ def compute_path_scores_batched_last_q(
 
     return scores
 import random
+import torch
+
 def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
     """
     x: [B, Q, T, H, D]
@@ -309,38 +311,91 @@ def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
         A_log: [B, Q, K, H, D]   log 幅值
         其中 K = T//2 + 1
     """
-    assert x.dim() == 5, "x 应为 [B, Q, T, H, D]"
-    B, Q, T, H, D = x.shape
-
-    # rFFT over T dimension
+    assert x.dim() == 5, f"x 应为 [B, Q, T, H, D]，当前 {x.shape}"
     X = torch.fft.rfft(x, dim=2, norm='ortho')   # [B, Q, K, H, D]
     A = X.abs()
     A_log = torch.log(A.clamp_min(eps))
     return A, A_log
 
+
 def spectral_distill_over_L(
     student: torch.Tensor,   # [B, L, H, D]  (path_attn_scores 映射/reshape到该形状)
-    teacher: torch.Tensor,   # [B, L, H, D]  (wavelet_scores 映射/reshape到该形状)
-    *, tau: float = 1.0,
-    w_band: torch.Tensor | None = None,  # [K] 可选频带权重
-    lambda_mse: float = 1.0,
-    lambda_kl: float = 0.5,
-    lambda_cos: float = 0.0,             # 需要时再开
+    teacher: torch.Tensor,   # [B, L, H, D]  (rotary 或 wavelet 的 logits 映射/reshape)
+    *,
+    tau: float = 1.0,                      # 暂时不用，保留接口
+    w_band: torch.Tensor | None = None,    # [K] 可选频带权重
+    lambda_mse: float = 1.0,               # 形状 MSE 权重
+    lambda_kl: float = 0.5,                # KL 权重
+    lambda_cos: float = 0.0,               # 暂不使用
+    eps: float = 1e-8,
 ):
+    """
+    频谱“形状”蒸馏（只对齐频率方向分布，不对齐绝对幅值）：
+
+      1. 对 teacher / student 沿 L 维做 rFFT，得到幅值 A_t, A_s: [B, Q=1, K, H, D]
+      2. 在 K 维上对幅值做归一化：
+            p_t = A_t / sum_K A_t
+            p_s = A_s / sum_K A_s
+         视作“在频率上的分布”
+      3. loss = lambda_kl * KL(p_t || p_s) + lambda_mse * MSE(log p)
+
+    这样模型不能靠整体缩小 amplitude 来“逃避”蒸馏，只能去贴频谱 shape，
+    同时不会像原来的 log-MSE 那样强迫绝对值完全对齐。
+    """
+    # 兼容 [B, L, H, D] 或 [B, Q, T, H, D]
+    if student.dim() == 4:
+        # [B, L, H, D] -> [B, Q=1, T=L, H, D]
+        x_s = student.unsqueeze(1)
+        x_t = teacher.unsqueeze(1)
+    elif student.dim() == 5:
+        x_s = student
+        x_t = teacher
+    else:
+        raise ValueError(f"student 形状必须是 [B,L,H,D] 或 [B,Q,T,H,D]，当前 {student.shape}")
+
+    # 1) rFFT 得到幅值谱: [B, Q, K, H, D]
     with torch.no_grad():
-        A_t, A_t_log = spectrum_over_T_multi(teacher)   # [B,Q,K,H,D]  teacher不反传
-    A_s, A_s_log = spectrum_over_T_multi(student)       # [B,Q,K,H,D]
+        A_t, _ = spectrum_over_T_multi(x_t)   # teacher 不反传
+    A_s, _ = spectrum_over_T_multi(x_s)
 
     # 频带加权（可选）
     if w_band is not None:
-        # w_band: [K] -> [1,1,1,K]
-        w = w_band.to(A_s).view(1,1,1,-1)
+        # w_band: [K] -> [1,1,K,1,1]
+        w = w_band.to(A_s).view(1, 1, -1, 1, 1)
     else:
         w = 1.0
 
-    # 1) 对数幅值 MSE
-    loss_spec_mse = ((A_s_log - A_t_log)**2 * w).mean()
-    return loss_spec_mse
+    # 2) 在 K 维上做归一化，得到“频率分布” p_t, p_s
+    # 先保证非负（幅值本身就是非负，这里只是稳一手）
+    A_t_clamp = A_t.clamp_min(0.0)
+    A_s_clamp = A_s.clamp_min(0.0)
+
+    # sum over K: [B,Q,1,H,D]
+    sum_t = A_t_clamp.sum(dim=2, keepdim=True)
+    sum_s = A_s_clamp.sum(dim=2, keepdim=True)
+
+    p_t = A_t_clamp / (sum_t + eps)  # [B,Q,K,H,D]
+    p_s = A_s_clamp / (sum_s + eps)  # [B,Q,K,H,D]
+
+    # 3a) KL(p_t || p_s)
+    if lambda_kl != 0.0:
+        kl = p_t * ((p_t + eps).log() - (p_s + eps).log())
+        loss_kl = (kl * w).mean()
+    else:
+        loss_kl = A_s.new_tensor(0.0)
+
+    # 3b) log-prob MSE（形状 MSE）
+    if lambda_mse != 0.0:
+        log_p_t = (p_t + eps).log()
+        log_p_s = (p_s + eps).log()
+        loss_mse = (((log_p_s - log_p_t) ** 2) * w).mean()
+    else:
+        loss_mse = A_s.new_tensor(0.0)
+
+    loss = lambda_kl * loss_kl + lambda_mse * loss_mse
+
+    return loss
+
 def path_attn_last_query_elementwise(Q_last, K, W, beta):
     """
     使用 UT 分解计算 PaTH 的“有效 q 向量”，只针对最后一个 query token。
@@ -860,7 +915,7 @@ class PaTHAttention(nn.Module):
                         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
                
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
-                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1))
+                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), lambda_kl=1, lambda_mse=0)
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
