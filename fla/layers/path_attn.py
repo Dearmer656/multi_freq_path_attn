@@ -899,7 +899,7 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
+            if (self.layer_idx == self.config.distill_in_which_layers) and self.training:
                 # offsets = (1, 8, 16, 32)
                 # idx = [k.size(1) - o for o in offsets]       # 绝对下标
                 # Q_sel = q[:, idx, :, :]                
@@ -915,7 +915,7 @@ class PaTHAttention(nn.Module):
                         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
                
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
-                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), lambda_kl=1, lambda_mse=0)
+                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), lambda_kl=0.0, lambda_mse=1.0)
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
