@@ -490,8 +490,8 @@ def spectral_distill_over_L(
     with torch.no_grad():
         A_t, A_t_log = spectrum_over_T_multi(teacher)   # [B,Q,K,H,D]  teacher不反传
     A_s, A_s_log = spectrum_over_T_multi(student)       # [B,Q,K,H,D]
-    # A_t_scale = aggregate_spectrum_by_scale(A_t, group_size=8, distill_teacher=distill_teacher)  # [H, S, K]
-    # A_s_scale = aggregate_spectrum_by_scale(A_s, group_size=8, distill_teacher=distill_teacher)
+    A_t_scale = aggregate_spectrum_by_scale(A_t, group_size=8, distill_teacher=distill_teacher)  # [H, S, K]
+    A_s_scale = aggregate_spectrum_by_scale(A_s, group_size=8, distill_teacher=distill_teacher)
     os.makedirs('freq_analysis_logs/spectrum_domain_plots', exist_ok=True)
     plot_out_head_dim_groups_or_grouped(A_t[:, 0, ...], save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_teacher", distill_teacher=distill_teacher)
     plot_out_head_dim_groups_or_grouped(A_s[:, 0, ...], save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_student", distill_teacher=distill_teacher)
@@ -1033,8 +1033,8 @@ class PaTHAttention(nn.Module):
                 g = rearrange(g, 'b t hq -> b t hq 1').repeat(1, 1, self.r, 1).view(g.shape[0], g.shape[1], -1)
 
             # 核心 op
-            gamma_stats = compute_gamma_stats(w=w, beta=beta)
-            plot_gamma_lambda_hist(gamma_stats['gamma'], gamma_stats['lambda_dir'], ratio_contractive=gamma_stats['ratio_contractive'], title_prefix=f"wavelet_distill_layer{self.layer_idx}", outdir='gamma_lambda_hist')
+            # gamma_stats = compute_gamma_stats(w=w, beta=beta)
+            # plot_gamma_lambda_hist_by_head(gamma_stats['gamma'], gamma_stats['lambda_dir'], ratio_contractive=gamma_stats['ratio_contractive'], title_prefix=f"wavelet_distill_layer{self.layer_idx}", outdir='gamma_lambda_hist')
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
             # if (self.layer_idx < 2) and self.training:
             offsets = (1, 8, 16, 32)
@@ -1054,19 +1054,19 @@ class PaTHAttention(nn.Module):
             #     # wavelet_scores = compute_wavelet_scores_multi_causal(Q_sel, k, wavelet_decay_table[:, -1, :], query_indices=idx, table_direction="near_to_far")
             #     wavelet_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
             
-            # path_attn_scores = compute_path_scores_batched_last_q(q[:, -1, ...], k, w, beta)
+            path_attn_scores = compute_path_scores_batched_last_q(q[:, -1, ...], k, w, beta)
             # diff = path_attn_scores[..., 1:] - path_attn_scores[..., :-1]
             # E_diff = torch.mean(diff**2)
             # print(E_diff)
             # pdb.set_trace()
-            # teacher_scores = F.softmax(teacher_scores, dim=-3)
-            # path_attn_scores = F.softmax(path_attn_scores, dim=-3)
-            # plot_out_head_dim_groups_or_grouped(path_attn_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_student", distill_teacher=self.config.distill_teacher)
-            # plot_out_head_dim_groups_or_grouped(teacher_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_teacher", distill_teacher=self.config.distill_teacher)
+            teacher_scores = F.softmax(teacher_scores, dim=-3)
+            path_attn_scores = F.softmax(path_attn_scores, dim=-3)
+            plot_out_head_dim_groups_or_grouped(path_attn_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_student", distill_teacher=self.config.distill_teacher)
+            plot_out_head_dim_groups_or_grouped(teacher_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_teacher", distill_teacher=self.config.distill_teacher)
             
-            # dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), self.layer_idx, distill_teacher=self.config.distill_teacher)
+            dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), self.layer_idx, distill_teacher=self.config.distill_teacher)
             # else:
-            dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
+            #     dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             if self.layer_idx == 11:
                 os._exit(0)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
