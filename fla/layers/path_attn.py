@@ -316,7 +316,58 @@ def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
     A = X.abs()
     A_log = torch.log(A.clamp_min(eps))
     return A, A_log
+# def spectral_distill_over_L(
+#     student: torch.Tensor,   # [B, L, H, D]  (path_attn_scores 映射/reshape到该形状)
+#     teacher: torch.Tensor,   # [B, L, H, D]  (rotary 或 wavelet 的 logits 映射/reshape)
+#     *,
+#     tau: float = 1.0,                      # 暂时不用，保留接口
+#     w_band: torch.Tensor | None = None,    # [K] 可选频带权重
+#     lambda_mse: float = 1.0,               # 形状 MSE 权重
+#     lambda_kl: float = 0.5,                # KL 权重
+#     lambda_cos: float = 0.0,               # 暂不使用
+#     eps: float = 1e-8,
+#     max_bins: int = 25,                    # 只蒸馏前 max_bins 个频点
+# ):
+#     """
+#     频谱“形状”蒸馏（只对齐频率方向分布，不对齐绝对幅值）：
+#     这里只在 K 维的前 max_bins 个频点上计算 loss。
+#     """
 
+#     # 兼容 [B, L, H, D] 或 [B, Q, T, H, D]
+#     if student.dim() == 4:
+#         # [B, L, H, D] -> [B, Q=1, T=L, H, D]
+#         x_s = student.unsqueeze(1)
+#         x_t = teacher.unsqueeze(1)
+#     elif student.dim() == 5:
+#         x_s = student
+#         x_t = teacher
+#     else:
+#         raise ValueError(f"student 形状必须是 [B,L,H,D] 或 [B,Q,T,H,D]，当前 {student.shape}")
+
+#     # 1) rFFT 得到幅值谱: [B, Q, K, H, D]
+#     with torch.no_grad():
+#         A_t, A_t_log = spectrum_over_T_multi(x_t)   # teacher 不反传
+#     A_s, A_s_log = spectrum_over_T_multi(x_s)
+
+#     # 只取前 max_bins 个频点
+#     K = A_s.shape[2]
+#     K0 = min(K, max_bins)
+
+#     A_t_log_low = A_t_log[:, :, :K0, :, :]   # [B,Q,K0,H,D]
+#     A_s_log_low = A_s_log[:, :, :K0, :, :]
+
+#     # 频带加权（可选），同样只对前 K0 个频点
+#     if w_band is not None:
+#         # w_band: [K] -> 先截断再 reshape 为 [1,1,K0,1,1]
+#         w = w_band[:K0].to(A_s).view(1, 1, K0, 1, 1)
+#     else:
+#         w = 1.0
+
+#     # 这里只用了 MSE 项，lambda_mse 保留接口（如果你想以后叠加其它项）
+#     diff2 = (A_s_log_low - A_t_log_low) ** 2      # [B,Q,K0,H,D]
+#     loss = (diff2 * w).mean()
+
+#     return loss
 
 def spectral_distill_over_L(
     student: torch.Tensor,   # [B, L, H, D]  (path_attn_scores 映射/reshape到该形状)
@@ -324,9 +375,6 @@ def spectral_distill_over_L(
     *,
     tau: float = 1.0,                      # 暂时不用，保留接口
     w_band: torch.Tensor | None = None,    # [K] 可选频带权重
-    lambda_mse: float = 1.0,               # 形状 MSE 权重
-    lambda_kl: float = 0.5,                # KL 权重
-    lambda_cos: float = 0.0,               # 暂不使用
     eps: float = 1e-8,
 ):
     """
@@ -355,8 +403,8 @@ def spectral_distill_over_L(
 
     # 1) rFFT 得到幅值谱: [B, Q, K, H, D]
     with torch.no_grad():
-        A_t, _ = spectrum_over_T_multi(x_t)   # teacher 不反传
-    A_s, _ = spectrum_over_T_multi(x_s)
+        A_t, A_t_log = spectrum_over_T_multi(x_t)   # teacher 不反传
+    A_s, A_s_log = spectrum_over_T_multi(x_s)
 
     # 频带加权（可选）
     if w_band is not None:
@@ -364,36 +412,7 @@ def spectral_distill_over_L(
         w = w_band.to(A_s).view(1, 1, -1, 1, 1)
     else:
         w = 1.0
-
-    # 2) 在 K 维上做归一化，得到“频率分布” p_t, p_s
-    # 先保证非负（幅值本身就是非负，这里只是稳一手）
-    A_t_clamp = A_t.clamp_min(0.0)
-    A_s_clamp = A_s.clamp_min(0.0)
-
-    # sum over K: [B,Q,1,H,D]
-    sum_t = A_t_clamp.sum(dim=2, keepdim=True)
-    sum_s = A_s_clamp.sum(dim=2, keepdim=True)
-
-    p_t = A_t_clamp / (sum_t + eps)  # [B,Q,K,H,D]
-    p_s = A_s_clamp / (sum_s + eps)  # [B,Q,K,H,D]
-
-    # 3a) KL(p_t || p_s)
-    if lambda_kl != 0.0:
-        kl = p_t * ((p_t + eps).log() - (p_s + eps).log())
-        loss_kl = (kl * w).mean()
-    else:
-        loss_kl = A_s.new_tensor(0.0)
-
-    # 3b) log-prob MSE（形状 MSE）
-    if lambda_mse != 0.0:
-        log_p_t = (p_t + eps).log()
-        log_p_s = (p_s + eps).log()
-        loss_mse = (((log_p_s - log_p_t) ** 2) * w).mean()
-    else:
-        loss_mse = A_s.new_tensor(0.0)
-
-    loss = lambda_kl * loss_kl + lambda_mse * loss_mse
-
+    loss = ((A_s_log - A_t_log)**2).mean()
     return loss
 
 def path_attn_last_query_elementwise(Q_last, K, W, beta):
@@ -861,21 +880,21 @@ class PaTHAttention(nn.Module):
             w = rearrange(W, 'b t h r d -> b t (h r) d')                                   # [B,T,H*R,d]
 
             # === Wavelet(beta)（可选）===
-            wave = None
-            if getattr(self, "use_wavelet_beta", False):
-                B, T = hidden_states.shape[:2]
-                # pos ∈ [-T+1, ..., 0]，末位为中心
-                pos_end = torch.arange(0, T, device=hidden_states.device).unsqueeze(0).to(hidden_states.dtype)  # [1,T,1,1]
+            # wave = None
+            # if getattr(self, "use_wavelet_beta", False):
+            #     B, T = hidden_states.shape[:2]
+            #     # pos ∈ [-T+1, ..., 0]，末位为中心
+            #     pos_end = torch.arange(0, T, device=hidden_states.device).unsqueeze(0).to(hidden_states.dtype)  # [1,T,1,1]
 
-                # 指数项可学：scale = 2**e，e 初始为负序列，窗更宽/衰减更慢
-                e = self.ricker_scale_exp.to(hidden_states.dtype)                          # [1,1,H,r]
-                scale = torch.exp2(e)                                                      # [1,1,H,r]
-                shift = self.ricker_shift.to(hidden_states.dtype)                          # [1,1,H,r]
-                t_affine = scale * (pos_end - shift)                                       # [B,T,H,r]
+            #     # 指数项可学：scale = 2**e，e 初始为负序列，窗更宽/衰减更慢
+            #     e = self.ricker_scale_exp.to(hidden_states.dtype)                          # [1,1,H,r]
+            #     scale = torch.exp2(e)                                                      # [1,1,H,r]
+            #     shift = self.ricker_shift.to(hidden_states.dtype)                          # [1,1,H,r]
+            #     t_affine = scale * (pos_end - shift)                                       # [B,T,H,r]
 
-                # Ricker（无 σ 版本）
-                psi = (1.0 - t_affine**2) * torch.exp(-0.5 * t_affine**2)     
-                wave = (psi - psi.min(dim=1, keepdim=True)[0]) / (psi.max(dim=1, keepdim=True)[0] - psi.min(dim=1, keepdim=True)[0] + 1e-6)             # [B,T,H,r]
+            #     # Ricker（无 σ 版本）
+            #     psi = (1.0 - t_affine**2) * torch.exp(-0.5 * t_affine**2)     
+            #     wave = (psi - psi.min(dim=1, keepdim=True)[0]) / (psi.max(dim=1, keepdim=True)[0] - psi.min(dim=1, keepdim=True)[0] + 1e-6)             # [B,T,H,r]
             beta = torch.sigmoid(beta_logits) * 2.0
             # per-head logging（参数 + 运行时）
             
@@ -899,7 +918,7 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if (self.layer_idx == self.config.distill_in_which_layers) and self.training:
+            if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
                 # offsets = (1, 8, 16, 32)
                 # idx = [k.size(1) - o for o in offsets]       # 绝对下标
                 # Q_sel = q[:, idx, :, :]                
@@ -913,9 +932,9 @@ class PaTHAttention(nn.Module):
                         teacher_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
                     else:
                         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
-               
+                
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
-                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), lambda_kl=0.0, lambda_mse=1.0)
+                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1))
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
