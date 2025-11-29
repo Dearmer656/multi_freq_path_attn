@@ -456,31 +456,14 @@ def compute_path_scores_batched_last_q(
         scores[:, j, :, :] = q_last[:, 0, :, :] * x   # [B,H,D]
 
     return scores
-import random
-def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
-    """
-    x: [B, Q, T, H, D]
-    沿 T 维 (dim=2) 做 rFFT，得到每个 (B,Q,H,D) 上的频谱。
-    
-    返回:
-        A    : [B, Q, K, H, D]   幅值
-        A_log: [B, Q, K, H, D]   log 幅值
-        其中 K = T//2 + 1
-    """
-    assert x.dim() == 5, "x 应为 [B, Q, T, H, D]"
-    B, Q, T, H, D = x.shape
 
-    # rFFT over T dimension
-    X = torch.fft.rfft(x, dim=2, norm='ortho')   # [B, Q, K, H, D]
-    A = X.abs()
-    A_log = torch.log(A.clamp_min(eps))
-    return A, A_log
 
 def spectral_distill_over_L(
     student: torch.Tensor,   # [B, L, H, D]  (path_attn_scores 映射/reshape到该形状)
     teacher: torch.Tensor,   # [B, L, H, D]  (wavelet_scores 映射/reshape到该形状)
-    layer_idx:int,
-    distill_teacher:str,
+    distill_teacher:str,    layer_idx: int,
+    name,
+    start_idx,
     *, tau: float = 1.0,
     w_band: torch.Tensor | None = None,  # [K] 可选频带权重
     lambda_mse: float = 1.0,
@@ -492,9 +475,17 @@ def spectral_distill_over_L(
     A_s, A_s_log = spectrum_over_T_multi(student)       # [B,Q,K,H,D]
     A_t_scale = aggregate_spectrum_by_scale(A_t, group_size=8, distill_teacher=distill_teacher)  # [H, S, K]
     A_s_scale = aggregate_spectrum_by_scale(A_s, group_size=8, distill_teacher=distill_teacher)
-    os.makedirs('freq_analysis_logs/spectrum_domain_plots', exist_ok=True)
-    plot_out_head_dim_groups_or_grouped(A_t[:, 0, ...], save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_teacher", distill_teacher=distill_teacher)
-    plot_out_head_dim_groups_or_grouped(A_s[:, 0, ...], save_dir='freq_analysis_logs/spectrum_domain_plots', name=f"layer{layer_idx}_student", distill_teacher=distill_teacher)
+    out_dir = 'no_distilation_freq_analysis_logs'
+    os.makedirs(f'{out_dir}/spectrum_domain_plots', exist_ok=True)
+    stats_t, stats_s = analyze_teacher_student_groups(
+        A_t_scale=A_t_scale,
+        A_s_scale=A_s_scale,
+        layer_idx=layer_idx,
+        outdir_base=f"{out_dir}/plots_group_similarity",
+        start_idx=start_idx,
+    )
+    # plot_out_head_dim_groups_or_grouped(A_t[:, 0, ...], save_dir=f'{out_dir}/spectrum_domain_plots', name=name+'_teacher', distill_teacher=distill_teacher)
+    # plot_out_head_dim_groups_or_grouped(A_s[:, 0, ...], save_dir=f'{out_dir}/spectrum_domain_plots', name=name+'_student', distill_teacher=distill_teacher)
     # t_mean, s_mean, kl_mat, row_ind, col_ind = match_heads_by_kl_over_S(
     #     A_t_scale, A_s_scale
     # )
@@ -512,14 +503,18 @@ def spectral_distill_over_L(
         # print("layer0 teacher power sum:", A_t_scale.abs().sum())
         # print("layer0 student power sum:", A_s_scale.abs().sum())
     # pdb.set_trace()
-    stats = spectrum_stats_teacher_student(A_t_scale, A_s_scale, low_ratio=0.25)
-    all_stats_per_layer.append(stats)
-    out_dir = 'freq_analysis_logs'
-    plot_layer_dashboard(stats, layer_idx, out_dir)
-    if layer_idx == 11:
-        summarize_over_layers(all_stats_per_layer, out_dir)
-        plot_kl_cos_heatmap_over_layers(all_stats_per_layer, out_dir)
-        os._exit(0)
+    # stats = spectrum_stats_teacher_student(A_t_scale, A_s_scale, low_ratio=0.25)
+    # if start_idx not in all_stats_per_layer:
+    #     all_stats_per_layer[start_idx] = [stats]
+    # else:
+    #     all_stats_per_layer[start_idx].append(stats)
+    
+    
+    # plot_layer_dashboard(stats, out_dir, name)
+    # if layer_idx == 11:
+    #     summarize_over_layers(all_stats_per_layer[start_idx], out_dir, name)
+    #     plot_kl_cos_heatmap_over_layers(all_stats_per_layer[start_idx], out_dir, name)
+    #     all_stats_per_layer[start_idx].clear()
     # 频带加权（可选）
     if w_band is not None:
         # w_band: [K] -> [1,1,1,K]
@@ -530,6 +525,7 @@ def spectral_distill_over_L(
     # 1) 对数幅值 MSE
     loss_spec_mse = ((A_s_log - A_t_log)**2 * w).mean()
     return loss_spec_mse
+
 def path_attn_last_query_elementwise(Q_last, K, W, beta):
     """
     使用 UT 分解计算 PaTH 的“有效 q 向量”，只针对最后一个 query token。
@@ -1059,14 +1055,27 @@ class PaTHAttention(nn.Module):
             # E_diff = torch.mean(diff**2)
             # print(E_diff)
             # pdb.set_trace()
-            teacher_scores = F.softmax(teacher_scores, dim=-3)
-            path_attn_scores = F.softmax(path_attn_scores, dim=-3)
-            plot_out_head_dim_groups_or_grouped(path_attn_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_student", distill_teacher=self.config.distill_teacher)
-            plot_out_head_dim_groups_or_grouped(teacher_scores, save_dir='temporal_domain_plots', name=f"layer{self.layer_idx}_teacher", distill_teacher=self.config.distill_teacher)
-            
-            dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), self.layer_idx, distill_teacher=self.config.distill_teacher)
+            # teacher_scores = F.softmax(teacher_scores, dim=-3)
+            # path_attn_scores = F.softmax(path_attn_scores, dim=-3)
+            num_in_group = 128
+            group_num = q.size(1) // num_in_group
+
+            for group in range(group_num):
+                start_idx = group * num_in_group
+                end_idx = (group + 1) * num_in_group
+                group_path_attn_scores = path_attn_scores[:, start_idx:end_idx, ...]
+                group_teacher_scores = teacher_scores[:, start_idx:end_idx, ...]
+                out_dir='wavelet_distill_layer0_e0_temporal_domain_plots'
+                # plot_out_head_dim_groups_or_grouped(group_path_attn_scores, save_dir=out_dir, name=f"layer{self.layer_idx}_student_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
+                # plot_out_head_dim_groups_or_grouped(group_teacher_scores, save_dir=out_dir, name=f"layer{self.layer_idx}_teacher_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
+                
+                dis_loss = spectral_distill_over_L(group_path_attn_scores.unsqueeze(1), group_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_{start_idx}_to_{end_idx}", start_idx=start_idx)
+            # plot_out_head_dim_groups_or_grouped(path_attn_scores, save_dir=out_dir, name=f"layer{self.layer_idx}_student_full", distill_teacher=self.config.distill_teacher)
+            # plot_out_head_dim_groups_or_grouped(teacher_scores, save_dir=out_dir, name=f"layer{self.layer_idx}_teacher_full", distill_teacher=self.config.distill_teacher)
+            dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_full", start_idx=-1)
             # else:
             #     dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
+
             if self.layer_idx == 11:
                 os._exit(0)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
