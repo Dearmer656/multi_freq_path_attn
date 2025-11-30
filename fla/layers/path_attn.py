@@ -475,6 +475,27 @@ def spectral_distill_over_L(
     A_s, A_s_log = spectrum_over_T_multi(student)       # [B,Q,K,H,D]
     A_t_scale = aggregate_spectrum_by_scale(A_t, group_size=8, distill_teacher=distill_teacher)  # [H, S, K]
     A_s_scale = aggregate_spectrum_by_scale(A_s, group_size=8, distill_teacher=distill_teacher)
+############ var analysis #################
+    H, S, K = A_t_scale.shape
+    var_t = A_t_scale.var(dim=-1, unbiased=False)   # teacher: [H, S]
+    var_s = A_s_scale.var(dim=-1, unbiased=False)   # student: [H, S]
+
+    # 2. 如果你想快速浏览每个 head / group 的方差对比：
+    out_path = "var_stats.txt"
+    with open(out_path, "w", encoding="utf-8") as f:
+        for h in tqdm(range(H), desc="heads"):
+            for s in range(S):
+                vt = var_t[h, s].item()
+                vs = var_s[h, s].item()
+                line = (
+                    f"head {h:2d}, group {s:2d}  |  "
+                    f"teacher var = {vt:.4e},  student var = {vs:.4e}\n"
+                )
+                f.write(line)
+
+    print(f"saved to {out_path}")
+    pdb.set_trace()
+############ var analysis #################
     out_dir = 'no_distilation_freq_analysis_logs'
     os.makedirs(f'{out_dir}/spectrum_domain_plots', exist_ok=True)
     stats_t, stats_s = analyze_teacher_student_groups(
