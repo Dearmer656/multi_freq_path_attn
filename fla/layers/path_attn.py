@@ -475,7 +475,7 @@ def spectral_distill_over_L(
     A_s, A_s_log = spectrum_over_T_multi(student)       # [B,Q,K,H,D]
     A_t_scale = aggregate_spectrum_by_scale(A_t, group_size=8, distill_teacher=distill_teacher)  # [H, S, K]
     A_s_scale = aggregate_spectrum_by_scale(A_s, group_size=8, distill_teacher=distill_teacher)
-    out_dir = '512_length_wavelet_distill_layer0_5000warmup_until_3e-3_freq_analysis_logs'
+    out_dir = '30000steps_512_length_wavelet_distill_layer0_5000warmup_until_3e-3_freq_analysis_logs'
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(f'{out_dir}/var_analysis', exist_ok=True)
 ############ var analysis #################
@@ -1082,7 +1082,7 @@ class PaTHAttention(nn.Module):
             # path_attn_scores = F.softmax(path_attn_scores, dim=-3)
             num_in_group = 128
             group_num = q.size(1) // num_in_group
-            out_dir='512_length_wavelet_distill_layer0_5000warmup_until_3e-3_temporal_domain_plots'
+            out_dir='30000steps_512_length_wavelet_distill_layer0_5000warmup_until_3e-3_temporal_domain_plots'
 
             for group in range(group_num):
                 start_idx = group * num_in_group
