@@ -837,19 +837,19 @@ class PaTHAttention(nn.Module):
         if wavelet_baseline_use:
             self.attn_dropout = nn.Dropout(attn_pdrop)
             self.path_attention_ratio = nn.Parameter(torch.ones(num_heads)) 
-        # ===== Wavelet(beta) 参数 =====
-        if use_wavelet_beta:
-            H = self.num_kv_heads
+        # # ===== Wavelet(beta) 参数 =====
+        # if use_wavelet_beta:
+        #     H = self.num_kv_heads
 
-            # 1) 你的新要求：指数项可学，且初始化为负数序列
-            #    e = [-2*(h//2) for h in range(H)]  → [0,0,-2,-2,-4,-4,...,-10,-10] 当 H=12
-            # exp_list   = [-2 * (h // 2) for h in range(H)]
-            # exp_list = [-1e6] * H
-            exp_list = [0] * H
-            shift_list = [float(h % 2) for h in range(H)]  # [0,1,0,1,...]
+        #     # 1) 你的新要求：指数项可学，且初始化为负数序列
+        #     #    e = [-2*(h//2) for h in range(H)]  → [0,0,-2,-2,-4,-4,...,-10,-10] 当 H=12
+        #     # exp_list   = [-2 * (h // 2) for h in range(H)]
+        #     # exp_list = [-1e6] * H
+        #     exp_list = [0] * H
+        #     shift_list = [float(h % 2) for h in range(H)]  # [0,1,0,1,...]
 
-            self.ricker_scale_exp   = torch.tensor(exp_list, dtype=torch.float32, device='cuda').unsqueeze(1)  # [H,1]
-            self.ricker_shift = torch.tensor(shift_list, dtype=torch.float32, device='cuda').unsqueeze(1)  # [H,1]
+        #     self.ricker_scale_exp   = torch.tensor(exp_list, dtype=torch.float32, device='cuda').unsqueeze(1)  # [H,1]
+        #     self.ricker_shift = torch.tensor(shift_list, dtype=torch.float32, device='cuda').unsqueeze(1)  # [H,1]
 
             # exp_init   = torch.tensor(exp_list, dtype=torch.float32).view(1,1,H,1).repeat(1,1,1,self.r)
             # shift_init = torch.tensor(shift_list, dtype=torch.float32).view(1,1,H,1).repeat(1,1,1,self.r)
