@@ -368,10 +368,39 @@ def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
 #     loss = (diff2 * w).mean()
 
 #     return loss
+def gaussian_smooth_over_K(A_log: torch.Tensor,
+                           kernel_size: int = 5,
+                           sigma: float = 1.0) -> torch.Tensor:
+    """
+    A_log: [B, Q, K, H, D]
+    只在 K 维做 1D 高斯平滑
+    """
+    B, Q, K, H, D = A_log.shape
+    assert kernel_size % 2 == 1, "kernel_size 必须是奇数"
 
+    # 构造高斯核 [kernel_size]
+    half = kernel_size // 2
+    idx = torch.arange(kernel_size, device=A_log.device) - half
+    kernel = torch.exp(-0.5 * (idx.float() / sigma) ** 2)
+    kernel = kernel / kernel.sum()               # 归一化
+    kernel = kernel.view(1, 1, -1)               # [1,1,k]
+
+    # 把 K 维拉到最后，用 conv1d 在 K 上做卷积
+    x = A_log.permute(0, 1, 3, 4, 2).contiguous()    # [B,Q,H,D,K]
+    x = x.view(-1, 1, K)                              # [B*Q*H*D, 1, K]
+
+    # 边界反射填充，避免值缩小
+    x = F.pad(x, (half, half), mode='reflect')       # [B*Q*H*D, 1, K+2*half]
+
+    x_smooth = F.conv1d(x, kernel)                   # [B*Q*H*D, 1, K]
+    x_smooth = x_smooth.view(B, Q, H, D, K).permute(0, 1, 4, 2, 3)  # [B,Q,K,H,D]
+
+    return x_smooth
 def spectral_distill_over_L(
     student: torch.Tensor,   # [B, L, H, D]  (path_attn_scores 映射/reshape到该形状)
     teacher: torch.Tensor,   # [B, L, H, D]  (rotary 或 wavelet 的 logits 映射/reshape)
+    K0: int,
+    smooth_use: bool = False,
     *,
     tau: float = 1.0,                      # 暂时不用，保留接口
     w_band: torch.Tensor | None = None,    # [K] 可选频带权重
@@ -404,6 +433,8 @@ def spectral_distill_over_L(
     # 1) rFFT 得到幅值谱: [B, Q, K, H, D]
     with torch.no_grad():
         A_t, A_t_log = spectrum_over_T_multi(x_t)   # teacher 不反传
+        if smooth_use:
+            A_t_log = gaussian_smooth_over_K(A_t_log)
     A_s, A_s_log = spectrum_over_T_multi(x_s)
 
     # 频带加权（可选）
@@ -412,7 +443,7 @@ def spectral_distill_over_L(
         w = w_band.to(A_s).view(1, 1, -1, 1, 1)
     else:
         w = 1.0
-    loss = ((A_s_log - A_t_log)**2).mean()
+    loss = ((A_s_log[:,:,:K0,...] - A_t_log[:,:,:K0,...])**2).mean()
     return loss
 
 def path_attn_last_query_elementwise(Q_last, K, W, beta):
@@ -934,7 +965,7 @@ class PaTHAttention(nn.Module):
                         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
                 
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
-                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1))
+                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), self.config.distill_freq_scale, self.config.smooth_use)
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
