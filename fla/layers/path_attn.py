@@ -316,6 +316,7 @@ def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
     A = X.abs()
     A_log = torch.log(A.clamp_min(eps))
     return A, A_log
+    # return A
 
 
 def spectral_distill_over_L(
@@ -355,8 +356,8 @@ def spectral_distill_over_L(
 
     # 1) rFFT 得到幅值谱: [B, Q, K, H, D]
     with torch.no_grad():
-        A_t, _ = spectrum_over_T_multi(x_t)   # teacher 不反传
-    A_s, _ = spectrum_over_T_multi(x_s)
+        A_t, A_t_log = spectrum_over_T_multi(x_t)   # teacher 不反传
+    A_s, A_s_log = spectrum_over_T_multi(x_s)
 
     # 频带加权（可选）
     if w_band is not None:
@@ -367,34 +368,49 @@ def spectral_distill_over_L(
 
     # 2) 在 K 维上做归一化，得到“频率分布” p_t, p_s
     # 先保证非负（幅值本身就是非负，这里只是稳一手）
-    A_t_clamp = A_t.clamp_min(0.0)
-    A_s_clamp = A_s.clamp_min(0.0)
+    # A_t_clamp = A_t.clamp_min(0.0)
+    # A_s_clamp = A_s.clamp_min(0.0)
 
-    # sum over K: [B,Q,1,H,D]
-    sum_t = A_t_clamp.sum(dim=2, keepdim=True)
-    sum_s = A_s_clamp.sum(dim=2, keepdim=True)
+    # # sum over K: [B,Q,1,H,D]
+    # sum_t = A_t_clamp.sum(dim=2, keepdim=True)
+    # sum_s = A_s_clamp.sum(dim=2, keepdim=True)
 
-    p_t = A_t_clamp / (sum_t + eps)  # [B,Q,K,H,D]
-    p_s = A_s_clamp / (sum_s + eps)  # [B,Q,K,H,D]
+    # p_t = A_t_clamp / (sum_t + eps)  # [B,Q,K,H,D]
+    # p_s = A_s_clamp / (sum_s + eps)  # [B,Q,K,H,D]
 
     # 3a) KL(p_t || p_s)
-    if lambda_kl != 0.0:
-        kl = p_t * ((p_t + eps).log() - (p_s + eps).log())
-        loss_kl = (kl * w).mean()
-    else:
-        loss_kl = A_s.new_tensor(0.0)
+    # if lambda_kl != 0.0:
+    #     kl = p_t * ((p_t + eps).log() - (p_s + eps).log())
+    #     loss_kl = (kl * w).mean()
+    # else:
+    #     loss_kl = A_s.new_tensor(0.0)
 
-    # 3b) log-prob MSE（形状 MSE）
-    if lambda_mse != 0.0:
-        log_p_t = (p_t + eps).log()
-        log_p_s = (p_s + eps).log()
-        loss_mse = (((log_p_s - log_p_t) ** 2) * w).mean()
-    else:
-        loss_mse = A_s.new_tensor(0.0)
+    # # 3b) log-prob MSE（形状 MSE）
+    # if lambda_mse != 0.0:
+    #     log_p_t = (p_t + eps).log()
+    #     log_p_s = (p_s + eps).log()
+    #     loss_mse = (((log_p_s - log_p_t) ** 2) * w).mean()
+    # else:
+    #     loss_mse = A_s.new_tensor(0.0)
+    eps = 1e-8
 
-    loss = lambda_kl * loss_kl + lambda_mse * loss_mse
+    # A_t_clamp = A_t.clamp_min(eps)
+    # A_s_clamp = A_s.clamp_min(eps)
 
-    return loss
+    # sum_t = A_t_clamp.sum(dim=2, keepdim=True)  # K 维是 dim=2
+    # sum_s = A_s_clamp.sum(dim=2, keepdim=True)
+
+    # p_t = A_t_clamp / (sum_t + eps)
+    # p_s = A_s_clamp / (sum_s + eps)
+
+    # log_p_t = (p_t + eps).log()
+    # log_p_s = (p_s + eps).log()
+
+    loss_spec_mse = ((A_t_log - A_s_log) ** 2 * w).mean()
+    return loss_spec_mse
+    # loss = lambda_kl * loss_kl + lambda_mse * loss_mse
+
+    # return loss
 
 def path_attn_last_query_elementwise(Q_last, K, W, beta):
     """
@@ -828,7 +844,6 @@ class PaTHAttention(nn.Module):
         assert not (cu_seqlens is not None and attention_mask is not None), (
             "cu_seqlens should not be provided when attention_mask is not None"
         )
-
         # ========= 训练路径（mask=None）=========
         if attention_mask is None:
             assert use_cache is False, "use_cache should be False in training"
@@ -899,13 +914,11 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if (self.layer_idx == self.config.distill_in_which_layers) and self.training:
-                # offsets = (1, 8, 16, 32)
-                # idx = [k.size(1) - o for o in offsets]       # 绝对下标
-                # Q_sel = q[:, idx, :, :]                
+            if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
+            #     # offsets = (1, 8, 16, 32)
+            #     # idx = [k.size(1) - o for o in offsets]       # 绝对下标
+            #     # Q_sel = q[:, idx, :, :]                
                 with torch.no_grad():
-                    # 计算 wavelet 分数
-                    # wavelet_scores = compute_wavelet_scores_multi_causal(Q_sel, k, wavelet_decay_table[:, -1, :], query_indices=idx, table_direction="near_to_far")
                     if self.config.distill_teacher == 'rotary':
                         dim_wise_scores = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()) * self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous())
                         teacher_scores = dim_wise_scores.permute(0, 2, 1, 3)
