@@ -712,7 +712,43 @@ def compute_wavelet_scores_multi_causal(
     scores = scores * decay                             # [B,Q,T,H,D]
 
     return scores
+def attn_softmax_mse(
+    student_scores: torch.Tensor,
+    teacher_scores: torch.Tensor,
+    *,
+    key_dim: int = 1,    # 哪一维是 key 维，当前 scores 是 [B, T, H, D] 则 key_dim=1
+    tau: float = 1.0,    # temperature，可设 >1 让分布更平一点
+) -> torch.Tensor:
+    """
+    对 path_attn_scores 和 teacher_scores 在 key_dim 上做 softmax，
+    然后计算概率分布的 MSE。
 
+    student_scores, teacher_scores: 形状相同
+    返回: 标量 loss
+    """
+    assert student_scores.shape == teacher_scores.shape
+
+    # 移到最后一维方便 softmax（不改变内存顺序的话后面还要 reshape）
+    if key_dim != -1:
+        # 把 key_dim 和 -1 交换
+        perm = list(range(student_scores.dim()))
+        perm[key_dim], perm[-1] = perm[-1], perm[key_dim]
+        s = student_scores.permute(*perm)
+        t = teacher_scores.permute(*perm)
+    else:
+        s = student_scores
+        t = teacher_scores
+
+    # 现在 s, t: [..., T]
+    T = s.size(-1)
+    s = (s / tau).contiguous().view(-1, T)  # [N, T]
+    t = (t / tau).contiguous().view(-1, T)
+
+    p_s = F.softmax(s, dim=-1)
+    p_t = F.softmax(t, dim=-1)
+
+    loss = ((p_s - p_t) ** 2).mean()
+    return loss
 class PaTHAttention(nn.Module):
     def __init__(
         self,
@@ -965,7 +1001,14 @@ class PaTHAttention(nn.Module):
                         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
                 
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
-                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), self.config.distill_freq_scale, self.config.smooth_use)
+                dis_loss_spectral = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), self.config.distill_freq_scale, self.config.smooth_use)
+                dis_loss_temp = attn_softmax_mse(
+                    path_attn_scores,
+                    teacher_scores,
+                    key_dim=1,   # T 维
+                    tau=1.0,
+                )
+                dis_loss = self.config.spectral_loss_coe * dis_loss_spectral + self.config.temp_loss_coe * dis_loss_temp                
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
