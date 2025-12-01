@@ -678,6 +678,156 @@ def compute_wavelet_scores_multi_causal(
     scores = scores * decay                             # [B,Q,T,H,D]
 
     return scores
+def sample_index_pairs(
+    block_size: int,
+    num_samples: int,
+    *,
+    deltas: torch.Tensor | None = None,
+    min_delta: int = 1,
+    max_delta: int | None = None,
+    method: str = "uniform",           # "mix" | "uniform" | "geometric"
+    geom_p: float = 0.2,           # 几何分布参数（期望 ~ 1/p），仅当 method in {"mix","geometric"} 时使用
+    uniform_frac: float = 0.3,     # mix 模式下，均匀采样比例
+    device: torch.device | None = None,
+    generator: torch.Generator | None = None,
+    allow_delta_zero: bool = False, # 如需 Δ=0（自指）则设 True
+    i_bias_power: float = 3.0,      # 针对 i_idx 的左侧偏置系数，>1 时越偏左，=1 时均匀
+):
+    """
+    随机采样 (i, j) 索引对，满足 j = i + Δ，且 0 <= i < j < block_size（若 allow_delta_zero=True 则允许 i==j）。
+
+    - 若提供 deltas，则按给定 Δ 向量逐一采样 (i, j)；
+    - 否则按 method 生成长度为 num_samples 的 Δ 向量。
+    - i 的采样默认在 [0, block_size-1-Δ] 范围内均匀；
+      若 i_bias_power > 1，则在该范围内对 i 进行“左侧偏置”，越大越偏向 0。
+
+    返回:
+        i_idx: LongTensor[num_samples]
+        j_idx: LongTensor[num_samples]
+        deltas: LongTensor[num_samples]  # 实际使用的 Δ
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if max_delta is None:
+        max_delta = block_size - 1
+
+    # 边界处理
+    if allow_delta_zero:
+        min_delta = 0
+    else:
+        min_delta = max(1, min_delta)
+    max_delta = max(min_delta, min(max_delta, block_size - (0 if allow_delta_zero else 1)))
+
+    if max_delta < min_delta:
+        raise ValueError(f"无可用的 Δ 范围：min_delta={min_delta}, max_delta={max_delta}, block_size={block_size}")
+
+    # 1) 生成/规范化 Δ
+    if deltas is None:
+        if method == "uniform":
+            deltas = torch.randint(
+                low=min_delta,
+                high=max_delta + 1,
+                size=(num_samples,),
+                device=device,
+                generator=generator,
+            )
+        elif method == "geometric":
+            support = torch.arange(min_delta, max_delta + 1, device=device)
+            shifted = support - (1 if not allow_delta_zero else 0)
+            pmf = (geom_p * torch.pow(1 - geom_p, shifted - 1)).clamp_min(1e-12)
+            pmf = pmf / pmf.sum()
+            deltas = support[torch.multinomial(pmf, num_samples, replacement=True, generator=generator)]
+        elif method == "mix":
+            num_u = int(num_samples * uniform_frac)
+            num_g = num_samples - num_u
+            deltas_u = torch.randint(
+                low=min_delta, high=max_delta + 1, size=(num_u,), device=device, generator=generator
+            )
+            support = torch.arange(min_delta, max_delta + 1, device=device)
+            shifted = support - (1 if not allow_delta_zero else 0)
+            pmf = (geom_p * torch.pow(1 - geom_p, shifted - 1)).clamp_min(1e-12)
+            pmf = pmf / pmf.sum()
+            deltas_g = support[torch.multinomial(pmf, num_g, replacement=True, generator=generator)]
+            deltas = torch.empty(num_samples, device=device, dtype=torch.long)
+            deltas[:num_u] = deltas_u
+            deltas[num_u:] = deltas_g
+            # 打乱
+            perm = torch.randperm(num_samples, device=device, generator=generator)
+            deltas = deltas[perm]
+        else:
+            raise ValueError(f"未知 method: {method}")
+    else:
+        deltas = deltas.to(device=device, dtype=torch.long)
+        if (deltas < min_delta).any() or (deltas > max_delta).any():
+            raise ValueError(f"deltas 超出范围 [{min_delta}, {max_delta}]")
+
+        if deltas.numel() != num_samples:
+            reps = (num_samples + deltas.numel() - 1) // deltas.numel()
+            deltas = deltas.repeat(reps)[:num_samples]
+
+    # 2) 对每个 Δ 采样左索引 i，使得 i ∈ [0, block_size - 1 - Δ]，然后 j = i + Δ
+    i_max = (block_size - 1) - deltas    # [num_samples]
+    span = i_max + 1                     # 每个样本的可选长度 > 0
+
+    # 先采 [0,1) 浮点
+    rand_u = torch.rand(num_samples, device=device, generator=generator)
+
+    # 对 i 做左侧偏置：i_bias_power > 1 时，u^power 更靠近 0
+    if i_bias_power != 1.0:
+        # 为防止非法值，约束一下最小值
+        i_bias_power_clamped = max(i_bias_power, 1.0)
+        rand_u = rand_u.pow(i_bias_power_clamped)
+
+    # 得到 [0, span_s) 的索引
+    i_idx = (rand_u * span.to(rand_u.dtype)).floor().to(torch.long)
+    j_idx = i_idx + deltas
+
+    # （可选）安全检查
+    # assert (i_idx >= 0).all()
+    # assert (j_idx < block_size).all()
+
+    return i_idx, j_idx, deltas
+def compute_path_score_single(
+    q_j: torch.Tensor,      # [H, D]
+    k_i: torch.Tensor,      # [H, D]
+    w: torch.Tensor,        # [T, H, D]
+    beta: torch.Tensor,     # [T, H]
+    i_idx: int,
+    j_idx: int,
+    *,
+    sqrt_d_scale: bool = True,
+    show_progress: bool = False,
+) -> torch.Tensor:
+    assert q_j.dim() == 2 and k_i.dim() == 2, "q_j/k_i 应是 [H,D]"
+    assert w.dim() == 3 and beta.dim() == 2, "w:[T,H,D], beta:[T,H]"
+    H, D = q_j.shape
+    T = w.shape[0]
+    assert w.shape[1:] == (H, D) and beta.shape == (T, H)
+    if not (0 <= i_idx < j_idx <= T - 1):
+        raise ValueError(f"i/j 越界或 i>=j: i={i_idx}, j={j_idx}, T={T}")
+
+    x = k_i.clone()                     # [H,D] 作为被变换的向量
+    it = range(i_idx, j_idx)
+
+    for t in it:
+        w_t = w[t]                      # [H,D]
+        b_t = beta[t].unsqueeze(-1)     # [H,1]
+        dot = (x * w_t).sum(dim=-1, keepdim=True)  # [H,1] 逐 head 的 <x_h, w_th>
+        x = x - b_t * dot * w_t         # x_h ← x_h - beta * <x_h,w_th> * w_th
+
+    score_h = (q_j * x)     # 每个 head 的标量 [H,D]
+    return score_h
+def compute_pair_wavelet_scores_batched(
+    q: torch.Tensor,                  # [sample_num, H, D]
+    k: torch.Tensor,
+    wavelet_decay_list: torch.Tensor, # [D,]  相对距离表
+) -> torch.Tensor:
+
+    _, _, D = q.shape
+    assert wavelet_decay_list.dim()==2 and wavelet_decay_list.size(0)==D, "wavelet_decay_list 应为 [D,]"
+    qk_scores = q * k   # [B,S,H,D]
+    wavelet_scores = qk_scores * wavelet_decay_list.transpose(0, 1)[:, None, :] # [B,S,H,D] * [B,S,H,D] -> [B,S,H,D]
+    return wavelet_scores
 
 class PaTHAttention(nn.Module):
     def __init__(
@@ -915,9 +1065,13 @@ class PaTHAttention(nn.Module):
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
             if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
-            #     # offsets = (1, 8, 16, 32)
-            #     # idx = [k.size(1) - o for o in offsets]       # 绝对下标
-            #     # Q_sel = q[:, idx, :, :]                
+                i_idx, j_idx, delta = sample_index_pairs(self.config.block_size, self.config.sample_num)
+                batch_idx = torch.randint(
+                    low=0,
+                    high=q.size(0),
+                    size=(self.config.sample_num,),
+                    device=q.device,
+                )
                 with torch.no_grad():
                     if self.config.distill_teacher == 'rotary':
                         dim_wise_scores = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()) * self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous())
@@ -926,10 +1080,23 @@ class PaTHAttention(nn.Module):
                         teacher_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
                     else:
                         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
-               
+                
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
                 spectral_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), lambda_kl=0.0, lambda_mse=1.0)
                 dis_loss = self.config.spectral_loss_coe * spectral_loss
+                with torch.no_grad():
+                    temp_teacher_scores = compute_pair_wavelet_scores_batched(q[batch_idx, j_idx, ...], k[batch_idx, i_idx, ...], wavelet_decay_table[:, j_idx, i_idx])
+                S, H, D = temp_teacher_scores.shape
+                temp_path_attn_scores = torch.empty(S, H, D, device=q.device, dtype=q.dtype)
+                for sample_idx in range(S):
+                    i = i_idx[sample_idx]
+                    j = j_idx[sample_idx]
+                    b = batch_idx[sample_idx]
+                    # a = compute_path_score_single(q[b, j, ...], k[b, i, ...], w[b], beta[b], i.item(), j.item())
+
+                    temp_path_attn_scores[sample_idx] = compute_path_score_single(q[b, j, ...], k[b, i, ...], w[b], beta[b], i.item(), j.item())
+                temp_loss = F.mse_loss(temp_path_attn_scores, temp_teacher_scores)
+                dis_loss = self.config.temp_loss_coe * temp_loss + self.config.spectral_loss_coe * spectral_loss
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
