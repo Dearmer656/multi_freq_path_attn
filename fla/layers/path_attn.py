@@ -34,17 +34,21 @@ def sample_index_pairs(
     deltas: torch.Tensor | None = None,
     min_delta: int = 1,
     max_delta: int | None = None,
-    method: str = "mix",           # "mix" | "uniform" | "geometric"
+    method: str = "uniform",           # "mix" | "uniform" | "geometric"
     geom_p: float = 0.2,           # 几何分布参数（期望 ~ 1/p），仅当 method in {"mix","geometric"} 时使用
     uniform_frac: float = 0.3,     # mix 模式下，均匀采样比例
     device: torch.device | None = None,
     generator: torch.Generator | None = None,
-    allow_delta_zero: bool = False # 如需 Δ=0（自指）则设 True
+    allow_delta_zero: bool = False, # 如需 Δ=0（自指）则设 True
+    i_bias_power: float = 3.0,      # 针对 i_idx 的左侧偏置系数，>1 时越偏左，=1 时均匀
 ):
     """
     随机采样 (i, j) 索引对，满足 j = i + Δ，且 0 <= i < j < block_size（若 allow_delta_zero=True 则允许 i==j）。
+
     - 若提供 deltas，则按给定 Δ 向量逐一采样 (i, j)；
     - 否则按 method 生成长度为 num_samples 的 Δ 向量。
+    - i 的采样默认在 [0, block_size-1-Δ] 范围内均匀；
+      若 i_bias_power > 1，则在该范围内对 i 进行“左侧偏置”，越大越偏向 0。
 
     返回:
         i_idx: LongTensor[num_samples]
@@ -77,18 +81,12 @@ def sample_index_pairs(
                 generator=generator,
             )
         elif method == "geometric":
-            # 采几何分布，截断到 [min_delta, max_delta]
-            # PyTorch 没有直接的几何分布，这里用伯努利和求首个成功的思路不高效；
-            # 用近似：先按几何的 PMF 构造离散表，再从表中采样（高效且可向量化）
             support = torch.arange(min_delta, max_delta + 1, device=device)
-            # 几何分布（从1开始）的PMF: p*(1-p)^(k-1)，这里平移到 min_delta 起点
             shifted = support - (1 if not allow_delta_zero else 0)
             pmf = (geom_p * torch.pow(1 - geom_p, shifted - 1)).clamp_min(1e-12)
             pmf = pmf / pmf.sum()
-            # 多项式采样
             deltas = support[torch.multinomial(pmf, num_samples, replacement=True, generator=generator)]
         elif method == "mix":
-            # 按 uniform_frac 混合均匀与几何
             num_u = int(num_samples * uniform_frac)
             num_g = num_samples - num_u
             deltas_u = torch.randint(
@@ -113,29 +111,32 @@ def sample_index_pairs(
             raise ValueError(f"deltas 超出范围 [{min_delta}, {max_delta}]")
 
         if deltas.numel() != num_samples:
-            # 若用户给的 deltas 数量与 num_samples 不一致，则循环扩展或截断
             reps = (num_samples + deltas.numel() - 1) // deltas.numel()
             deltas = deltas.repeat(reps)[:num_samples]
 
-    # 2) 对每个 Δ 采样左索引 i，使得 i ∈ [0, block_size - 1 - Δ]（包含），然后 j = i + Δ
-    # 先计算各样本对应的上界（含）
-    # 有的 Δ 可能接近 block_size-1，此时合法 i 的选择很少；下面逐样本向量化处理。
-    # 构造每个样本的 i_max = block_size - 1 - Δ
-    i_max = (block_size - 1) - deltas
-    # 对应的“可采样长度” = i_max + 1，最小为 1（保证至少一个位置）
-    span = i_max + 1
-    # 为了一次性采样，先对每个样本生成一个 [0, span_s) 的随机数，再拼成 i
-    # 方案：先采 [0, 1) 浮点，再乘以 span，取 floor
-    # 但要保证 span>0，这里根据构造一定成立
+    # 2) 对每个 Δ 采样左索引 i，使得 i ∈ [0, block_size - 1 - Δ]，然后 j = i + Δ
+    i_max = (block_size - 1) - deltas    # [num_samples]
+    span = i_max + 1                     # 每个样本的可选长度 > 0
+
+    # 先采 [0,1) 浮点
     rand_u = torch.rand(num_samples, device=device, generator=generator)
+
+    # 对 i 做左侧偏置：i_bias_power > 1 时，u^power 更靠近 0
+    if i_bias_power != 1.0:
+        # 为防止非法值，约束一下最小值
+        i_bias_power_clamped = max(i_bias_power, 1.0)
+        rand_u = rand_u.pow(i_bias_power_clamped)
+
+    # 得到 [0, span_s) 的索引
     i_idx = (rand_u * span.to(rand_u.dtype)).floor().to(torch.long)
-    # i 的真实值 = i_idx（已是合法范围内）
     j_idx = i_idx + deltas
 
-    # 3) 安全断言（可选）
-    # (i_idx >= 0).all(), (j_idx < block_size).all()
+    # （可选）安全检查
+    # assert (i_idx >= 0).all()
+    # assert (j_idx < block_size).all()
 
     return i_idx, j_idx, deltas
+
 def build_causal_mask(q_len: int,
                       k_len: int | None = None,
                       past_kv_len: int = 0,
@@ -201,31 +202,96 @@ def log_heatmap(tensor, name = '', vmin=-1, vmax = 0):
 
     # 记录到 wandb
     # wandb.log({f"heatmap_{name}": wandb.Image(f"heatmap.png")})
+
 def compute_wavelet_scores_batched(
-    q: torch.Tensor,                  # [B, H, D]
-    k: torch.Tensor,                  # [B, T, H, D]
-    wavelet_decay_list: torch.Tensor, # [D, L]  相对距离表
-    *,
-    table_direction: str = "near_to_far",  # or "far_to_near"
+    q: torch.Tensor,                  # [B, S, H, D]
+    wavelet_decay_list: torch.Tensor, # [D, S, L]  相对距离表
 ) -> torch.Tensor:
 
-    _, _, D = q.shape
-    assert wavelet_decay_list.dim()==2 and wavelet_decay_list.size(0)==D, "wavelet_decay_list 应为 [D,L]"
-
-    device = q.device
-    dtype  = q.dtype
-    L = wavelet_decay_list.size(1)
-    scores = q[:, None, :, :] * k # [S,1,H,D] * [S,T,H,D] -> [S,T,H,D]
-    scores = scores * wavelet_decay_list.transpose(0, 1)[None, :, None, :] # [S,T,H,D] * [1,T,1,D] -> [S,T,H,D]
+    _, _, _, D = q.shape
+    assert wavelet_decay_list.dim()==3 and wavelet_decay_list.size(0)==D, "wavelet_decay_list 应为 [D,L]"
+    scores = q * wavelet_decay_list.permute(1, 2, 0)[:, :, None, :] # [B,S,H,D] * [B,S,H,D] -> [B,S,H,D]
     return scores
-# def compute_wavelet_score_single(q_j, k_i, wavelet_decay_list, i_idx, j_idx, *, sqrt_d_scale=True):
-#     H, D = q_j.shape
-#     rel = i_idx - j_idx                     # 假设 0<=rel<R
-#     d = wavelet_decay_list[:, rel].to(q_j)     # [D]
-#     q_w = q_j * d                              # [H,D]
-#     score = torch.einsum('hd,hd->', q_w, k_i)  # 标量
+def path_attn_last_query_qonly(Q_last, W, beta):
+    """
+    使用 UT 分解计算 PaTH 的“有效 q 向量”，只针对最后一个 query token。
+    （只返回 q_eff，不再乘以 K）
 
-#     return score / math.sqrt(D)
+    参数:
+        Q_last : [B, 1, H, D]
+            已经是「最后一个 token」的 query，通常来自：
+                Q_last = Q_all[:, -1:, :, :]
+        W      : [B, T, H, D]    PaTH 中的 Householder 向量 w_t
+        beta   : [B, T, H]       Householder 系数 β_t
+
+    返回:
+        q_eff_out : [B, T, H, D]
+            q_eff_out[b, t, h, d] = (Q_last[b, 0, h, d] - S_{b,h,t+1,d])
+            其中 S_{b,h,t+1} 是根据 UT 分解得到的修正向量。
+            对最后一位 t = T-1，S_{b,h,T} 视为 0。
+    """
+    B, one, H, D = Q_last.shape
+    assert one == 1, "Q_last 应为 [B, 1, H, D]，且只包含最后一个 token"
+
+    B_w, T, H_w, D_w = W.shape
+    assert B_w == B and H_w == H and D_w == D, "W 形状必须为 [B, T, H, D] 且与 Q_last 匹配"
+
+    B_b, T_b, H_b = beta.shape
+    assert B_b == B and T_b == T and H_b == H, "beta 形状必须为 [B, T, H]"
+
+    device = Q_last.device
+    dtype  = Q_last.dtype
+
+    # 把 (B, H) 拉平成一个大的 batch 维 BH，方便用 batched 矩阵运算
+    BH = B * H
+
+    # Q_last: [B, 1, H, D] -> [BH, D]
+    q_last = Q_last.reshape(B, 1, H, D)[:, 0, :, :].reshape(BH, D)  # [BH, D]
+
+    # W_flat: [B, T, H, D] -> [BH, T, D]
+    W_flat   = W.permute(0, 2, 1, 3).reshape(BH, T, D)             # [BH, T, D]
+    beta_flat = beta.permute(0, 2, 1).reshape(BH, T)               # [BH, T]
+
+    # ===== 1) 构造 batched 的 WDWT = (W * beta) @ W^T =====
+    B_scaled = W_flat * beta_flat.unsqueeze(-1)                    # [BH, T, D]
+    WDWT = B_scaled @ W_flat.transpose(1, 2)                       # [BH, T, T]
+
+    # strict lower 部分 + I -> T_basic = I + strictLower(WDW^T)
+    Lmat = torch.tril(WDWT, diagonal=-1)                           # [BH, T, T]
+    I = torch.eye(T, device=device, dtype=dtype).expand(BH, T, T)  # [BH, T, T]
+    T_basic = I + Lmat                                             # [BH, T, T] 下三角
+
+    # ===== 2) 计算 x = T_basic^{-1} (beta ⊙ (W q_last)) =====
+    # t = W q_last : [BH, T]，用逐元素乘再 sum 避免多一次 @
+    t = (W_flat * q_last.unsqueeze(1)).sum(dim=-1)                 # [BH, T]
+    z = beta_flat * t                                              # [BH, T]
+
+    # 解下三角方程 T_basic x = z
+    x = torch.linalg.solve_triangular(
+        T_basic, z.unsqueeze(-1), upper=False
+    ).squeeze(-1)                                                  # [BH, T]
+
+    # ===== 3) U_m = x_m * w_m, 做 suffix sum 得到 S_t =====
+    U = W_flat * x.unsqueeze(-1)                                   # [BH, T, D]
+
+    # S[t] = sum_{m=t}^{T-1} U[m]
+    U_flip = torch.flip(U, dims=[1])                               # 反转时间维
+    S_flip = torch.cumsum(U_flip, dim=1)
+    S = torch.flip(S_flip, dims=[1])                               # [BH, T, D]
+
+    # S_shift[j] = S[j+1]，最后一个位置的修正为 0
+    S_shift = torch.zeros_like(S)
+    if T > 1:
+        S_shift[:, :-1] = S[:, 1:]                                 # S_shift[:, j] = S[:, j+1]
+
+    # ===== 4) 有效 q: q_eff[j] = q_last - S_{j+1} =====
+    q_eff = q_last.unsqueeze(1) - S_shift                          # [BH, T, D]
+
+    # reshape 回 [B, T, H, D]
+    q_eff_out = q_eff.reshape(B, H, T, D).permute(0, 2, 1, 3)      # [B, T, H, D]
+
+    return q_eff_out
+
 def compute_path_scores_batched_last_q(
     q: torch.Tensor,          # [B, H, D]   —— 使用最后一个 query（i = T-1）
     k: torch.Tensor,          # [B, T, H, D]
@@ -314,9 +380,9 @@ def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
     assert x.dim() == 5, f"x 应为 [B, Q, T, H, D]，当前 {x.shape}"
     X = torch.fft.rfft(x, dim=2, norm='ortho')   # [B, Q, K, H, D]
     A = X.abs()
-    A_log = torch.log(A.clamp_min(eps))
-    return A, A_log
-    # return A
+    # A_log = torch.log(A.clamp_min(eps))
+    # return A, A_log
+    return A
 
 
 def spectral_distill_over_L(
@@ -356,8 +422,8 @@ def spectral_distill_over_L(
 
     # 1) rFFT 得到幅值谱: [B, Q, K, H, D]
     with torch.no_grad():
-        A_t, A_t_log = spectrum_over_T_multi(x_t)   # teacher 不反传
-    A_s, A_s_log = spectrum_over_T_multi(x_s)
+        A_t = spectrum_over_T_multi(x_t)   # teacher 不反传
+    A_s = spectrum_over_T_multi(x_s)
 
     # 频带加权（可选）
     if w_band is not None:
@@ -365,52 +431,22 @@ def spectral_distill_over_L(
         w = w_band.to(A_s).view(1, 1, -1, 1, 1)
     else:
         w = 1.0
-
-    # 2) 在 K 维上做归一化，得到“频率分布” p_t, p_s
-    # 先保证非负（幅值本身就是非负，这里只是稳一手）
-    # A_t_clamp = A_t.clamp_min(0.0)
-    # A_s_clamp = A_s.clamp_min(0.0)
-
-    # # sum over K: [B,Q,1,H,D]
-    # sum_t = A_t_clamp.sum(dim=2, keepdim=True)
-    # sum_s = A_s_clamp.sum(dim=2, keepdim=True)
-
-    # p_t = A_t_clamp / (sum_t + eps)  # [B,Q,K,H,D]
-    # p_s = A_s_clamp / (sum_s + eps)  # [B,Q,K,H,D]
-
-    # 3a) KL(p_t || p_s)
-    # if lambda_kl != 0.0:
-    #     kl = p_t * ((p_t + eps).log() - (p_s + eps).log())
-    #     loss_kl = (kl * w).mean()
-    # else:
-    #     loss_kl = A_s.new_tensor(0.0)
-
-    # # 3b) log-prob MSE（形状 MSE）
-    # if lambda_mse != 0.0:
-    #     log_p_t = (p_t + eps).log()
-    #     log_p_s = (p_s + eps).log()
-    #     loss_mse = (((log_p_s - log_p_t) ** 2) * w).mean()
-    # else:
-    #     loss_mse = A_s.new_tensor(0.0)
     eps = 1e-8
 
-    # A_t_clamp = A_t.clamp_min(eps)
-    # A_s_clamp = A_s.clamp_min(eps)
+    A_t_clamp = A_t.clamp_min(eps)
+    A_s_clamp = A_s.clamp_min(eps)
 
-    # sum_t = A_t_clamp.sum(dim=2, keepdim=True)  # K 维是 dim=2
-    # sum_s = A_s_clamp.sum(dim=2, keepdim=True)
+    sum_t = A_t_clamp.sum(dim=2, keepdim=True)  # K 维是 dim=2
+    sum_s = A_s_clamp.sum(dim=2, keepdim=True)
 
-    # p_t = A_t_clamp / (sum_t + eps)
-    # p_s = A_s_clamp / (sum_s + eps)
+    p_t = A_t_clamp / (sum_t + eps)
+    p_s = A_s_clamp / (sum_s + eps)
 
-    # log_p_t = (p_t + eps).log()
-    # log_p_s = (p_s + eps).log()
+    log_p_t = (p_t + eps).log()
+    log_p_s = (p_s + eps).log()
 
-    loss_spec_mse = ((A_t_log - A_s_log) ** 2 * w).mean()
+    loss_spec_mse = ((log_p_t - log_p_s) ** 2 * w).mean()
     return loss_spec_mse
-    # loss = lambda_kl * loss_kl + lambda_mse * loss_mse
-
-    # return loss
 
 def path_attn_last_query_elementwise(Q_last, K, W, beta):
     """
@@ -678,6 +714,10 @@ def compute_wavelet_scores_multi_causal(
     scores = scores * decay                             # [B,Q,T,H,D]
 
     return scores
+def compute_sampled_temp_domain_wavelet_scores_batched(q_sel, wavelet_sel):
+    coeff = wavelet_sel.transpose(0, 1)
+    temp_teacher_score = q_sel * coeff.unsqueeze(1)
+    return temp_teacher_score
 
 class PaTHAttention(nn.Module):
     def __init__(
@@ -918,17 +958,23 @@ class PaTHAttention(nn.Module):
             #     # offsets = (1, 8, 16, 32)
             #     # idx = [k.size(1) - o for o in offsets]       # 绝对下标
             #     # Q_sel = q[:, idx, :, :]                
+                # i_idx, j_idx, delta = sample_index_pairs(self.block_size, self.config.sample_num)
+                # perm = torch.randperm(q.size(0), device=q.device, generator=None)
+                # batch_idx = perm[:self.config.sample_num]
                 with torch.no_grad():
                     if self.config.distill_teacher == 'rotary':
                         dim_wise_scores = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()) * self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous())
                         teacher_scores = dim_wise_scores.permute(0, 2, 1, 3)
                     elif self.config.distill_teacher == 'wavelet':
-                        teacher_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
+                        teacher_scores = compute_wavelet_scores_batched(q[:, -1:, ...], wavelet_decay_table[:, -1:, :])
+                        # temp_teacher_score = compute_wavelet_scores_batched(q[batch_idx, j_idx, ...], wavelet_decay_table[:, j_idx, i_idx])
+                        # temp_teacher_score = compute_sampled_temp_domain_wavelet_scores_batched(q[batch_idx, j_idx, ...], wavelet_decay_table[:, j_idx, i_idx])
                     else:
                         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
                
-                path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
-                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), lambda_kl=0.0, lambda_mse=1.0)
+                path_attn_scores = path_attn_last_query_qonly(q[:, -1:, ...], w, beta)
+                spectral_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), lambda_kl=0.0, lambda_mse=1.0)
+                dis_loss = self.config.spectral_loss_coe * spectral_loss
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
