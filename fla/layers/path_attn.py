@@ -928,7 +928,8 @@ class PaTHAttention(nn.Module):
                         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
                
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
-                dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), lambda_kl=0.0, lambda_mse=1.0)
+                spectral_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), lambda_kl=0.0, lambda_mse=1.0)
+                dis_loss = self.config.spectral_loss_coe * spectral_loss
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
