@@ -380,9 +380,9 @@ def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
     assert x.dim() == 5, f"x 应为 [B, Q, T, H, D]，当前 {x.shape}"
     X = torch.fft.rfft(x, dim=2, norm='ortho')   # [B, Q, K, H, D]
     A = X.abs()
-    # A_log = torch.log(A.clamp_min(eps))
-    # return A, A_log
-    return A
+    A_log = torch.log(A.clamp_min(eps))
+    return A, A_log
+    # return A
 
 
 def spectral_distill_over_L(
@@ -422,8 +422,8 @@ def spectral_distill_over_L(
 
     # 1) rFFT 得到幅值谱: [B, Q, K, H, D]
     with torch.no_grad():
-        A_t = spectrum_over_T_multi(x_t)   # teacher 不反传
-    A_s = spectrum_over_T_multi(x_s)
+        A_t, A_log_t = spectrum_over_T_multi(x_t)   # teacher 不反传
+    A_s, A_log_s = spectrum_over_T_multi(x_s)
 
     # 频带加权（可选）
     if w_band is not None:
@@ -431,21 +431,21 @@ def spectral_distill_over_L(
         w = w_band.to(A_s).view(1, 1, -1, 1, 1)
     else:
         w = 1.0
-    eps = 1e-8
+    # eps = 1e-8
 
-    A_t_clamp = A_t.clamp_min(eps)
-    A_s_clamp = A_s.clamp_min(eps)
+    # A_t_clamp = A_t.clamp_min(eps)
+    # A_s_clamp = A_s.clamp_min(eps)
 
-    sum_t = A_t_clamp.sum(dim=2, keepdim=True)  # K 维是 dim=2
-    sum_s = A_s_clamp.sum(dim=2, keepdim=True)
+    # sum_t = A_t_clamp.sum(dim=2, keepdim=True)  # K 维是 dim=2
+    # sum_s = A_s_clamp.sum(dim=2, keepdim=True)
 
-    p_t = A_t_clamp / (sum_t + eps)
-    p_s = A_s_clamp / (sum_s + eps)
+    # p_t = A_t_clamp / (sum_t + eps)
+    # p_s = A_s_clamp / (sum_s + eps)
 
-    log_p_t = (p_t + eps).log()
-    log_p_s = (p_s + eps).log()
+    # log_p_t = (p_t + eps).log()
+    # log_p_s = (p_s + eps).log()
 
-    loss_spec_mse = ((log_p_t - log_p_s) ** 2 * w).mean()
+    loss_spec_mse = ((A_log_s - A_log_t) ** 2 * w).mean()
     return loss_spec_mse
 
 def path_attn_last_query_elementwise(Q_last, K, W, beta):
