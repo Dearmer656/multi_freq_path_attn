@@ -817,6 +817,69 @@ def compute_path_score_single(
 
     score_h = (q_j * x)     # 每个 head 的标量 [H,D]
     return score_h
+def compute_path_score_multi(
+    q: torch.Tensor,      # [B, T, H, D]
+    k: torch.Tensor,      # [B, T, H, D]
+    w: torch.Tensor,      # [B, T, H, D]
+    beta: torch.Tensor,   # [B, T, H]
+    i_idx: torch.Tensor,      # [S]
+    j_idx: torch.Tensor,      # [S]
+    batch_idx: torch.Tensor,  # [S]
+) -> torch.Tensor:
+    """
+    返回: [S, H, D]，与 compute_path_score_single 的返回形状对齐（只是多了 S 维）
+    """
+    assert q.dim() == 4 and k.dim() == 4 and w.dim() == 4
+    assert beta.dim() == 3
+    B, T, H, D = q.shape
+    assert k.shape == (B, T, H, D)
+    assert w.shape == (B, T, H, D)
+    assert beta.shape == (B, T, H)
+    assert i_idx.shape == j_idx.shape == batch_idx.shape
+
+    S = i_idx.shape[0]
+    device = q.device
+
+    # 合法性检查
+    if not torch.all((0 <= i_idx) & (i_idx < j_idx) & (j_idx <= T - 1)):
+        raise ValueError("i/j 越界或 i>=j")
+
+    # 初始 x_s = k[b_s, i_s] 作为被变换的向量，形状 [S, H, D]
+    x = k[batch_idx, i_idx, ...].clone()  # [S, H, D]
+
+    # 对应的 q_j，形状 [S, H, D]
+    q_j = q[batch_idx, j_idx, ...]        # [S, H, D]
+
+    # 主循环只在时间轴 t 上扫一遍
+    t_iter = range(T)
+    # if show_progress:
+    #     t_iter = tqdm(t_iter, desc="path Householder steps")
+
+    for t in t_iter:
+        # 这一时刻 t，哪些 sample 的区间 [i_s, j_s) 覆盖 t？
+        # 条件: i_s <= t < j_s
+        active = (i_idx <= t) & (t < j_idx)  # [S]
+        if not torch.any(active):
+            continue
+
+        # 只更新 active 的那些样本
+        b_t = batch_idx[active]              # [S_active]
+        x_act = x[active]                    # [S_active, H, D]
+
+        # 取对应 batch 上的 w_t, beta_t
+        w_t = w[b_t, t, ...]                 # [S_active, H, D]
+        beta_t = beta[b_t, t, ...].unsqueeze(-1)  # [S_active, H, 1]
+
+        # dot = <x, w_t>，逐 head 内积
+        dot = (x_act * w_t).sum(dim=-1, keepdim=True)  # [S_active, H, 1]
+
+        # x ← x - beta * dot * w
+        x[active] = x_act - beta_t * dot * w_t
+
+    # 最后 score 与你原先一致：不在这里求和，只是逐维乘
+    score = q_j * x  # [S, H, D]
+
+    return score
 def compute_pair_wavelet_scores_batched(
     q: torch.Tensor,                  # [sample_num, H, D]
     k: torch.Tensor,
@@ -1083,18 +1146,15 @@ class PaTHAttention(nn.Module):
                 
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
                 spectral_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), lambda_kl=0.0, lambda_mse=1.0)
-                dis_loss = self.config.spectral_loss_coe * spectral_loss
                 with torch.no_grad():
                     temp_teacher_scores = compute_pair_wavelet_scores_batched(q[batch_idx, j_idx, ...], k[batch_idx, i_idx, ...], wavelet_decay_table[:, j_idx, i_idx])
                 S, H, D = temp_teacher_scores.shape
-                temp_path_attn_scores = torch.empty(S, H, D, device=q.device, dtype=q.dtype)
-                for sample_idx in range(S):
-                    i = i_idx[sample_idx]
-                    j = j_idx[sample_idx]
-                    b = batch_idx[sample_idx]
-                    # a = compute_path_score_single(q[b, j, ...], k[b, i, ...], w[b], beta[b], i.item(), j.item())
-
-                    temp_path_attn_scores[sample_idx] = compute_path_score_single(q[b, j, ...], k[b, i, ...], w[b], beta[b], i.item(), j.item())
+                temp_path_attn_scores = compute_path_score_multi(
+                                                                    q, k, w, beta,
+                                                                    i_idx=i_idx,
+                                                                    j_idx=j_idx,
+                                                                    batch_idx=batch_idx,
+                                                                )
                 temp_loss = F.mse_loss(temp_path_attn_scores, temp_teacher_scores)
                 dis_loss = self.config.temp_loss_coe * temp_loss + self.config.spectral_loss_coe * spectral_loss
             else:
