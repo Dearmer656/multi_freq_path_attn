@@ -1128,34 +1128,50 @@ class PaTHAttention(nn.Module):
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
             if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
-                i_idx, j_idx, delta = sample_index_pairs(self.config.block_size, self.config.sample_num)
-                batch_idx = torch.randint(
-                    low=0,
-                    high=q.size(0),
-                    size=(self.config.sample_num,),
-                    device=q.device,
-                )
+                if self.config.temp_loss_coe != 0:
+                    i_idx, j_idx, delta = sample_index_pairs(self.config.block_size, self.config.sample_num)
+                    batch_idx = torch.randint(
+                        low=0,
+                        high=q.size(0),
+                        size=(self.config.sample_num,),
+                        device=q.device,
+                    )
                 with torch.no_grad():
                     if self.config.distill_teacher == 'rotary':
                         rot_q, rot_k = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3), self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3)
-                        temp_teacher_scores = rot_q[batch_idx, j_idx, ...] * rot_k[batch_idx, i_idx, ...]
+                        if self.config.temp_loss_coe != 0:
+                            temp_teacher_scores = rot_q[batch_idx, j_idx, ...] * rot_k[batch_idx, i_idx, ...]
                         spectral_teacher_scores = rot_q[:, -1:, ...] * rot_k
                     elif self.config.distill_teacher == 'wavelet':
                         spectral_teacher_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
-                        temp_teacher_scores = compute_pair_wavelet_scores_batched(q[batch_idx, j_idx, ...], k[batch_idx, i_idx, ...], wavelet_decay_table[:, j_idx, i_idx])                      
+                        if self.config.temp_loss_coe != 0:
+                            temp_teacher_scores = compute_pair_wavelet_scores_batched(
+                                q[batch_idx, j_idx, ...],
+                                k[batch_idx, i_idx, ...],
+                                wavelet_decay_table[batch_idx, i_idx, :],
+                            )
+                    elif self.config.distill_teacher == 'shrink':
+                        with torch.no_grad():
+                            spectral_teacher_scores = (q[:, -1:, ...] * k)
+                            norm = spectral_teacher_scores.norm(dim=1, keepdim=True) + 1e-12
+                            spectral_teacher_scores = spectral_teacher_scores / norm                            
                     else:
                         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
-                temp_path_attn_scores = compute_path_score_multi(
-                                                                    q, k, w, beta,
-                                                                    i_idx=i_idx,
-                                                                    j_idx=j_idx,
-                                                                    batch_idx=batch_idx,
-                                                                )                  
+                if self.config.temp_loss_coe != 0:
+                    temp_path_attn_scores = compute_path_score_multi(
+                                                                        q, k, w, beta,
+                                                                        i_idx=i_idx,
+                                                                        j_idx=j_idx,
+                                                                        batch_idx=batch_idx,
+                                                                    )            
+                    temp_loss = self.config.temp_loss_coe * F.mse_loss(temp_path_attn_scores, temp_teacher_scores)      
+                else:
+                    temp_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
-                spectral_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1), lambda_kl=0.0, lambda_mse=1.0)
+                spectral_loss = self.config.spectral_loss_coe * spectral_distill_over_L(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1) if spectral_teacher_scores.dim() == 4 else spectral_teacher_scores, lambda_kl=0.0, lambda_mse=1.0)
  
-                temp_loss = F.mse_loss(temp_path_attn_scores, temp_teacher_scores)
-                dis_loss = self.config.temp_loss_coe * temp_loss + self.config.spectral_loss_coe * spectral_loss
+                
+                dis_loss = temp_loss + spectral_loss
             else:
                 dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
