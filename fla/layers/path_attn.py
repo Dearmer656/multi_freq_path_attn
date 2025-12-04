@@ -102,7 +102,7 @@ def plot_out_head_dim_groups_or_grouped(
                 for g in range(S)
             ]
 
-        elif distill_teacher == "rotary":
+        elif distill_teacher in ["rotary", "shrink"]:
             # 每 group_size 维取一个具体 dim：0, group_size, 2*group_size, ...
             assert group_size > 0, "group_size 必须为正整数"
             device = out.device
