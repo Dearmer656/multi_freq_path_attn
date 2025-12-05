@@ -1063,12 +1063,37 @@ class PaTHAttention(nn.Module):
             print(f'layer{self.layer_idx} analysis!!!!')
             with torch.no_grad():
                 if self.config.distill_teacher == 'rotary':
-                    dim_wise_scores = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()) * self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous())
-                    teacher_scores = dim_wise_scores.permute(0, 2, 1, 3)
+                    rot_q, rot_k = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3), self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3)
+                    if self.config.temp_loss_coe != 0:
+                        temp_teacher_scores = rot_q[batch_idx, j_idx, ...] * rot_k[batch_idx, i_idx, ...]
+                    spectral_teacher_scores = rot_q[:, -1:, ...] * rot_k
                 elif self.config.distill_teacher == 'wavelet':
-                    teacher_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
+                    spectral_teacher_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
+                    if self.config.temp_loss_coe != 0:
+                        temp_teacher_scores = compute_pair_wavelet_scores_batched(
+                            q[batch_idx, j_idx, ...],
+                            k[batch_idx, i_idx, ...],
+                            wavelet_decay_table[batch_idx, i_idx, :],
+                        )
+                elif self.config.distill_teacher == 'shrink':
+                    spectral_teacher_scores = (q[:, -1:, ...] * k)
+                    norm = spectral_teacher_scores.norm(dim=1, keepdim=True) + 1e-12
+                    spectral_teacher_scores = spectral_teacher_scores / norm            
+                elif self.config.distill_teacher == 'shrink_w_shuffle':
+                    spectral_teacher_scores = (q[:, -1:, ...] * k)
+                    norm = spectral_teacher_scores.norm(dim=1, keepdim=True) + 1e-12
+                    spectral_teacher_scores = spectral_teacher_scores / norm
+                    spectral_teacher_scores = make_randomized_teacher_T(spectral_teacher_scores)
                 else:
-                    raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")            
+                    raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
+            # with torch.no_grad():
+            #     if self.config.distill_teacher == 'rotary':
+            #         dim_wise_scores = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()) * self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous())
+            #         spectral_teacher_scores = dim_wise_scores.permute(0, 2, 1, 3)
+            #     elif self.config.distill_teacher == 'wavelet':
+            #         spectral_teacher_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
+            #     else:
+            #         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")            
             # with torch.no_grad():
             #     # 计算 wavelet 分数
             #     # wavelet_scores = compute_wavelet_scores_multi_causal(Q_sel, k, wavelet_decay_table[:, -1, :], query_indices=idx, table_direction="near_to_far")
@@ -1079,25 +1104,25 @@ class PaTHAttention(nn.Module):
             # E_diff = torch.mean(diff**2)
             # print(E_diff)
             # pdb.set_trace()
-            # teacher_scores = F.softmax(teacher_scores, dim=-3)
+            # spectral_teacher_scores = F.softmax(spectral_teacher_scores, dim=-3)
             # path_attn_scores = F.softmax(path_attn_scores, dim=-3)
             num_in_group = 128
             group_num = q.size(1) // num_in_group
             if self.config.block_size < num_in_group:
                 group_num = 1
                 num_in_group = self.config.block_size
-            # out_dir='50000steps_512_length_wavelet_distill_1e-3spect_1e-3_64samples_temp'
-            out_dir='80000steps_1024length_no_distillation'
+            out_dir=f'80000steps_length{self.config.block_size}_{self.config.distill_teacher}_distill_{self.config.spectral_loss_coe}'
+            # out_dir='80000steps_512length_no_distillation'
             softmax_out_dir = 'softmax_' + out_dir
             temporal_out_dir = out_dir + 'temporal_domain_plots'
             softxmax_temporal_out_dir = 'softmax_'+temporal_out_dir
             softmax_path_attn_scores = F.softmax(path_attn_scores, dim=-3)
-            softmax_teacher_scores = F.softmax(teacher_scores, dim=-3)
+            softmax_teacher_scores = F.softmax(spectral_teacher_scores, dim=-3)
             for group in range(group_num):
                 start_idx = group * num_in_group
                 end_idx = (group + 1) * num_in_group
                 group_path_attn_scores = path_attn_scores[:, start_idx:end_idx, ...]
-                group_teacher_scores = teacher_scores[:, start_idx:end_idx, ...]
+                group_teacher_scores = spectral_teacher_scores[:, start_idx:end_idx, ...]
                 softmax_group_path_attn_scores = softmax_path_attn_scores[:, start_idx:end_idx, ...]
                 softmax_group_teacher_scores = softmax_teacher_scores[:, start_idx:end_idx, ...]
                 plot_out_head_dim_groups_or_grouped(group_path_attn_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_student_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
@@ -1108,8 +1133,10 @@ class PaTHAttention(nn.Module):
                 dis_loss = spectral_distill_over_L(group_path_attn_scores.unsqueeze(1), group_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_{start_idx}_to_{end_idx}", start_idx=start_idx, out_dir=out_dir)
                 _ = spectral_distill_over_L(softmax_group_path_attn_scores.unsqueeze(1), softmax_group_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_{start_idx}_to_{end_idx}", start_idx=start_idx, out_dir=softmax_out_dir)
             plot_out_head_dim_groups_or_grouped(path_attn_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_student_full", distill_teacher=self.config.distill_teacher)
-            plot_out_head_dim_groups_or_grouped(teacher_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_full", distill_teacher=self.config.distill_teacher)
-            dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_full", start_idx=-1, out_dir=out_dir)
+            plot_out_head_dim_groups_or_grouped(spectral_teacher_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_full", distill_teacher=self.config.distill_teacher)
+            plot_out_head_dim_groups_or_grouped(softmax_path_attn_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_student_full", distill_teacher=self.config.distill_teacher)
+            plot_out_head_dim_groups_or_grouped(softmax_teacher_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_full", distill_teacher=self.config.distill_teacher)
+            dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_full", start_idx=-1, out_dir=out_dir)
             _ = spectral_distill_over_L(softmax_path_attn_scores.unsqueeze(1), softmax_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_full", start_idx=-1, out_dir=softmax_out_dir)
             
             # else:
@@ -1119,7 +1146,7 @@ class PaTHAttention(nn.Module):
                 os._exit(0)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
-            return o, None, past_key_values, dis_loss
+            return o, None, past_key_values, 0
 
         # ========= 其它路径（mask!=None）：最小实现 =========
         if self.use_w_shortconv:
