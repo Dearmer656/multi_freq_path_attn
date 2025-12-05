@@ -12,7 +12,7 @@ from einops import rearrange, repeat
 import torch.distributed as dist
 
 from fla.layers.utils import pad_input, unpad_input
-# from fla.layers.freq_analysis_utils import spectrum_stats_from_logits, spectrum_over_T_multi
+from fla.layers.freq_analysis_utils import make_randomized_teacher_T
 from fla.modules import RMSNorm, ShortConvolution
 from fla.modules.l2norm import l2_norm
 from fla.ops.attn.decoding import attn_decoding_one_step
@@ -1154,7 +1154,13 @@ class PaTHAttention(nn.Module):
                         with torch.no_grad():
                             spectral_teacher_scores = (q[:, -1:, ...] * k)
                             norm = spectral_teacher_scores.norm(dim=1, keepdim=True) + 1e-12
-                            spectral_teacher_scores = spectral_teacher_scores / norm                            
+                            spectral_teacher_scores = spectral_teacher_scores / norm            
+                    elif self.config.distill_teacher == 'shrink_w_shuffle':
+                        with torch.no_grad():
+                            spectral_teacher_scores = (q[:, -1:, ...] * k)
+                            norm = spectral_teacher_scores.norm(dim=1, keepdim=True) + 1e-12
+                            spectral_teacher_scores = spectral_teacher_scores / norm
+                            spectral_teacher_scores = make_randomized_teacher_T(spectral_teacher_scores)
                     else:
                         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
                 if self.config.temp_loss_coe != 0:
