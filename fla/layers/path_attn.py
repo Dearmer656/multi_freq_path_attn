@@ -1127,7 +1127,7 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
+            if (self.layer_idx == self.config.distill_in_which_layers) and self.training:
                 if self.config.temp_loss_coe != 0:
                     i_idx, j_idx, delta = sample_index_pairs(self.config.block_size, self.config.sample_num)
                     batch_idx = torch.randint(
