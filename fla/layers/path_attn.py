@@ -102,7 +102,7 @@ def plot_out_head_dim_groups_or_grouped(
                 for g in range(S)
             ]
 
-        elif distill_teacher in ["rotary", "shrink"]:
+        elif distill_teacher in ["rotary", "shrink", "shrink_w_shuffle"]:
             # 每 group_size 维取一个具体 dim：0, group_size, 2*group_size, ...
             assert group_size > 0, "group_size 必须为正整数"
             device = out.device
@@ -501,13 +501,13 @@ def spectral_distill_over_L(
     # pdb.set_trace()
 ############ var analysis #################
     os.makedirs(f'{freq_out_dir}/spectrum_domain_plots', exist_ok=True)
-    stats_t, stats_s = analyze_teacher_student_groups(
-        A_t_scale=A_t_scale,
-        A_s_scale=A_s_scale,
-        layer_idx=layer_idx,
-        outdir_base=f"{freq_out_dir}/plots_group_similarity",
-        start_idx=start_idx,
-    )
+    # stats_t, stats_s = analyze_teacher_student_groups(
+    #     A_t_scale=A_t_scale,
+    #     A_s_scale=A_s_scale,
+    #     layer_idx=layer_idx,
+    #     outdir_base=f"{freq_out_dir}/plots_group_similarity",
+    #     start_idx=start_idx,
+    # )
     plot_out_head_dim_groups_or_grouped(A_t[:, 0, ...], f'{freq_out_dir}/spectrum_domain_plots', name+'_teacher', distill_teacher=distill_teacher)
     plot_out_head_dim_groups_or_grouped(A_s[:, 0, ...], f'{freq_out_dir}/spectrum_domain_plots', name+'_student', distill_teacher=distill_teacher)
     # t_mean, s_mean, kl_mat, row_ind, col_ind = match_heads_by_kl_over_S(
@@ -1112,7 +1112,7 @@ class PaTHAttention(nn.Module):
                 group_num = 1
                 num_in_group = self.config.block_size
             out_dir=f'80000steps_length{self.config.block_size}_{self.config.distill_teacher}_distill_{self.config.spectral_loss_coe}'
-            # out_dir='80000steps_512length_no_distillation'
+            # out_dir=f'80000steps_{self.config.block_size}length_no_distillation'
             softmax_out_dir = 'softmax_' + out_dir
             temporal_out_dir = out_dir + 'temporal_domain_plots'
             softxmax_temporal_out_dir = 'softmax_'+temporal_out_dir
