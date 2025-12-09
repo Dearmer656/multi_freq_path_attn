@@ -351,6 +351,7 @@ def spectral_distill_over_L(
     elif student.dim() == 5:
         x_s = student
         x_t = teacher
+    
     else:
         raise ValueError(f"student 形状必须是 [B,L,H,D] 或 [B,Q,T,H,D]，当前 {student.shape}")
 
@@ -935,7 +936,10 @@ class PaTHAttention(nn.Module):
         self.kv_dim = self.num_kv_heads * self.head_dim
 
         self.layer_idx = layer_idx
-
+        if config.distill_teacher == 'mean_wavelet_pe':
+            load_spec_teacher = torch.load(f"/cl/work5/hongyu-s/gpt2_test/transformers/examples/pytorch/language-modeling/spectra_wavelet_teacher/layer_{layer_idx}_spectrum.pt")
+            teacher_mean_spec = load_spec_teacher["mean_spectrum"]
+            self.register_buffer("teacher_mean_spec", teacher_mean_spec)
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
@@ -1161,6 +1165,9 @@ class PaTHAttention(nn.Module):
                             norm = spectral_teacher_scores.norm(dim=1, keepdim=True) + 1e-12
                             spectral_teacher_scores = spectral_teacher_scores / norm
                             spectral_teacher_scores = make_randomized_teacher_T(spectral_teacher_scores)
+                    elif self.config.distill_teacher == 'mean_wavelet_pe':
+                        spectral_teacher_scores = self.teacher_mean_spec[None, :, :, :]
+
                     else:
                         raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
                 if self.config.temp_loss_coe != 0:
@@ -1174,7 +1181,14 @@ class PaTHAttention(nn.Module):
                 else:
                     temp_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
-                spectral_loss = self.config.spectral_loss_coe * spectral_distill_over_L(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1) if spectral_teacher_scores.dim() == 4 else spectral_teacher_scores, lambda_kl=0.0, lambda_mse=1.0)
+                if self.config.distill_teacher == "mean_wavelet_pe":
+                    softmax_path_attn_scores = F.softmax(path_attn_scores, dim=1)
+                    softmax_student_spectrum, _ = spectrum_over_T_multi(softmax_path_attn_scores.unsqueeze(1))
+                    softmax_student_spectrum_T = softmax_student_spectrum.squeeze(1).transpose(1,2)
+                    spectral_loss = self.config.spectral_loss_coe * F.mse_loss(softmax_student_spectrum_T, spectral_teacher_scores)
+
+                else:
+                    spectral_loss = self.config.spectral_loss_coe * spectral_distill_over_L(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1) if spectral_teacher_scores.dim() == 4 else spectral_teacher_scores, lambda_kl=0.0, lambda_mse=1.0)
  
                 
                 dis_loss = temp_loss + spectral_loss
