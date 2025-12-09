@@ -937,7 +937,10 @@ class PaTHAttention(nn.Module):
 
         self.layer_idx = layer_idx
         if config.distill_teacher == 'mean_wavelet_pe':
-            load_spec_teacher = torch.load(f"/cl/work5/hongyu-s/gpt2_test/transformers/examples/pytorch/language-modeling/spectra_wavelet_teacher/layer_{layer_idx}_spectrum.pt")
+            if config.wavelet_pe_softmax_use:
+                load_spec_teacher = torch.load(f"/cl/work5/hongyu-s/gpt2_test/transformers/examples/pytorch/language-modeling/spectra_wavelet_teacher/layer_{layer_idx}_spectrum.pt")
+            else:
+                load_spec_teacher = torch.load(f"/cl/work5/hongyu-s/gpt2_test/transformers/examples/pytorch/language-modeling/wo_softmax_spectra_wavelet_teacher/layer_{layer_idx}_spectrum.pt")
             teacher_mean_spec = load_spec_teacher["mean_spectrum"]
             self.register_buffer("teacher_mean_spec", teacher_mean_spec)
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
@@ -1131,7 +1134,7 @@ class PaTHAttention(nn.Module):
             # 核心 op
 
             o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
-            if (self.layer_idx == self.config.distill_in_which_layers) and self.training:
+            if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
                 if self.config.temp_loss_coe != 0:
                     i_idx, j_idx, delta = sample_index_pairs(self.config.block_size, self.config.sample_num)
                     batch_idx = torch.randint(
@@ -1182,8 +1185,9 @@ class PaTHAttention(nn.Module):
                     temp_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
                 if self.config.distill_teacher == "mean_wavelet_pe":
-                    softmax_path_attn_scores = F.softmax(path_attn_scores, dim=1)
-                    softmax_student_spectrum, _ = spectrum_over_T_multi(softmax_path_attn_scores.unsqueeze(1))
+                    if self.config.wavelet_pe_softmax_use:
+                        path_attn_scores = F.softmax(path_attn_scores, dim=1)
+                    softmax_student_spectrum, _ = spectrum_over_T_multi(path_attn_scores.unsqueeze(1))
                     softmax_student_spectrum_T = softmax_student_spectrum.squeeze(1).transpose(1,2)
                     spectral_loss = self.config.spectral_loss_coe * F.mse_loss(softmax_student_spectrum_T, spectral_teacher_scores)
 
