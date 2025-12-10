@@ -300,7 +300,16 @@ def compute_path_scores_batched_last_q(
     return scores
 import random
 import torch
-
+def make_highfreq_weight(K, alpha=1.0, device="cpu"):
+    # 频率 index: 0 ~ K-1
+    k = torch.arange(K, device=device, dtype=torch.float32)
+    # 归一化到 [0,1]
+    f = k / (K - 1)
+    # 高频权重大一点，比如 f^alpha
+    w = f**alpha
+    # 也可以加一个 floor，避免前面直接变 0
+    # w = (f**alpha) + 0.1
+    return w  # [K]
 def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
     """
     x: [B, Q, T, H, D]
@@ -323,8 +332,8 @@ def spectral_distill_over_L(
     student: torch.Tensor,   # [B, L, H, D]  (path_attn_scores 映射/reshape到该形状)
     teacher: torch.Tensor,   # [B, L, H, D]  (rotary 或 wavelet 的 logits 映射/reshape)
     *,
+    w=1.0,
     tau: float = 1.0,                      # 暂时不用，保留接口
-    w_band: torch.Tensor | None = None,    # [K] 可选频带权重
     lambda_mse: float = 1.0,               # 形状 MSE 权重
     lambda_kl: float = 0.5,                # KL 权重
     lambda_cos: float = 0.0,               # 暂不使用
@@ -359,53 +368,6 @@ def spectral_distill_over_L(
     with torch.no_grad():
         A_t, A_t_log = spectrum_over_T_multi(x_t)   # teacher 不反传
     A_s, A_s_log = spectrum_over_T_multi(x_s)
-
-    # 频带加权（可选）
-    if w_band is not None:
-        # w_band: [K] -> [1,1,K,1,1]
-        w = w_band.to(A_s).view(1, 1, -1, 1, 1)
-    else:
-        w = 1.0
-
-    # 2) 在 K 维上做归一化，得到“频率分布” p_t, p_s
-    # 先保证非负（幅值本身就是非负，这里只是稳一手）
-    # A_t_clamp = A_t.clamp_min(0.0)
-    # A_s_clamp = A_s.clamp_min(0.0)
-
-    # # sum over K: [B,Q,1,H,D]
-    # sum_t = A_t_clamp.sum(dim=2, keepdim=True)
-    # sum_s = A_s_clamp.sum(dim=2, keepdim=True)
-
-    # p_t = A_t_clamp / (sum_t + eps)  # [B,Q,K,H,D]
-    # p_s = A_s_clamp / (sum_s + eps)  # [B,Q,K,H,D]
-
-    # 3a) KL(p_t || p_s)
-    # if lambda_kl != 0.0:
-    #     kl = p_t * ((p_t + eps).log() - (p_s + eps).log())
-    #     loss_kl = (kl * w).mean()
-    # else:
-    #     loss_kl = A_s.new_tensor(0.0)
-
-    # # 3b) log-prob MSE（形状 MSE）
-    # if lambda_mse != 0.0:
-    #     log_p_t = (p_t + eps).log()
-    #     log_p_s = (p_s + eps).log()
-    #     loss_mse = (((log_p_s - log_p_t) ** 2) * w).mean()
-    # else:
-    #     loss_mse = A_s.new_tensor(0.0)
-    eps = 1e-8
-
-    # A_t_clamp = A_t.clamp_min(eps)
-    # A_s_clamp = A_s.clamp_min(eps)
-
-    # sum_t = A_t_clamp.sum(dim=2, keepdim=True)  # K 维是 dim=2
-    # sum_s = A_s_clamp.sum(dim=2, keepdim=True)
-
-    # p_t = A_t_clamp / (sum_t + eps)
-    # p_s = A_s_clamp / (sum_s + eps)
-
-    # log_p_t = (p_t + eps).log()
-    # log_p_s = (p_s + eps).log()
 
     loss_spec_mse = ((A_t_log - A_s_log) ** 2 * w).mean()
     return loss_spec_mse
@@ -1184,15 +1146,31 @@ class PaTHAttention(nn.Module):
                 else:
                     temp_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
                 path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
+                K = q.size(1) // 2 + 1
+                if self.config.weight_alpha > 0.0:
+                    w = make_highfreq_weight(K, alpha=self.config.weight_alpha, device=q.device)
+                    w = w[None, :, None, None]  # [1, K, 1, 1]
+                else:
+                    w = 1.0
                 if self.config.distill_teacher == "mean_wavelet_pe":
                     if self.config.wavelet_pe_softmax_use:
                         path_attn_scores = F.softmax(path_attn_scores, dim=1)
-                    softmax_student_spectrum, _ = spectrum_over_T_multi(path_attn_scores.unsqueeze(1))
-                    softmax_student_spectrum_T = softmax_student_spectrum.squeeze(1).transpose(1,2)
-                    spectral_loss = self.config.spectral_loss_coe * F.mse_loss(softmax_student_spectrum_T, spectral_teacher_scores)
 
+                    # A_s: power spectrum, A_s_log: log spectrum
+                    A_s, A_s_log = spectrum_over_T_multi(path_attn_scores.unsqueeze(1))
+                    A_s_log_T = A_s_log.squeeze(1).transpose(1, 2)  # 和 teacher 对齐
+
+                    eps = 1e-8
+                    # teacher 从文件读的是 power mean_spectrum
+                    # -> 在这里转成 log 频谱
+                    A_t = spectral_teacher_scores  # [1, H, K, D]
+                    A_t_log = torch.log(A_t + eps)
+
+                    spectral_loss = self.config.spectral_loss_coe * F.mse_loss(
+                        A_s_log_T, A_t_log
+                    )
                 else:
-                    spectral_loss = self.config.spectral_loss_coe * spectral_distill_over_L(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1) if spectral_teacher_scores.dim() == 4 else spectral_teacher_scores, lambda_kl=0.0, lambda_mse=1.0)
+                    spectral_loss = self.config.spectral_loss_coe * spectral_distill_over_L(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1) if spectral_teacher_scores.dim() == 4 else spectral_teacher_scores, w=w,lambda_kl=0.0, lambda_mse=1.0)
  
                 
                 dis_loss = temp_loss + spectral_loss
