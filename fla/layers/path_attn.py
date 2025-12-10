@@ -508,7 +508,8 @@ def spectral_distill_over_L(
     #     outdir_base=f"{freq_out_dir}/plots_group_similarity",
     #     start_idx=start_idx,
     # )
-    plot_out_head_dim_groups_or_grouped(A_t[:, 0, ...], f'{freq_out_dir}/spectrum_domain_plots', name+'_teacher', distill_teacher=distill_teacher)
+    if distill_teacher == 'wavelet':
+        plot_out_head_dim_groups_or_grouped(A_t[:, 0, ...], f'{freq_out_dir}/spectrum_domain_plots', name+'_teacher', distill_teacher=distill_teacher)
     plot_out_head_dim_groups_or_grouped(A_s[:, 0, ...], f'{freq_out_dir}/spectrum_domain_plots', name+'_student', distill_teacher=distill_teacher)
     # t_mean, s_mean, kl_mat, row_ind, col_ind = match_heads_by_kl_over_S(
     #     A_t_scale, A_s_scale
@@ -1111,7 +1112,7 @@ class PaTHAttention(nn.Module):
             if self.config.block_size < num_in_group:
                 group_num = 1
                 num_in_group = self.config.block_size
-            out_dir=f'80000steps_length{self.config.block_size}_{self.config.distill_teacher}_distill_{self.config.spectral_loss_coe}'
+            out_dir=f'80000steps_length{self.config.block_size}_{self.config.distill_teacher}_distill_in_layer0_{self.config.spectral_loss_coe}'
             # out_dir=f'80000steps_{self.config.block_size}length_no_distillation'
             softmax_out_dir = 'softmax_' + out_dir
             temporal_out_dir = out_dir + 'temporal_domain_plots'
@@ -1126,16 +1127,18 @@ class PaTHAttention(nn.Module):
                 softmax_group_path_attn_scores = softmax_path_attn_scores[:, start_idx:end_idx, ...]
                 softmax_group_teacher_scores = softmax_teacher_scores[:, start_idx:end_idx, ...]
                 plot_out_head_dim_groups_or_grouped(group_path_attn_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_student_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
-                plot_out_head_dim_groups_or_grouped(group_teacher_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
                 plot_out_head_dim_groups_or_grouped(softmax_group_path_attn_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_student_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
-                plot_out_head_dim_groups_or_grouped(softmax_group_teacher_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
+                if self.config.distill_teacher == 'wavelet':
+                    plot_out_head_dim_groups_or_grouped(softmax_group_teacher_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
+                    plot_out_head_dim_groups_or_grouped(group_teacher_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
                 
                 dis_loss = spectral_distill_over_L(group_path_attn_scores.unsqueeze(1), group_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_{start_idx}_to_{end_idx}", start_idx=start_idx, out_dir=out_dir)
                 _ = spectral_distill_over_L(softmax_group_path_attn_scores.unsqueeze(1), softmax_group_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_{start_idx}_to_{end_idx}", start_idx=start_idx, out_dir=softmax_out_dir)
             plot_out_head_dim_groups_or_grouped(path_attn_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_student_full", distill_teacher=self.config.distill_teacher)
-            plot_out_head_dim_groups_or_grouped(spectral_teacher_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_full", distill_teacher=self.config.distill_teacher)
             plot_out_head_dim_groups_or_grouped(softmax_path_attn_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_student_full", distill_teacher=self.config.distill_teacher)
-            plot_out_head_dim_groups_or_grouped(softmax_teacher_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_full", distill_teacher=self.config.distill_teacher)
+            if self.config.distill_teacher == 'wavelet':
+                plot_out_head_dim_groups_or_grouped(spectral_teacher_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_full", distill_teacher=self.config.distill_teacher)
+                plot_out_head_dim_groups_or_grouped(softmax_teacher_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_full", distill_teacher=self.config.distill_teacher)
             dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_full", start_idx=-1, out_dir=out_dir)
             _ = spectral_distill_over_L(softmax_path_attn_scores.unsqueeze(1), softmax_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_full", start_idx=-1, out_dir=softmax_out_dir)
             
