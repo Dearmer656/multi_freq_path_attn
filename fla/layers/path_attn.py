@@ -327,8 +327,61 @@ def spectrum_over_T_multi(x: torch.Tensor, eps: float = 1e-6):
     return A, A_log
     # return A
 
+def spectral_distill_over_L_cos(
+    student: torch.Tensor,   # [B, L, H, D] or [B, Q, T, H, D]
+    teacher: torch.Tensor,   # [B, L, H, D] or [B, Q, T, H, D]
+    *,
+    w=1.0,
+    eps: float = 1e-8,
+):
+    """
+    频谱 Shape 蒸馏（COSINE VERSION）
+    ----------------------------------------------------
+    1) 沿 T 做 rFFT → amplitude A_s, A_t: [B, Q, K, H, D]
+    2) 在频率 K 维上做 cosine similarity
+    3) loss = (1 - cosine) 的均值
+    """
 
-def spectral_distill_over_L(
+    # Support both shapes: [B,L,H,D] → [B,1,T,H,D]
+    if student.dim() == 4:
+        x_s = student.unsqueeze(1)
+        x_t = teacher.unsqueeze(1)
+    elif student.dim() == 5:
+        x_s = student
+        x_t = teacher
+    else:
+        raise ValueError(f"Bad shape: {student.shape}")
+
+    # --------------------------------------------------
+    # 1) rFFT amplitude spectrum: [B, Q, K, H, D]
+    # --------------------------------------------------
+    with torch.no_grad():
+        A_t, _ = spectrum_over_T_multi(x_t)       # teacher 不反传
+    A_s, _ = spectrum_over_T_multi(x_s)
+
+    # --------------------------------------------------
+    # reshape 到 [B*Q*H*D, K]，方便批量计算 cosine
+    # --------------------------------------------------
+    B, Q, K, H, D = A_s.shape
+    A_t_flat = A_t.permute(0,1,3,4,2).reshape(-1, K)
+    A_s_flat = A_s.permute(0,1,3,4,2).reshape(-1, K)
+
+    # --------------------------------------------------
+    # 2) 计算 cosine similarity
+    # --------------------------------------------------
+    dot = (A_t_flat * A_s_flat).sum(dim=-1)                     # [N]
+    norm_t = A_t_flat.norm(dim=-1)
+    norm_s = A_s_flat.norm(dim=-1)
+
+    cosine = dot / (norm_t * norm_s + eps)                      # [N]
+
+    # --------------------------------------------------
+    # 3) loss = mean(1 - cosine)
+    # --------------------------------------------------
+    loss_cos = (1.0 - cosine).mean() * w
+
+    return loss_cos
+def spectral_distill_over_L_mse(
     student: torch.Tensor,   # [B, L, H, D]  (path_attn_scores 映射/reshape到该形状)
     teacher: torch.Tensor,   # [B, L, H, D]  (rotary 或 wavelet 的 logits 映射/reshape)
     *,
@@ -371,9 +424,9 @@ def spectral_distill_over_L(
 
     loss_spec_mse = ((A_t_log - A_s_log) ** 2 * w).mean()
     return loss_spec_mse
-    # loss = lambda_kl * loss_kl + lambda_mse * loss_mse
+    loss = lambda_kl * loss_kl + lambda_mse * loss_mse
 
-    # return loss
+    return loss
 
 def path_attn_last_query_elementwise(Q_last, K, W, beta):
     """
@@ -1170,8 +1223,10 @@ class PaTHAttention(nn.Module):
                         A_s_log_T, A_t_log
                     )
                 else:
-                    spectral_loss = self.config.spectral_loss_coe * spectral_distill_over_L(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1) if spectral_teacher_scores.dim() == 4 else spectral_teacher_scores, w=w,lambda_kl=0.0, lambda_mse=1.0)
- 
+                    if self.config.loss_type == 'mse':
+                        spectral_loss = self.config.spectral_loss_coe * spectral_distill_over_L_mse(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1) if spectral_teacher_scores.dim() == 4 else spectral_teacher_scores, w=w,lambda_kl=0.0, lambda_mse=1.0)
+                    elif self.config.loss_type == 'cos':
+                        spectral_loss = self.config.spectral_loss_coe * spectral_distill_over_L_cos(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1) if spectral_teacher_scores.dim() == 4 else spectral_teacher_scores, w=w)
                 
                 dis_loss = temp_loss + spectral_loss
             else:
