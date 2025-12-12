@@ -11,6 +11,40 @@ from fla.utils import check_shared_mem
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
     'USE_GATE': lambda args: args['g_cumsum'] is not None,
 })
+@triton.jit
+def add_q_wavelet_term_for_logits_dq(
+    b_A,          # [BT, BS], float32 logits
+    b_q,          # [BT, K]
+    wavelet,      # [K, T, T]
+    T,
+    K: tl.constexpr,
+    BT: tl.constexpr,
+    BS: tl.constexpr,
+    q_block_start,
+    k_block_start,
+):
+    q_idx = q_block_start + tl.arange(0, BT)
+    k_idx = k_block_start + tl.arange(0, BS)
+
+    mq = q_idx < T
+    mk = (k_idx >= 0) & (k_idx < T)
+    q_idx = tl.where(mq, q_idx, 0)
+    k_idx = tl.where(mk, k_idx, 0)
+
+    for d in range(0, K):
+        qd = b_q[:, d][:, None]      # [BT,1]
+        base = d * T * T
+        ptr = wavelet + base + q_idx[:, None] * T + k_idx[None, :]
+        b_p = tl.load(
+            ptr,
+            mask=mq[:, None] & mk[None, :],
+            other=0.0
+        ).to(b_A.dtype)             # [BT,BS]
+        b_A += qd * b_p             # sum_d q[m,d] * W[d,m,n]
+
+    return b_A
+
+
 @triton.jit(do_not_specialize=['T'])
 def parallel_path_bwd_dq_kernel(
     q,
@@ -29,6 +63,7 @@ def parallel_path_bwd_dq_kernel(
     indices,
     split_offsets,  # varlen specific
     T,
+    wavelet_decay_table,
     G: tl.constexpr,
     HQ: tl.constexpr,
     H: tl.constexpr,
@@ -112,6 +147,12 @@ def parallel_path_bwd_dq_kernel(
             p_k = tl.make_block_ptr(k, (T, K), (H * K, 1), (offset, 0), (BS, BK), (1, 0))
             b_k = tl.load(p_k, boundary_check=(0, 1))
             b_A = tl.dot(b_q, tl.trans(b_k).to(b_q.dtype))
+            b_A = add_q_wavelet_term_for_logits_dq(
+                b_A, b_q, wavelet_decay_table,
+                T, K, BT, BS,
+                q_block_start=i_t*BT,
+                k_block_start=offset,
+            )
             if USE_GATE:
                 p_g_cumsum_k = tl.make_block_ptr(g_cumsum, (T,), (HQ,), (offset,), (BS,), (0,))
                 b_g_cumsum_k = tl.load(p_g_cumsum_k, boundary_check=(0,)).to(tl.float32)
@@ -147,6 +188,7 @@ def parallel_path_bwd_dq_fn(
     S,
     BT,
     BS,
+    wavelet_decay_table,
 ):
     B, T, num_blocks, HQ, K = q.shape
     H, V = v.shape[-2:]
@@ -194,6 +236,7 @@ def parallel_path_bwd_dq_fn(
         BK=BK,
         BV=BV,
         NUM_BLOCKS=num_blocks,
+        wavelet_decay_table=wavelet_decay_table,
         num_warps=8 if (BT == 128 and K == 128) else 4,
         num_stages=3 if check_shared_mem('ampere') else 2
     )
