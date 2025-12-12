@@ -817,7 +817,7 @@ def compute_wavelet_scores_multi_causal(
     scores = scores * decay                             # [B,Q,T,H,D]
 
     return scores
-
+from pathlib import Path
 from rotary_embedding_torch import RotaryEmbedding
 class PaTHAttention(nn.Module):
     def __init__(
@@ -1112,35 +1112,34 @@ class PaTHAttention(nn.Module):
             if self.config.block_size < num_in_group:
                 group_num = 1
                 num_in_group = self.config.block_size
-            out_dir=f'80000steps_length{self.config.block_size}_{self.config.distill_teacher}_distill_in_layer0_{self.config.spectral_loss_coe}'
-            # out_dir=f'80000steps_{self.config.block_size}length_no_distillation'
-            softmax_out_dir = 'softmax_' + out_dir
+            out_dir = Path(self.config.model_name_or_path).name + '_' + Path(self.config.model_name_or_path).parent.name + '_'
+            # softmax_out_dir = 'softmax_' + out_dir
             temporal_out_dir = out_dir + 'temporal_domain_plots'
-            softxmax_temporal_out_dir = 'softmax_'+temporal_out_dir
-            softmax_path_attn_scores = F.softmax(path_attn_scores, dim=-3)
-            softmax_teacher_scores = F.softmax(spectral_teacher_scores, dim=-3)
-            for group in range(group_num):
-                start_idx = group * num_in_group
-                end_idx = (group + 1) * num_in_group
-                group_path_attn_scores = path_attn_scores[:, start_idx:end_idx, ...]
-                group_teacher_scores = spectral_teacher_scores[:, start_idx:end_idx, ...]
-                softmax_group_path_attn_scores = softmax_path_attn_scores[:, start_idx:end_idx, ...]
-                softmax_group_teacher_scores = softmax_teacher_scores[:, start_idx:end_idx, ...]
-                plot_out_head_dim_groups_or_grouped(group_path_attn_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_student_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
-                plot_out_head_dim_groups_or_grouped(softmax_group_path_attn_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_student_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
-                if self.config.distill_teacher == 'wavelet':
-                    plot_out_head_dim_groups_or_grouped(softmax_group_teacher_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
-                    plot_out_head_dim_groups_or_grouped(group_teacher_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
+            # softxmax_temporal_out_dir = 'softmax_'+temporal_out_dir
+            # softmax_path_attn_scores = F.softmax(path_attn_scores, dim=-3)
+            # softmax_teacher_scores = F.softmax(spectral_teacher_scores, dim=-3)
+            # for group in range(group_num):
+            #     start_idx = group * num_in_group
+            #     end_idx = (group + 1) * num_in_group
+            #     group_path_attn_scores = path_attn_scores[:, start_idx:end_idx, ...]
+            #     group_teacher_scores = spectral_teacher_scores[:, start_idx:end_idx, ...]
+            #     softmax_group_path_attn_scores = softmax_path_attn_scores[:, start_idx:end_idx, ...]
+            #     softmax_group_teacher_scores = softmax_teacher_scores[:, start_idx:end_idx, ...]
+            #     plot_out_head_dim_groups_or_grouped(group_path_attn_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_student_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
+            #     plot_out_head_dim_groups_or_grouped(softmax_group_path_attn_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_student_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
+            #     if self.config.distill_teacher == 'wavelet':
+            #         plot_out_head_dim_groups_or_grouped(softmax_group_teacher_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
+            #         plot_out_head_dim_groups_or_grouped(group_teacher_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_{start_idx}_to_{end_idx}", distill_teacher=self.config.distill_teacher)
                 
-                dis_loss = spectral_distill_over_L(group_path_attn_scores.unsqueeze(1), group_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_{start_idx}_to_{end_idx}", start_idx=start_idx, out_dir=out_dir)
-                _ = spectral_distill_over_L(softmax_group_path_attn_scores.unsqueeze(1), softmax_group_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_{start_idx}_to_{end_idx}", start_idx=start_idx, out_dir=softmax_out_dir)
+            #     dis_loss = spectral_distill_over_L(group_path_attn_scores.unsqueeze(1), group_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_{start_idx}_to_{end_idx}", start_idx=start_idx, out_dir=out_dir)
+            #     _ = spectral_distill_over_L(softmax_group_path_attn_scores.unsqueeze(1), softmax_group_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_{start_idx}_to_{end_idx}", start_idx=start_idx, out_dir=softmax_out_dir)
             plot_out_head_dim_groups_or_grouped(path_attn_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_student_full", distill_teacher=self.config.distill_teacher)
-            plot_out_head_dim_groups_or_grouped(softmax_path_attn_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_student_full", distill_teacher=self.config.distill_teacher)
+            # plot_out_head_dim_groups_or_grouped(softmax_path_attn_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_student_full", distill_teacher=self.config.distill_teacher)
             if self.config.distill_teacher == 'wavelet':
                 plot_out_head_dim_groups_or_grouped(spectral_teacher_scores, f'{temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_full", distill_teacher=self.config.distill_teacher)
-                plot_out_head_dim_groups_or_grouped(softmax_teacher_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_full", distill_teacher=self.config.distill_teacher)
+                # plot_out_head_dim_groups_or_grouped(softmax_teacher_scores, f'{softxmax_temporal_out_dir}', name=f"layer{self.layer_idx}_teacher_full", distill_teacher=self.config.distill_teacher)
             dis_loss = spectral_distill_over_L(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_full", start_idx=-1, out_dir=out_dir)
-            _ = spectral_distill_over_L(softmax_path_attn_scores.unsqueeze(1), softmax_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_full", start_idx=-1, out_dir=softmax_out_dir)
+            # _ = spectral_distill_over_L(softmax_path_attn_scores.unsqueeze(1), softmax_teacher_scores.unsqueeze(1), distill_teacher=self.config.distill_teacher, layer_idx=self.layer_idx, name = f"layer{self.layer_idx}_full", start_idx=-1, out_dir=softmax_out_dir)
             
             # else:
             #     dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
