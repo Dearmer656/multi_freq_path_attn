@@ -28,7 +28,8 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
     @staticmethod
     @input_guard
     @autocast_custom_fwd
-    def forward(ctx, q, k, v, w, beta, g, scale, cu_seqlens, use_cache=False, wavelet_decay_table=None):
+    def forward(ctx, q, k, v, w, beta, g, scale, cu_seqlens, use_cache=False):
+
         g_cumsum = chunk_global_cumsum(g, cu_seqlens=cu_seqlens, output_dtype=torch.float32) if g is not None else None
         BS = 64 if check_shared_mem('hopper') else 32
         BT = 128 if check_shared_mem('ampere') else 64
@@ -73,20 +74,18 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             BT=BT,
             BS=BS,
-            wavelet_decay_table=wavelet_decay_table,
         )
         k_cache = prepare_k_cache_fn(k=k_new, w1=w, w2=w2, cu_seqlens=cu_seqlens, BS=BS, use_cache=use_cache)
         ctx.save_for_backward(q, k, v, w, g_cumsum, o, beta, L, A)
         ctx.scale = scale
         ctx.cu_seqlens = cu_seqlens
-        ctx.wavelet_decay_table = wavelet_decay_table
         return o, k_cache
 
     @staticmethod
     @input_guard
     @autocast_custom_bwd
     def backward(ctx, do, dk_new):
-        q, k, v, w, g_cumsum, o, beta, L, A, wavelet_decay_table = ctx.saved_tensors
+        q, k, v, w, g_cumsum, o, beta, L, A = ctx.saved_tensors
         BT = 128 if check_shared_mem('ampere') else 64
         BS = 64 if check_shared_mem('hopper') else 32
         S = 512
@@ -137,8 +136,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             D=delta,
             S=S,
             BT=BT,
-            BS=BS,
-            wavelet_decay_table=wavelet_decay_table,
+            BS=BS
         )
         dq, dhc_whole, dg_cumsum = parallel_path_bwd_dq_fn(
             q=q_new_large,
@@ -154,8 +152,7 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
             D=delta,
             S=S,
             BT=BT,
-            BS=BS,
-            wavelet_decay_table=wavelet_decay_table,
+            BS=BS
         )
         dw1, dw2, dk = chunk_cumprod_householder_bwd_fn(
             w1=w,
@@ -232,8 +229,7 @@ def parallel_path_attn(
     g: Optional[torch.Tensor] = None,
     scale: float = None,
     cu_seqlens: Optional[torch.Tensor] = None,
-    use_cache: bool = False,
-    wavelet_decay_table=None,
+    use_cache: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -277,7 +273,7 @@ def parallel_path_attn(
     if g is not None:
         assert g.shape[:3] == q.shape[:3], 'g should have the same number of heads as q'
     assert q.shape[-2] % k.shape[-2] == 0, 'the number of query heads should be divisible by the number of key heads'
-    o, k_cache = ParallelPATHAttentionFunction.apply(q, k, v, w, beta, g, scale, cu_seqlens, use_cache, wavelet_decay_table)
+    o, k_cache = ParallelPATHAttentionFunction.apply(q, k, v, w, beta, g, scale, cu_seqlens, use_cache)
     return o, k_cache
 
 parallel_path_attention = parallel_path_attn

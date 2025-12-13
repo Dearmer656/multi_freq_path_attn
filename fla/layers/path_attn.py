@@ -27,6 +27,151 @@ if TYPE_CHECKING:
 from rotary_embedding_torch import RotaryEmbedding
 
 import pdb
+def plot_out_head_dim_groups_or_grouped(
+    out: torch.Tensor,
+    save_dir: str = "plots_out_traces",
+    name: str = "",
+    group_size: int = 8,
+    separate_plots: bool = False,
+    distill_teacher: str = "wavelet",  # "wavelet" or "rotary"
+):
+    """
+    支持两种输入：
+
+    1) out.shape == [B, T, H, D]
+       - distill_teacher == "wavelet":
+           对 D 维按 group_size 分组 (默认 8 维一组)，在组内平均，
+           得到 [B, T, H, S]，再在 B 上平均 -> [T, H, S]，
+           最后画 head×S 条曲线（K=T 为横轴）。
+       - distill_teacher == "rotary":
+           不分组，直接每 group_size 维取一个 dim (0, group_size, 2*group_size, ...)，
+           得到 [B, T, H, S]，在 B 上平均 -> [T, H, S]，画这些具体 dim 的曲线。
+
+    2) out.shape == [H, S, K]
+       - 认为已经分好组，无需再 group/平均，
+         直接把 K 作为横轴画 head×S 条曲线。
+
+    Args:
+        out: Tensor, shape [B, T, H, D] 或 [H, S, K]
+        name: 文件名前缀，用于区分不同实验
+        save_dir: 保存图片的目录
+        group_size: 
+            wavelet: 每组的大小（默认 8 维一组）
+            rotary : 作为 stride，每 group_size 维取一个 dim（默认每 8 维取一个）
+        separate_plots:
+            True: 每个 (head, group/dim) 一张图 -> H * S 张
+            False: 每个 head 一张图，里面画多个 group/dim 的曲线 -> H 张
+        distill_teacher:
+            "wavelet": 使用分组平均显示 scale
+            "rotary" : 每 group_size 维取一个具体 dim 显示
+    """
+    os.makedirs(save_dir, exist_ok=True)
+
+    if out.dim() == 4:
+        # --------- 情况 1: [B, T, H, D] ---------
+        B, T, H, D = out.shape
+
+        if distill_teacher == "wavelet":
+            # [B, T, H, D] -> [B, T, H, S, group_size]
+            assert D % group_size == 0, f"D={D} 必须能被 group_size={group_size} 整除"
+
+            S = D // group_size
+            out_grouped = out.view(B, T, H, S, group_size)
+
+            # 在 group_size 上平均 -> [B, T, H, S]
+            out_group_mean = out_grouped.mean(dim=-1)
+
+            # 在 batch 上平均 -> [T, H, S]
+            data = out_group_mean.mean(dim=0).cpu().numpy()
+            K_len = T
+            x_axis = range(K_len)
+
+            group_labels = [
+                f"group{g} (dims {g*group_size}-{(g+1)*group_size-1})"
+                for g in range(S)
+            ]
+
+        elif distill_teacher in ["rotary", "shrink", "shrink_w_shuffle"]:
+            # 每 group_size 维取一个具体 dim：0, group_size, 2*group_size, ...
+            assert group_size > 0, "group_size 必须为正整数"
+            device = out.device
+            selected_indices = torch.arange(0, D, group_size, device=device)  # [S]
+            S = selected_indices.numel()
+
+            # 选出这些维度: [B, T, H, S]
+            out_selected = out[..., selected_indices]
+
+            # 在 batch 上平均 -> [T, H, S]
+            data = out_selected.mean(dim=0).cpu().numpy()
+            K_len = T
+            x_axis = range(K_len)
+
+            idx_list = selected_indices.tolist()
+            group_labels = [
+                f"dim{d_idx}"
+                for d_idx in idx_list
+            ]
+        else:
+            raise ValueError(f"未知的 distill_teacher='{distill_teacher}'，应为 'wavelet' 或 'rotary'")
+
+    elif out.dim() == 3:
+        # --------- 情况 2: [H, S, K]，已经分好组 ---------
+        H, S, K_len = out.shape
+        data = out.cpu().numpy()          # [H, S, K]
+        x_axis = range(K_len)
+
+        group_labels = [
+            f"group{g}"
+            for g in range(S)
+        ]
+    else:
+        raise ValueError(
+            f"out 维度必须是 3 或 4，当前形状 {out.shape} (dim={out.dim()})"
+        )
+
+    # --------- 统一画图逻辑 ---------
+    # 对于 4 维输入，此时 data.shape == [T, H, S]
+    # 我们想要 [K, H, S] 的风格，K 是横轴
+    if out.dim() == 4:
+        # data: [T, H, S] -> [K, H, S]，这里 K=T
+        data = data  # [K, H, S]
+    else:
+        # 3 维时 data: [H, S, K] -> [K, H, S]，方便统一处理
+        data = data.transpose(2, 0, 1)  # [K, H, S]
+
+    K, H, S = data.shape  # 统一的布局：data[k, h, s]
+
+    if separate_plots:
+        # 每个 (head, group/dim) 一张图
+        for h in tqdm(range(H), desc="heads"):
+            for g in range(S):
+                plt.figure()
+                plt.plot(x_axis, data[:, h, g])
+                plt.xlabel("index (T or freq)")
+                plt.ylabel("value")
+                plt.title(f"{name} | head={h}, {group_labels[g]}")
+                plt.tight_layout()
+                plt.savefig(
+                    os.path.join(save_dir, f"{name}_head{h}_group{g}.png"),
+                    dpi=200,
+                )
+                plt.close()
+    else:
+        # 每个 head 一张图，里面画多个 group/dim 曲线
+        for h in tqdm(range(H), desc="heads"):
+            plt.figure()
+            for g in range(S):
+                plt.plot(x_axis, data[:, h, g], label=group_labels[g])
+            plt.xlabel("index (T or freq)")
+            plt.ylabel("value")
+            plt.title(f"{name} | head={h}")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(
+                os.path.join(save_dir, f"{name}_head{h}_groups.png"),
+                dpi=200,
+            )
+            plt.close()
 def sample_index_pairs(
     block_size: int,
     num_samples: int,
@@ -998,6 +1143,226 @@ def compute_pair_wavelet_scores_batched(
     wavelet_scores = qk_scores * wavelet_decay_list.transpose(0, 1)[:, None, :] # [B,S,H,D] * [B,S,H,D] -> [B,S,H,D]
     return wavelet_scores
 
+# ---------------------------
+# helpers
+# ---------------------------
+def _match_heads(x: torch.Tensor, target_h: int) -> torch.Tensor:
+    """
+    x: [B,T,H,...]
+    target_h: desired H
+    repeat_interleave on head dim if needed (for GQA alignment)
+    """
+    H = x.shape[2]
+    if H == target_h:
+        return x
+    if target_h % H == 0:
+        return x.repeat_interleave(target_h // H, dim=2)
+    raise ValueError(f"Cannot match heads: {H} -> {target_h}")
+
+def _future_mask(T: int, device) -> torch.Tensor:
+    # [1,1,T,T]
+    return torch.triu(torch.ones((T, T), device=device, dtype=torch.bool), diagonal=1).view(1, 1, T, T)
+
+# ---------------------------
+# core: build A and compute M = lower(QW^T) T^{-1}
+# ---------------------------
+def path_ut_build_A(
+    w: torch.Tensor,        # [B,T,H,d]
+    beta: torch.Tensor,     # [B,T,H]
+    compute_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    A = I + strictLower(W D W^T), unit-lower-triangular
+    returns A: [B,H,T,T]
+    """
+    B, T, H, d = w.shape
+    w0 = w.to(compute_dtype)
+    b0 = beta.to(compute_dtype)
+
+    eyeT = torch.eye(T, device=w.device, dtype=compute_dtype)
+
+    w_scaled = w0 * b0.unsqueeze(-1)  # [B,T,H,d]
+    S_wdw = torch.einsum("b i h d, b j h d -> b h i j", w_scaled, w0)  # [B,H,T,T]
+    A = torch.tril(S_wdw, diagonal=-1) + eyeT.view(1, 1, T, T)         # unit-lower-tri
+    return A
+
+def path_ut_M_from_S(
+    A: torch.Tensor,        # [B,H,T,T] unit-lower-tri
+    S: torch.Tensor,        # [B,H,T,T] lower(..) already applied
+    beta: torch.Tensor,     # [B,T,H]
+    compute_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    M = S @ T^{-1}, where T^{-1} = A^{-1} D and D=diag(beta)
+    We compute Z = S @ A^{-1} via A^{-T} trick, then M = Z @ D (column-wise scaling).
+    returns M: [B,H,T,T]
+    """
+    b0 = beta.to(compute_dtype)
+    beta_h = b0.transpose(1, 2)  # [B,H,T] (column index j)
+
+    Zt = torch.linalg.solve_triangular(
+        A.transpose(-1, -2),      # A^T (upper)
+        S.transpose(-1, -2),      # RHS = S^T
+        upper=True,
+        unitriangular=True,
+    )
+    Z = Zt.transpose(-1, -2)      # [B,H,T,T] = S @ A^{-1}
+
+    # right-multiply D => scale by beta on column j
+    M = Z * beta_h.unsqueeze(2)   # [B,H,T,T]
+    return M
+
+def path_ut_base_raw(
+    q: torch.Tensor,        # [B,T,H,d]
+    k: torch.Tensor,        # [B,T,H,d]
+    w: torch.Tensor,        # [B,T,H,d]
+    beta: torch.Tensor,     # [B,T,H]
+    compute_dtype: torch.dtype = torch.float32,
+):
+    """
+    returns:
+      E_base_raw: [B,H,T,T]   lower(QK^T) - M_base@strictLower(WK^T), NO mask, NO scale
+      M_base:     [B,H,T,T]
+      strict_WK:  [B,H,T,T]
+      A:          [B,H,T,T]
+    """
+    B, T, H, d = w.shape
+    q0 = q.to(compute_dtype)
+    k0 = k.to(compute_dtype)
+    w0 = w.to(compute_dtype)
+    b0 = beta.to(compute_dtype)
+
+    A = path_ut_build_A(w0, b0, compute_dtype=compute_dtype)
+
+    QK = torch.einsum("b i h d, b j h d -> b h i j", q0, k0)
+    WK = torch.einsum("b i h d, b j h d -> b h i j", w0, k0)
+
+    lower_QK  = torch.tril(QK, diagonal=0)
+    strict_WK = torch.tril(WK, diagonal=-1)
+
+    QW = torch.einsum("b i h d, b j h d -> b h i j", q0, w0)
+    S_base = torch.tril(QW, diagonal=0)
+
+    M_base = path_ut_M_from_S(A, S_base, b0, compute_dtype=compute_dtype)
+
+    E_base_raw = lower_QK - (M_base @ strict_WK)
+    return E_base_raw, M_base, strict_WK, A
+
+# ---------------------------
+# optional: wavelet fused S_wave => M_wave (no OOM, d-chunk)
+# ---------------------------
+def path_ut_M_wave_fused(
+    q: torch.Tensor,          # [B,T,H,d]
+    w: torch.Tensor,          # [B,T,H,d]
+    beta: torch.Tensor,       # [B,T,H]
+    A: torch.Tensor,          # [B,H,T,T]
+    wavelet_dtt: torch.Tensor,# [d,T,T]
+    d_chunk: int = 8,
+    compute_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    S_wave[i,j] = lower( sum_d q[i,d] * w[j,d] * wavelet[d,i,j] )
+    M_wave = S_wave @ T^{-1}
+    returns M_wave: [B,H,T,T]
+    """
+    B, T, H, d = w.shape
+    q0 = q.to(compute_dtype)
+    w0 = w.to(compute_dtype)
+    wav = wavelet_dtt.to(compute_dtype)
+    b0 = beta.to(compute_dtype)
+
+    S_wave = torch.zeros((B, H, T, T), device=q.device, dtype=compute_dtype)
+    for d0 in range(0, d, d_chunk):
+        d1 = min(d, d0 + d_chunk)
+        qc = q0[..., d0:d1]      # [B,T,H,dc]
+        wc = w0[..., d0:d1]      # [B,T,H,dc]
+        wavc = wav[d0:d1]        # [dc,T,T]
+        S_wave += torch.einsum("b i h c, b j h c, c i j -> b h i j", qc, wc, wavc)
+
+    S_wave = torch.tril(S_wave, diagonal=0)
+    M_wave = path_ut_M_from_S(A, S_wave, b0, compute_dtype=compute_dtype)
+    return M_wave
+
+# ---------------------------
+# wavelet PE term using QH: rel = (QH) P^T, where QH = Q - (M W)
+# ---------------------------
+def wavelet_rel_from_M(
+    q: torch.Tensor,            # [B,T,H,d]
+    w: torch.Tensor,            # [B,T,H,d]
+    M: torch.Tensor,            # [B,H,T,T]
+    wavelet_dtt: torch.Tensor,  # [d,T,T]
+    compute_dtype: torch.dtype = torch.float32,
+    layer_idx: int = None,
+) -> torch.Tensor:
+    """
+    rel = (QH) P^T = Q P^T - (M W) P^T
+    returns rel: [B,H,T,T]  (NO scale, NO mask)
+    """
+    q0 = q.to(compute_dtype)
+    w0 = w.to(compute_dtype)
+    wav = wavelet_dtt.to(compute_dtype)
+
+    rel_1 = torch.einsum("b t h d, d t n -> b h t n", q0, wav)  # Q P^T
+
+    q_corr = torch.einsum("b h t j, b j h d -> b t h d", M, w0) # (M W)
+    rel_2  = torch.einsum("b t h d, d t n -> b h t n", q_corr, wav)
+
+    rel = rel_1 - rel_2
+    return rel
+
+# ---------------------------
+# final: baseline output + wavelet(QH) output
+# ---------------------------
+def path_attention_with_wavelet_QH(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    w: torch.Tensor, beta: torch.Tensor,
+    wavelet_dtt: torch.Tensor,
+    layer_idx,
+    use_wavelet_fused_H: bool = False,  # False: baseline H; True: wavelet-fused H
+    d_chunk: int = 8,
+    compute_dtype: torch.dtype = torch.float32,
+):
+    """
+    Returns:
+      out_base: [B,T,H,d] baseline PaTH output
+      out_wav:  [B,T,H,d] PaTH logits + rel(QH·wavelet) output
+    """
+    # align heads to Hw = w.heads
+    Hw = w.shape[2]
+    q = _match_heads(q, Hw)
+    k = _match_heads(k, Hw)
+    v = _match_heads(v, Hw)
+    beta = _match_heads(beta.unsqueeze(-1), Hw)[..., 0] if beta.dim() == 3 else beta  # keep [B,T,H]
+
+    B, T, H, d = q.shape
+    scale = d ** -0.5
+    future = _future_mask(T, q.device)
+
+    # baseline raw logits and M_base
+    E_base_raw, M_base, strict_WK, A = path_ut_base_raw(q, k, w, beta, compute_dtype=compute_dtype)
+
+    # baseline attention
+    E_base = (E_base_raw * scale).masked_fill(future, float("-inf"))
+    P_base = torch.softmax(E_base, dim=-1)
+    out_base = torch.einsum("b h i j, b j h d -> b i h d", P_base, v.to(compute_dtype))
+
+    # choose H (i.e., choose M used to define QH)
+    if use_wavelet_fused_H:
+        M_used = path_ut_M_wave_fused(q, w, beta, A, wavelet_dtt, d_chunk=d_chunk, compute_dtype=compute_dtype)
+    else:
+        M_used = M_base
+
+    # wavelet PE term based on QH
+    rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype, layer_idx=layer_idx)
+
+    # combine raw logits, then scale+mask once
+    E_wav_raw = E_base_raw + rel
+    E_wav = (E_wav_raw * scale).masked_fill(future, float("-inf"))
+    P_wav = torch.softmax(E_wav, dim=-1)
+    out_wav = torch.einsum("b h i j, b j h d -> b i h d", P_wav, v.to(compute_dtype))
+
+    return out_base, out_wav
+
 class PaTHAttention(nn.Module):
     def __init__(
         self,
@@ -1237,8 +1602,19 @@ class PaTHAttention(nn.Module):
                 g = rearrange(g, 'b t hq -> b t hq 1').repeat(1, 1, self.r, 1).view(g.shape[0], g.shape[1], -1)
 
             # 核心 op
+            # pdb.set_trace()
+            out_base, o = path_attention_with_wavelet_QH(
+                q=q, k=k, v=v,
+                w=w, beta=beta,
+                # wavelet_dtt=torch.zeros_like(wavelet_decay_table),
+                wavelet_dtt=wavelet_decay_table,
+                use_wavelet_fused_H=False,   # 用 baseline PaTH 的 H（推荐先从这开始对齐）
+                d_chunk=8,
+                compute_dtype=torch.float32,
+            )
 
-            o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens, wavelet_decay_table=wavelet_decay_table)
+            # pdb.set_trace()
+            # o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
             if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
                 if self.config.temp_loss_coe != 0:
                     i_idx, j_idx, delta = sample_index_pairs(self.config.block_size, self.config.sample_num)

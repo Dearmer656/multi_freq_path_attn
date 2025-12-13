@@ -9,45 +9,6 @@ from fla.ops.utils import prepare_chunk_indices
     'USE_GATE': lambda args: args['g_cumsum'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit
-def add_q_wavelet_term(
-    b_s,          # [BT, BS], float32
-    b_q,          # [BT, BK], float32
-    wavelet,      # ptr to [K, T, T]
-    lambda_w,     # scalar
-    T,            # seq len
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    q_block_start,   # int, 当前 block 的 query 起始 index (0-based in this seq)
-    k_block_start,   # int, 当前 block 的 key   起始 index (0-based in this seq)
-):
-    # m index: [BT]
-    q_idx = q_block_start + tl.arange(0, BT)
-    # n index: [BS]
-    k_idx = k_block_start + tl.arange(0, BS)
-
-    # mask 限制在 [0, T)
-    mq = q_idx < T
-    mk = (k_idx >= 0) & (k_idx < T)
-    q_idx = tl.where(mq, q_idx, 0)
-    k_idx = tl.where(mk, k_idx, 0)
-
-    # wavelet layout: [K, T, T] in row-major:
-    # offset(d, m, n) = d * T * T + m * T + n
-    for d in range(0, K):
-        # [BT, 1]
-        qd = b_q[:, d][:, None]          # broadcast over BS
-
-        base = d * T * T
-        ptr = wavelet + base + q_idx[:, None] * T + k_idx[None, :]
-        # [BT, BS]
-        b_p = tl.load(ptr, mask=mq[:, None] & mk[None, :], other=0.0).to(tl.float32)
-
-        b_s += lambda_w * qd * b_p
-
-    return b_s
-
 @triton.jit(do_not_specialize=['T'])
 def parallel_path_fwd_kernel(
     q,
@@ -66,7 +27,6 @@ def parallel_path_fwd_kernel(
     cu_seqlens,
     indices,
     T,
-    wavelet_decay_table,
     G: tl.constexpr,
     HQ: tl.constexpr,
     H: tl.constexpr,
@@ -126,20 +86,7 @@ def parallel_path_fwd_kernel(
         # [BT, BS]
         m_s = i_t * BT + tl.arange(0, BT) >= (offset + BS)
         b_s = tl.dot(b_q.to(b_k.dtype), b_k)
-        q_block_start = i_t * BT
-        k_block_start = offset
-        b_s = add_q_wavelet_term(
-            b_s=b_s,
-            b_q=b_q,
-            wavelet=wavelet_decay_table,
-            lambda_w=1.0,
-            T=T,
-            K=K,
-            BT=BT,
-            BS=BS,
-            q_block_start=q_block_start,
-            k_block_start=k_block_start,
-        )
+
         if USE_GATE:
             p_g_cumsum_k = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq), (T, ), (HQ, ), (offset, ), (BS, ), (0,))
             b_g_cumsum_k = tl.load(p_g_cumsum_k, boundary_check=(0,))
@@ -171,14 +118,6 @@ def parallel_path_fwd_kernel(
         b_w2 = tl.load(p_w2, boundary_check=(0, 1))
         # [BT, BS]
         b_s = tl.dot(b_q.to(b_k.dtype), b_k)
-        q_block_start = i_t * BT
-        k_block_start = offset
-        b_s = add_q_wavelet_term(
-            b_s, b_q, wavelet_decay_table, 1.0,
-            T=T, K=K, BT=BT, BS=BS,
-            q_block_start=q_block_start,
-            k_block_start=k_block_start,
-        )
         if USE_GATE:
             p_g_cumsum_k = tl.make_block_ptr(g_cumsum + (bos * HQ + i_hq), (T, ), (HQ, ), (offset, ), (BS, ), (0,))
             b_g_cumsum_k = tl.load(p_g_cumsum_k, boundary_check=(0,))
@@ -238,7 +177,6 @@ def parallel_path_fwd_fn(
     cu_seqlens,
     BT,
     BS,
-    wavelet_decay_table,
 ):
     B, T, HQ, K = q.shape
     V = v.shape[-1]
@@ -267,7 +205,6 @@ def parallel_path_fwd_fn(
         T=T,
         K=K,
         V=V,
-        wavelet_decay_table=wavelet_decay_table,
         BK=triton.next_power_of_2(K),
         BV=triton.next_power_of_2(V),
         G=G,

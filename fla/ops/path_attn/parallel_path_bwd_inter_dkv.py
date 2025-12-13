@@ -9,34 +9,6 @@ from fla.ops.utils import prepare_chunk_indices, prepare_chunk_offsets
     'USE_GATE': lambda args: args['g_cumsum'] is not None,
     'IS_VARLEN': lambda args: args['cu_seqlens'] is not None,
 })
-@triton.jit
-def add_wavelet_term_for_bwd_dkv(
-    b_A,            # [BT_keys, BS_queries]
-    b_q,            # [BS_queries, K]
-    wavelet,        # [K, T, T]
-    T: tl.constexpr,
-    K: tl.constexpr,
-    BT: tl.constexpr,
-    BS: tl.constexpr,
-    q_block_start,  # offset（query 起点）
-    k_block_start,  # i_t*BT（key 起点）
-):
-    q_idx = q_block_start + tl.arange(0, BS)
-    k_idx = k_block_start + tl.arange(0, BT)
-    mq = (q_idx >= 0) & (q_idx < T)
-    mk = (k_idx >= 0) & (k_idx < T)
-    q_idx = tl.where(mq, q_idx, 0)
-    k_idx = tl.where(mk, k_idx, 0)
-
-    for d in range(0, K):
-        base = d * T * T
-        # 这里我们把 wavelet 看成 [K, T_key, T_query]
-        ptr = wavelet + base + k_idx[:, None] * T + q_idx[None, :]
-        b_p = tl.load(ptr, mask=mk[:, None] & mq[None, :], other=0.0).to(b_A.dtype)  # [BT, BS]
-        qd = b_q[:, d]  # [BS]
-        b_A += b_p * qd[None, :]  # 每个 (key,query) 加 sum_d q[query,d]*W[d,key,query]
-    return b_A
-
 @triton.jit(do_not_specialize=['T'])
 def parallel_path_bwd_dkv_kernel(
     q,
@@ -55,7 +27,6 @@ def parallel_path_bwd_dkv_kernel(
     indices,
     split_offsets,
     T,
-    wavelet_decay_table,
     G: tl.constexpr,
     HQ: tl.constexpr,
     H: tl.constexpr,
@@ -136,18 +107,6 @@ def parallel_path_bwd_dkv_kernel(
                                 (HQ*K*NUM_BLOCKS, 1), (offset, 0), (BS, BK), (1, 0))
         b_q = tl.load(p_q, boundary_check=(0, 1))
         b_A = tl.dot(b_k, tl.trans(b_q).to(b_k.dtype))
-        b_A = add_wavelet_term_for_bwd_dkv(
-            b_A=b_A,
-            b_q=b_q,
-            wavelet=wavelet_decay_table,
-            T=T,
-            K=K,
-            BT=BT,
-            BS=BS,
-            q_block_start=offset,
-            k_block_start=i_t * BT,
-        )
-
         if USE_GATE:
             p_g_cumsum_q = tl.make_block_ptr(g_cumsum, (T, ), (HQ, ), (offset, ), (BS, ), (0, ))
             b_g_cumsum_q = tl.load(p_g_cumsum_q, boundary_check=(0, ))
@@ -181,8 +140,7 @@ def parallel_path_bwd_dkv_fn(
     q, k, v, g_cumsum, do, dv, dg_cumsum,
     hc_whole, scale, L, D,
     cu_seqlens,
-    S, BT, BS,
-    wavelet_decay_table,
+    S, BT, BS
 ):
     B, T, num_blocks, HQ, K = q.shape
     V = v.shape[-1]
@@ -223,7 +181,6 @@ def parallel_path_bwd_dkv_fn(
         H=H,
         K=K,
         V=V,
-        wavelet_decay_table=wavelet_decay_table,
         BK=triton.next_power_of_2(K),
         BV=triton.next_power_of_2(V),
         num_warps=8 if (BT == 128 and K == 128) else 4,
