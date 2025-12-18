@@ -12,7 +12,7 @@ from einops import rearrange, repeat
 import torch.distributed as dist
 
 from fla.layers.utils import pad_input, unpad_input
-from fla.layers.freq_analysis_utils import make_randomized_teacher_T
+from fla.layers.freq_analysis_utils import *
 from fla.modules import RMSNorm, ShortConvolution
 from fla.modules.l2norm import l2_norm
 from fla.ops.attn.decoding import attn_decoding_one_step
@@ -27,151 +27,6 @@ if TYPE_CHECKING:
 from rotary_embedding_torch import RotaryEmbedding
 
 import pdb
-def plot_out_head_dim_groups_or_grouped(
-    out: torch.Tensor,
-    save_dir: str = "plots_out_traces",
-    name: str = "",
-    group_size: int = 8,
-    separate_plots: bool = False,
-    distill_teacher: str = "wavelet",  # "wavelet" or "rotary"
-):
-    """
-    支持两种输入：
-
-    1) out.shape == [B, T, H, D]
-       - distill_teacher == "wavelet":
-           对 D 维按 group_size 分组 (默认 8 维一组)，在组内平均，
-           得到 [B, T, H, S]，再在 B 上平均 -> [T, H, S]，
-           最后画 head×S 条曲线（K=T 为横轴）。
-       - distill_teacher == "rotary":
-           不分组，直接每 group_size 维取一个 dim (0, group_size, 2*group_size, ...)，
-           得到 [B, T, H, S]，在 B 上平均 -> [T, H, S]，画这些具体 dim 的曲线。
-
-    2) out.shape == [H, S, K]
-       - 认为已经分好组，无需再 group/平均，
-         直接把 K 作为横轴画 head×S 条曲线。
-
-    Args:
-        out: Tensor, shape [B, T, H, D] 或 [H, S, K]
-        name: 文件名前缀，用于区分不同实验
-        save_dir: 保存图片的目录
-        group_size: 
-            wavelet: 每组的大小（默认 8 维一组）
-            rotary : 作为 stride，每 group_size 维取一个 dim（默认每 8 维取一个）
-        separate_plots:
-            True: 每个 (head, group/dim) 一张图 -> H * S 张
-            False: 每个 head 一张图，里面画多个 group/dim 的曲线 -> H 张
-        distill_teacher:
-            "wavelet": 使用分组平均显示 scale
-            "rotary" : 每 group_size 维取一个具体 dim 显示
-    """
-    os.makedirs(save_dir, exist_ok=True)
-
-    if out.dim() == 4:
-        # --------- 情况 1: [B, T, H, D] ---------
-        B, T, H, D = out.shape
-
-        if distill_teacher == "wavelet":
-            # [B, T, H, D] -> [B, T, H, S, group_size]
-            assert D % group_size == 0, f"D={D} 必须能被 group_size={group_size} 整除"
-
-            S = D // group_size
-            out_grouped = out.view(B, T, H, S, group_size)
-
-            # 在 group_size 上平均 -> [B, T, H, S]
-            out_group_mean = out_grouped.mean(dim=-1)
-
-            # 在 batch 上平均 -> [T, H, S]
-            data = out_group_mean.mean(dim=0).cpu().numpy()
-            K_len = T
-            x_axis = range(K_len)
-
-            group_labels = [
-                f"group{g} (dims {g*group_size}-{(g+1)*group_size-1})"
-                for g in range(S)
-            ]
-
-        elif distill_teacher in ["rotary", "shrink", "shrink_w_shuffle"]:
-            # 每 group_size 维取一个具体 dim：0, group_size, 2*group_size, ...
-            assert group_size > 0, "group_size 必须为正整数"
-            device = out.device
-            selected_indices = torch.arange(0, D, group_size, device=device)  # [S]
-            S = selected_indices.numel()
-
-            # 选出这些维度: [B, T, H, S]
-            out_selected = out[..., selected_indices]
-
-            # 在 batch 上平均 -> [T, H, S]
-            data = out_selected.mean(dim=0).cpu().numpy()
-            K_len = T
-            x_axis = range(K_len)
-
-            idx_list = selected_indices.tolist()
-            group_labels = [
-                f"dim{d_idx}"
-                for d_idx in idx_list
-            ]
-        else:
-            raise ValueError(f"未知的 distill_teacher='{distill_teacher}'，应为 'wavelet' 或 'rotary'")
-
-    elif out.dim() == 3:
-        # --------- 情况 2: [H, S, K]，已经分好组 ---------
-        H, S, K_len = out.shape
-        data = out.cpu().numpy()          # [H, S, K]
-        x_axis = range(K_len)
-
-        group_labels = [
-            f"group{g}"
-            for g in range(S)
-        ]
-    else:
-        raise ValueError(
-            f"out 维度必须是 3 或 4，当前形状 {out.shape} (dim={out.dim()})"
-        )
-
-    # --------- 统一画图逻辑 ---------
-    # 对于 4 维输入，此时 data.shape == [T, H, S]
-    # 我们想要 [K, H, S] 的风格，K 是横轴
-    if out.dim() == 4:
-        # data: [T, H, S] -> [K, H, S]，这里 K=T
-        data = data  # [K, H, S]
-    else:
-        # 3 维时 data: [H, S, K] -> [K, H, S]，方便统一处理
-        data = data.transpose(2, 0, 1)  # [K, H, S]
-
-    K, H, S = data.shape  # 统一的布局：data[k, h, s]
-
-    if separate_plots:
-        # 每个 (head, group/dim) 一张图
-        for h in tqdm(range(H), desc="heads"):
-            for g in range(S):
-                plt.figure()
-                plt.plot(x_axis, data[:, h, g])
-                plt.xlabel("index (T or freq)")
-                plt.ylabel("value")
-                plt.title(f"{name} | head={h}, {group_labels[g]}")
-                plt.tight_layout()
-                plt.savefig(
-                    os.path.join(save_dir, f"{name}_head{h}_group{g}.png"),
-                    dpi=200,
-                )
-                plt.close()
-    else:
-        # 每个 head 一张图，里面画多个 group/dim 曲线
-        for h in tqdm(range(H), desc="heads"):
-            plt.figure()
-            for g in range(S):
-                plt.plot(x_axis, data[:, h, g], label=group_labels[g])
-            plt.xlabel("index (T or freq)")
-            plt.ylabel("value")
-            plt.title(f"{name} | head={h}")
-            plt.legend()
-            plt.tight_layout()
-            plt.savefig(
-                os.path.join(save_dir, f"{name}_head{h}_groups.png"),
-                dpi=200,
-            )
-            plt.close()
 def sample_index_pairs(
     block_size: int,
     num_samples: int,
@@ -1103,8 +958,7 @@ def compute_path_score_multi(
 
     # 主循环只在时间轴 t 上扫一遍
     t_iter = range(T)
-    # if show_progress:
-    #     t_iter = tqdm(t_iter, desc="path Householder steps")
+
 
     for t in t_iter:
         # 这一时刻 t，哪些 sample 的区间 [i_s, j_s) 覆盖 t？
@@ -1285,7 +1139,32 @@ def path_ut_M_wave_fused(
 
 # ---------------------------
 # wavelet PE term using QH: rel = (QH) P^T, where QH = Q - (M W)
-# ---------------------------
+
+def wavelet_rel_from_M_bands(
+    q: torch.Tensor,              # [B,T,H,d]
+    w: torch.Tensor,              # [B,T,H,d]
+    M: torch.Tensor,              # [B,H,T,T]
+    wavelet_dtt_bands: torch.Tensor,  # [K,d,T,T]   (K=BANDS=8)
+    compute_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """
+    returns rel_bands: [B,H,K,T,T]  (NO scale, NO mask)
+    """
+    q0 = q.to(compute_dtype)
+    w0 = w.to(compute_dtype)
+    wav = wavelet_dtt_bands.to(compute_dtype)  # [K,d,T,T]
+
+    # rel_1[k] = Q P_k^T
+    rel_1 = torch.einsum("b t h d, k d t n -> b h k t n", q0, wav)
+
+    # q_corr = (M W)
+    q_corr = torch.einsum("b h t j, b j h d -> b t h d", M, w0)
+
+    # rel_2[k] = (M W) P_k^T
+    rel_2 = torch.einsum("b t h d, k d t n -> b h k t n", q_corr, wav)
+
+    rel_bands = rel_1 - rel_2
+    return rel_bands
 def wavelet_rel_from_M(
     q: torch.Tensor,            # [B,T,H,d]
     w: torch.Tensor,            # [B,T,H,d]
@@ -1293,6 +1172,11 @@ def wavelet_rel_from_M(
     wavelet_dtt: torch.Tensor,  # [d,T,T]
     compute_dtype: torch.dtype = torch.float32,
     layer_idx: int = None,
+    rel_selection = None,
+    rel1_coe=None,
+    rel2_coe=None,
+    scale_wise_analyzer = None,
+    E_base_raw: torch.Tensor = None,
 ) -> torch.Tensor:
     """
     rel = (QH) P^T = Q P^T - (M W) P^T
@@ -1301,68 +1185,306 @@ def wavelet_rel_from_M(
     q0 = q.to(compute_dtype)
     w0 = w.to(compute_dtype)
     wav = wavelet_dtt.to(compute_dtype)
+    if rel_selection == 'rel1':
+        rel_1 = torch.einsum("b t h d, d t n -> b h t n", q0, wav)  # Q P^T
+        rel = rel_1
+    elif rel_selection == 'rel2':
+        q_corr = torch.einsum("b h t j, b j h d -> b t h d", M, w0) # (M W)
+        rel_2  = torch.einsum("b t h d, d t n -> b h t n", q_corr, wav)
+        rel = -rel_2
+    elif rel_selection == 'all':
+        q_corr = torch.einsum("b h t j, b j h d -> b t h d", M, w0) # (M W)
+        # rel = rel2_coe * (torch.einsum("b t h d, d t n -> b h t n", q0, wav) - rel2_coe * torch.einsum("b t h d, d t n -> b h t n", q_corr, wav))
+        rel = rel1_coe * torch.einsum("b t h d, d t n -> b h t n", q0, wav) - rel2_coe * torch.einsum("b t h d, d t n -> b h t n", q_corr, wav)
+    if scale_wise_analyzer is not None:
+        scale_wise_analyzer.update(layer_idx, E_base_raw, q, q_corr, wavelet_dtt, coe=rel2_coe)
 
-    rel_1 = torch.einsum("b t h d, d t n -> b h t n", q0, wav)  # Q P^T
-
-    q_corr = torch.einsum("b h t j, b j h d -> b t h d", M, w0) # (M W)
-    rel_2  = torch.einsum("b t h d, d t n -> b h t n", q_corr, wav)
-
-    rel = rel_1 - rel_2
     return rel
-
+def causal_mask_fill_value(dtype: torch.dtype) -> float:
+    # 对 fp16/bf16/float32 都安全
+    return torch.finfo(dtype).min
 # ---------------------------
 # final: baseline output + wavelet(QH) output
 # ---------------------------
-def path_attention_with_wavelet_QH(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
-    w: torch.Tensor, beta: torch.Tensor,
-    wavelet_dtt: torch.Tensor,
-    layer_idx,
-    use_wavelet_fused_H: bool = False,  # False: baseline H; True: wavelet-fused H
-    d_chunk: int = 8,
-    compute_dtype: torch.dtype = torch.float32,
+import torch
+
+def wavelet_rel_from_M_stream(
+    q: torch.Tensor,              # [B,T,H,d]
+    w: torch.Tensor,              # [B,T,H,d]
+    M: torch.Tensor,              # [B,H,T,T]
+    wavelet_dtt_bands: torch.Tensor,  # [K,d,T,T]
+    alpha: torch.Tensor | None = None, # [B,H,K] or None (uniform)
+    compute_dtype: torch.dtype = torch.bfloat16,
+    n_chunk: int = 128,           # chunk over last dim of [T,T]
 ):
     """
-    Returns:
-      out_base: [B,T,H,d] baseline PaTH output
-      out_wav:  [B,T,H,d] PaTH logits + rel(QH·wavelet) output
+    Returns rel: [B,H,T,T] (NO scale, NO mask), streaming over K and n_chunk.
+    Peak memory ~ O(B*H*T*n_chunk) instead of O(B*H*K*T*T).
     """
-    # align heads to Hw = w.heads
+    B, T, H, d = q.shape
+    K, d2, T1, T2 = wavelet_dtt_bands.shape
+    assert d2 == d and T1 == T and T2 == T, (q.shape, wavelet_dtt_bands.shape)
+
+    q0 = q.to(compute_dtype)
+    w0 = w.to(compute_dtype)
+    wav = wavelet_dtt_bands.to(compute_dtype)
+
+    # q_corr = (M W)  -> [B,T,H,d]
+    q_corr = torch.einsum("b h t j, b j h d -> b t h d", M, w0)
+
+    rel = torch.zeros((B, H, T, T), device=q.device, dtype=compute_dtype)
+
+    if alpha is not None:
+        assert alpha.shape == (B, H, K), (alpha.shape, (B, H, K))
+        a = alpha.to(device=q.device, dtype=compute_dtype)
+    else:
+        a = None
+
+    for k in range(K):
+        wav_k = wav[k]  # [d,T,T]
+        wgt = a[:, :, k] if a is not None else None  # [B,H] or None
+
+        for n0 in range(0, T, n_chunk):
+            n1 = min(T, n0 + n_chunk)
+
+            # rel1_chunk: Q P_k^T
+            rel1 = torch.einsum("b t h d, d t n -> b h t n", q0, wav_k[:, :, n0:n1])
+            # rel2_chunk: (MW) P_k^T
+            rel2 = torch.einsum("b t h d, d t n -> b h t n", q_corr, wav_k[:, :, n0:n1])
+
+            chunk = rel1 - rel2
+            if wgt is not None:
+                chunk = chunk * wgt[:, :, None, None]
+
+            rel[:, :, :, n0:n1] += chunk
+
+    return rel
+
+def path_attention_with_wavelet_QH(
+    q, k, v, w, beta,
+    wavelet_dtt,
+    use_wavelet_fused_H: bool = False,
+    d_chunk: int = 8,
+    compute_dtype: torch.dtype = torch.float32,
+    analyzer=None,
+    scale_wise_analyzer=None,
+    layer_idx=None,
+    ablate=None,
+    rel1_coe=None,
+    rel2_coe=None,
+    router=None,
+    rel_selection = None,
+    router1=None,
+    router2=None,
+):
+    # === (A) head 对齐：先沿用你现在的 Hw 对齐（但见下文我建议改成 Hq 对齐） ===
     Hw = w.shape[2]
     q = _match_heads(q, Hw)
     k = _match_heads(k, Hw)
     v = _match_heads(v, Hw)
-    beta = _match_heads(beta.unsqueeze(-1), Hw)[..., 0] if beta.dim() == 3 else beta  # keep [B,T,H]
+    if beta.dim() == 3:  # [B,T,H]
+        beta = _match_heads(beta.unsqueeze(-1), Hw)[..., 0]
+    else:
+        beta = beta  # assume already [B,T,Hw]
 
     B, T, H, d = q.shape
     scale = d ** -0.5
-    future = _future_mask(T, q.device)
+    future = _future_mask(T, q.device)  # [1,1,T,T]
 
-    # baseline raw logits and M_base
-    E_base_raw, M_base, strict_WK, A = path_ut_base_raw(q, k, w, beta, compute_dtype=compute_dtype)
+    # --- baseline raw logits and M_base ---
+    E_base_raw, M_base, strict_WK, A = path_ut_base_raw(
+        q, k, w, beta, compute_dtype=compute_dtype
+    )
 
-    # baseline attention
-    E_base = (E_base_raw * scale).masked_fill(future, float("-inf"))
+    # --- baseline attention ---
+    E_base = E_base_raw * scale
+    fill = causal_mask_fill_value(E_base.dtype)
+    E_base = E_base.masked_fill(future, fill)
     P_base = torch.softmax(E_base, dim=-1)
     out_base = torch.einsum("b h i j, b j h d -> b i h d", P_base, v.to(compute_dtype))
 
-    # choose H (i.e., choose M used to define QH)
+    # --- pick M_used for defining QH in wavelet branch ---
     if use_wavelet_fused_H:
         M_used = path_ut_M_wave_fused(q, w, beta, A, wavelet_dtt, d_chunk=d_chunk, compute_dtype=compute_dtype)
     else:
         M_used = M_base
 
-    # wavelet PE term based on QH
-    rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype, layer_idx=layer_idx)
+    # --- wavelet rel term ---
+    if wavelet_dtt is not None:
+        if router1 is not None and router2 is not None:
+            rel = wavelet_rel_from_M_scale_router(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype, d_chunk=d_chunk, layer_idx=layer_idx,
+                                                rel_selection=rel_selection, gate1=router1, gate2=router2)
+        else:
+            rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype,layer_idx=layer_idx, rel_selection=rel_selection, rel1_coe=rel1_coe, rel2_coe=rel2_coe, scale_wise_analyzer=scale_wise_analyzer,
+                                     E_base_raw=E_base_raw if scale_wise_analyzer is not None else None)
 
-    # combine raw logits, then scale+mask once
-    E_wav_raw = E_base_raw + rel
-    E_wav = (E_wav_raw * scale).masked_fill(future, float("-inf"))
+        # optional ablation on rel
+        if ablate is not None and layer_idx in ablate:
+            for h in ablate[layer_idx]:
+                rel[:, h].zero_()
+
+        # ✅ 关键：无论是否 ablate，都要加上 rel
+
+        # if coe is not None:
+        #     coe = coe.to(rel.device).to(rel.dtype)
+        #     E_wav_raw = E_base_raw + coe * rel
+        # else:
+        E_wav_raw = E_base_raw + rel
+    else:
+        rel = None
+        E_wav_raw = E_base_raw
+    E_wav = E_wav_raw * scale
+    wave_fill = causal_mask_fill_value(E_wav.dtype)
+    E_wav = E_wav.masked_fill(future, wave_fill)
     P_wav = torch.softmax(E_wav, dim=-1)
     out_wav = torch.einsum("b h i j, b j h d -> b i h d", P_wav, v.to(compute_dtype))
 
+    if analyzer is not None:
+        w0 = w.to(compute_dtype)
+        deltaQ = torch.einsum("b h i j, b j h d -> b i h d", M_used, w0)
+        analyzer.update(layer_idx, E_base_raw, rel, P_base, P_wav, q, deltaQ)
     return out_base, out_wav
+class PathToWaveletRouter(torch.nn.Module):
+    def __init__(self, head_dim_feat: int, num_heads: int, num_bands: int, hidden: int = 64):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_bands = num_bands
+        self.mlp = torch.nn.Sequential(
+            torch.nn.Linear(head_dim_feat, hidden),
+            torch.nn.SiLU(),
+            torch.nn.Linear(hidden, num_bands),
+        )
 
+    def forward(self, feat_h: torch.Tensor, temperature: float = 1.0):
+        """
+        feat_h: [B, H, F]  (每个 head 的特征)
+        return alpha: [B, H, B]  (band mixing)
+        """
+        logits = self.mlp(feat_h) / temperature
+        alpha = torch.softmax(logits, dim=-1)
+        return alpha
+class LogitsToBandRouter(nn.Module):
+    """
+    Input : E_base_raw [B,H,T,T]
+    Output: alpha      [B,H,K]
+    """
+    def __init__(self, num_heads: int, num_bands: int, hidden: int = 64, pool: int = 8):
+        super().__init__()
+        self.num_heads = num_heads
+        self.num_bands = num_bands
+        self.pool = pool
+
+        # depthwise conv per head (keeps heads independent)
+        self.dw = nn.Conv2d(num_heads, num_heads, kernel_size=3, padding=1, groups=num_heads)
+        # pointwise conv: each head -> hidden channels (still grouped by head)
+        self.pw = nn.Conv2d(num_heads, num_heads * hidden, kernel_size=1, groups=num_heads)
+
+        self.out = nn.Linear(hidden, num_bands)
+
+    def forward(self, E_base_raw: torch.Tensor, temperature: float = 1.0):
+        assert E_base_raw.dim() == 4, E_base_raw.shape
+        B, H, T, _ = E_base_raw.shape
+        assert H == self.num_heads, (H, self.num_heads)
+
+        x = E_base_raw  # [B,H,T,T]
+
+        # downsample for speed (T=512 -> 64 if pool=8)
+        if self.pool > 1:
+            x = F.avg_pool2d(x, kernel_size=self.pool, stride=self.pool)  # [B,H,Ts,Ts]
+
+        x = self.dw(x)                       # [B,H,Ts,Ts]
+        x = self.pw(x)                       # [B,H*hidden,Ts,Ts]
+
+        Ts = x.shape[-1]
+        x = x.view(B, H, -1, Ts, Ts).mean(dim=(-1, -2))  # [B,H,hidden]  (全局聚合)
+
+        logits = self.out(x) / temperature   # [B,H,K]
+        alpha = torch.softmax(logits, dim=-1)
+        return alpha
+def wavelet_rel_from_M_scale_router(
+    q: torch.Tensor,            # [B,T,H,D]
+    w: torch.Tensor,            # [B,T,H,D]
+    M: torch.Tensor,            # [B,H,T,T]
+    wavelet_dtt: torch.Tensor,  # [D,T,T]
+    compute_dtype: torch.dtype = torch.float32,
+    d_chunk: int = 8,
+    layer_idx: int = None,
+    rel_selection: str = "all",     # "rel1" | "rel2" | "all"
+    # gates (推荐 token-wise): [B,T,H,S]，也可广播成 [1,1,H,S] / [B,1,H,S]
+    gate1: torch.Tensor = None,     # for rel1
+    gate2: torch.Tensor = None,     # for rel2
+    # fallback coe（如果你还想保留 head-wise 标量）: [H] or [H,1,1]
+    rel1_coe: torch.Tensor = None,
+    rel2_coe: torch.Tensor = None,
+    scale_wise_analyzer=None,
+    E_base_raw: torch.Tensor = None,  # [B,H,T,T]
+) -> torch.Tensor:
+    """
+    Scale-wise routed:
+      rel1 = sum_s (gate1 * q_s) P_s
+      rel2 = sum_s (gate2 * qcorr_s) P_s
+      rel  = rel1 - rel2   (or selection)
+    Return: rel [B,H,T,T] (NO scale, NO mask)
+    """
+    B, T, H, D = q.shape
+    assert wavelet_dtt.shape[0] == D
+    assert D % d_chunk == 0
+    S = D // d_chunk
+
+    q0 = q.to(compute_dtype)
+    w0 = w.to(compute_dtype)
+    P  = wavelet_dtt.to(compute_dtype)
+
+    # P_s: [S,T,T]  (同组共享scale -> 压缩到scale-group)
+    P_s = P.view(S, d_chunk, T, T).mean(dim=1)
+
+    # q_s: [B,T,H,S]  (组内求和；也可以改成 mean，看你定义)
+    q_s = q0.view(B, T, H, S, d_chunk).sum(dim=-1)
+
+    # gate 默认：全 1（不路由）
+    if gate1 is None:
+        gate1 = 1.0
+        gate2 = 1.0
+    if gate1 is not None and gate2 is None:
+        gate2 = gate1
+    # rel1: [B,H,T,T]
+    rel1 = None
+    if rel_selection in ("rel1", "all"):
+        rel1 = torch.einsum("b t h s, s t n -> b h t n", gate1 * q_s, P_s)
+
+        if rel1_coe is not None:
+            # rel1_coe: [H] or [H,1,1] -> broadcast to [B,H,T,T]
+            rel1 = rel1 * rel1_coe.view(1, H, 1, 1).to(rel1.dtype)
+
+    # rel2: [B,H,T,T]
+    rel2 = None
+    q_corr = None
+    if rel_selection in ("rel2", "all"):
+        # q_corr: [B,T,H,D] = M W
+        q_corr = torch.einsum("b h t j, b j h d -> b t h d", M.to(compute_dtype), w0)
+        qcorr_s = q_corr.view(B, T, H, S, d_chunk).sum(dim=-1)
+
+        rel2 = torch.einsum("b t h s, s t n -> b h t n", gate2 * qcorr_s, P_s)
+
+        if rel2_coe is not None:
+            rel2 = rel2 * rel2_coe.view(1, H, 1, 1).to(rel2.dtype)
+
+    # combine
+    if rel_selection == "rel1":
+        rel = rel1
+    elif rel_selection == "rel2":
+        rel = -rel2
+    elif rel_selection == "all":
+        rel = rel1 - rel2
+    else:
+        raise ValueError(f"Unknown rel_selection={rel_selection}")
+
+    # analyzer update: only when q_corr is available (or pass None and handle it in analyzer)
+    if scale_wise_analyzer is not None and (E_base_raw is not None) and (q_corr is not None):
+        # 这里传 gate/coe 你想记录什么都行；先沿用 rel2_coe
+        scale_wise_analyzer.update(layer_idx, E_base_raw, q, q_corr, wavelet_dtt, coe=rel2_coe)
+
+    return rel
 class PaTHAttention(nn.Module):
     def __init__(
         self,
@@ -1416,7 +1538,15 @@ class PaTHAttention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
-
+        if str(getattr(config, "coe_mode", "")).lower() == "seperate":
+            self.rel1_coe = nn.Parameter(torch.zeros(1, 12, 1, 1), requires_grad=True)
+            self.wavelet_coe = nn.Parameter(torch.ones(1, 12, 1, 1), requires_grad=True)
+        elif str(getattr(config, "coe_mode", "")).lower() == "unify":
+            self.rel1_coe = None
+            self.wavelet_coe = nn.Parameter(torch.zeros(1, 12, 1, 1), requires_grad=True)
+        elif str(getattr(config, "coe_mode", "")).lower() == "none":
+            self.rel1_coe = None
+            self.wavelet_coe = None
         # w 分支输出扩到 H*R*d
         out_w = self.kv_dim * self.r
         if use_low_rank_w:
@@ -1424,6 +1554,26 @@ class PaTHAttention(nn.Module):
                 nn.Linear(self.hidden_size, 32, bias=False),
                 nn.Linear(32, out_w, bias=False)
             )
+            if config.wavelet_router:
+                print(config.router_mode)
+                if config.router_mode == 'unify':
+                    self.router1 = nn.Sequential(
+                        nn.Linear(self.hidden_size, 32, bias=False),
+                        nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
+                    )
+                    self.router2 = None
+                elif config.router_mode == 'seperate':
+                    self.router1 = nn.Sequential(
+                        nn.Linear(self.hidden_size, 32, bias=False),
+                        nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
+                    )
+                    self.router2 = nn.Sequential(
+                        nn.Linear(self.hidden_size, 32, bias=False),
+                        nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
+                    )
+            else:
+                self.router1 = None
+                self.router2 = None
         else:
             self.w_proj = nn.Linear(self.hidden_size, out_w, bias=False)
 
@@ -1444,8 +1594,9 @@ class PaTHAttention(nn.Module):
 
         # 每个 (head, rank) 一个 beta
         self.bt_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.r, bias=True)
-        if self.config.distill_teacher == 'rotary':
+        if self.config.distill_teacher == 'rotary' or self.config.qk_rotation:
             self.rotary_emb = RotaryEmbedding(dim=64)
+
         # 可选 FoX 遗忘门
         self.use_forget_gate = use_forget_gate
         if use_forget_gate:
@@ -1458,6 +1609,15 @@ class PaTHAttention(nn.Module):
             self.attn_dropout = nn.Dropout(attn_pdrop)
             self.path_attention_ratio = nn.Parameter(torch.ones(num_heads)) 
         # ===== Wavelet(beta) 参数 =====
+        if config.wavelet_router:
+            self.router_module = LogitsToBandRouter(
+                num_heads=self.num_heads,
+                num_bands=config.router_band_num,
+                hidden=config.router_hidden_dim,
+                pool=8,
+            )
+        else:
+            self.router_module = None
         if use_wavelet_beta:
             H = self.num_kv_heads
 
@@ -1510,6 +1670,9 @@ class PaTHAttention(nn.Module):
         use_cache: bool = False,
         wavelet_decay_table: Optional[torch.Tensor] = None,  # [B,T,H,] or None
         geom_p = 0,
+        analyzer=None,
+        scale_wise_analyzer=None,
+        router_analyzer=None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
 
@@ -1526,6 +1689,21 @@ class PaTHAttention(nn.Module):
         k = self.k_proj(hidden_states)           # [B,T,H*d]
         v = self.v_proj(hidden_states)           # [B,T,H*d]
         w = self.w_proj(hidden_states)           # [B,T,H*R*d]
+        if self.config.wavelet_router:
+            B = w.size(0)
+            S=8
+            H= 12
+            T = w.size(1)
+            router1_logits = self.router1(hidden_states)          # [B,T,H*S]
+            router1_logits = router1_logits.view(B, T, H, S)               # [B,T,H,S]
+            router1 = torch.softmax(router1_logits, dim=-1)                # 在 scale 上做 softmax
+            if self.router2 is None:
+                router2 = None
+            else:
+                router2_logits = self.router2(hidden_states)          # [B,T,H*S]
+                router2_logits = router2_logits.view(B, T, H, S)               # [B,T,H,S]
+                router2 = torch.softmax(router2_logits, dim=-1)
+                # router_analyzer.update(self.layer_idx, router1, router2)
         beta_logits = self.bt_proj(hidden_states)  # [B,T,H*R]
         g = F.logsigmoid(self.g_proj(hidden_states).float()) if self.use_forget_gate else None
 
@@ -1602,19 +1780,44 @@ class PaTHAttention(nn.Module):
                 g = rearrange(g, 'b t hq -> b t hq 1').repeat(1, 1, self.r, 1).view(g.shape[0], g.shape[1], -1)
 
             # 核心 op
-            # pdb.set_trace()
-            out_base, o = path_attention_with_wavelet_QH(
-                q=q, k=k, v=v,
-                w=w, beta=beta,
-                # wavelet_dtt=torch.zeros_like(wavelet_decay_table),
-                wavelet_dtt=wavelet_decay_table,
-                use_wavelet_fused_H=False,   # 用 baseline PaTH 的 H（推荐先从这开始对齐）
-                d_chunk=8,
-                compute_dtype=torch.float32,
-            )
-
-            # pdb.set_trace()
+            if not self.config.qk_rotation:
+                if self.config.ablate_switch:
+                    ablate = ablation_from_conflict_csv("/cl/work5/hongyu-s/transformers/examples/pytorch/language-modeling/analysis/top_conflict_heads.csv", topk=5, layer_whitelist=[0,6])
+                else:
+                    ablate = None
+                out_base, o = path_attention_with_wavelet_QH(
+                    q=q, k=k, v=v,
+                    w=w, beta=beta,
+                    wavelet_dtt=wavelet_decay_table,
+                    # wavelet_dtt=None,
+                    use_wavelet_fused_H=False,   # 用 baseline PaTH 的 H（推荐先从这开始对齐）
+                    d_chunk=8,
+                    compute_dtype=torch.float32,
+                    analyzer=analyzer,
+                    scale_wise_analyzer=scale_wise_analyzer,
+                    layer_idx=self.layer_idx,
+                    ablate=ablate,
+                    rel1_coe=self.rel1_coe,
+                    rel2_coe=self.wavelet_coe,
+                    router=self.router_module,
+                    rel_selection=self.config.rel_selection,
+                    router1=router1 if self.config.wavelet_router else None,
+                    router2=router2 if self.config.wavelet_router else None,
+                )                
+            else:
+                rot_q, rot_k = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3), self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3)
+                o, _ = parallel_path_attn(q=rot_q, k=rot_k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
             # o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
+            if self.layer_idx == 11 and analyzer:
+                analyzer.save(
+                    out_dir=f"analysis/{Path(self.config.model_name_or_path).name}_{Path(self.config.model_name_or_path).parent.name}",
+                    tag="path_wavelet_QH",
+                    make_plots=True,
+                )         
+                scale_wise_analyzer.save_npz()
+                npz_path, fig_paths = router_analyzer.finalize_and_plot(prefix="router")
+                os._exit(0)
+            # pdb.set_trace()
             if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
                 if self.config.temp_loss_coe != 0:
                     i_idx, j_idx, delta = sample_index_pairs(self.config.block_size, self.config.sample_num)
