@@ -6,12 +6,14 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import os
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange, repeat
 import torch.distributed as dist
+import time
 
 from fla.layers.utils import pad_input, unpad_input
 from fla.layers.freq_analysis_utils import *
@@ -1297,7 +1299,6 @@ def wavelet_rel_from_M(
     rel_selection = None,
     rel1_coe=None,
     rel2_coe=None,
-    scale_wise_analyzer = None,
     E_base_raw: torch.Tensor = None,
 ) -> torch.Tensor:
     """
@@ -1307,6 +1308,7 @@ def wavelet_rel_from_M(
     q0 = q.to(compute_dtype)
     w0 = w.to(compute_dtype)
     wav = wavelet_dtt.to(compute_dtype)
+    rel1_coe, rel2_coe = 1.0, 1.0
     if rel_selection == 'rel1':
         rel_1 = torch.einsum("b t h d, d t n -> b h t n", q0, wav)  # Q P^T
         rel = rel1_coe * rel_1
@@ -1318,8 +1320,7 @@ def wavelet_rel_from_M(
         q_corr = torch.einsum("b h t j, b j h d -> b t h d", M, w0) # (M W)
         # rel = rel2_coe * (torch.einsum("b t h d, d t n -> b h t n", q0, wav) - rel2_coe * torch.einsum("b t h d, d t n -> b h t n", q_corr, wav))
         rel = rel1_coe * torch.einsum("b t h d, d t n -> b h t n", q0, wav) - rel2_coe * torch.einsum("b t h d, d t n -> b h t n", q_corr, wav)
-    if scale_wise_analyzer is not None:
-        scale_wise_analyzer.update(layer_idx, E_base_raw, q, q_corr, wavelet_dtt, coe=rel2_coe)
+
 
     return rel
 def causal_mask_fill_value(dtype: torch.dtype) -> float:
@@ -1382,101 +1383,7 @@ def wavelet_rel_from_M_stream(
 
     return rel
 
-def path_attention_with_wavelet_QH(
-    q, k, v, w, beta,
-    wavelet_dtt,
-    use_wavelet_fused_H: bool = False,
-    d_chunk: int = 8,
-    compute_dtype: torch.dtype = torch.float32,
-    analyzer=None,
-    # scale_wise_analyzer=None,
-    layer_idx=None,
-    ablate=None,
-    rel1_coe=None,
-    rel2_coe=None,
-    rel_selection = None,
-    router1=None,
-    router2=None,
-):
-    # === (A) head 对齐：先沿用你现在的 Hw 对齐（但见下文我建议改成 Hq 对齐） ===
-    Hw = w.shape[2]
-    q = _match_heads(q, Hw)
-    k = _match_heads(k, Hw)
-    v = _match_heads(v, Hw)
-    if beta.dim() == 3:  # [B,T,H]
-        beta = _match_heads(beta.unsqueeze(-1), Hw)[..., 0]
-    else:
-        beta = beta  # assume already [B,T,Hw]
 
-    B, T, H, d = q.shape
-    scale = d ** -0.5
-    future = _future_mask(T, q.device)  # [1,1,T,T]
-
-    # --- baseline raw logits and M_base ---
-    E_base_raw, M_base, strict_WK, A = path_ut_base_raw(
-        q, k, w, beta, compute_dtype=compute_dtype
-    )
-
-    # --- baseline attention ---
-    E_base = E_base_raw * scale
-    fill = causal_mask_fill_value(E_base.dtype)
-    E_base = E_base.masked_fill(future, fill)
-    P_base = torch.softmax(E_base, dim=-1)
-    out_base = torch.einsum("b h i j, b j h d -> b i h d", P_base, v.to(compute_dtype))
-
-    # --- pick M_used for defining QH in wavelet branch ---
-    if use_wavelet_fused_H:
-        M_used = path_ut_M_wave_fused(q, w, beta, A, wavelet_dtt, d_chunk=d_chunk, compute_dtype=compute_dtype)
-    else:
-        M_used = M_base
-    # dump_last_query_per_dim(
-    #     save_path=f"./D_keep_data/hotpot_qa_2048L_mix_PA_pretrain_WR_layer{layer_idx:02d}",
-    #     q=q, k=k, w=w,
-    #     M=M_used,                     # 用你想分析的那份 M（M_base 或 M_wave）
-    #     wavelet_dtt=wavelet_dtt,
-    #     layer_idx=layer_idx,           # 视显存/速度调
-    #     save_dtype=torch.float32,
-    #     compute_corr_row=True,
-    #     router1=router1,
-    #     router2=router2,
-    # )
-    
-    # if layer_idx == 11:
-    #     os._exit(0)
-    # --- wavelet rel term ---
-    if wavelet_dtt is not None:
-        if router1 is not None and router2 is not None:
-            rel = wavelet_rel_from_M_scale_router(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype, d_chunk=d_chunk, layer_idx=layer_idx,
-                                                rel_selection=rel_selection, gate1=router1, gate2=router2)
-        else:
-            # rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype,layer_idx=layer_idx, rel_selection=rel_selection, rel1_coe=rel1_coe, rel2_coe=rel2_coe, scale_wise_analyzer=scale_wise_analyzer,
-            #                          E_base_raw=E_base_raw if scale_wise_analyzer is not None else None)
-            rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype,layer_idx=layer_idx, rel_selection=rel_selection, rel1_coe=rel1_coe, rel2_coe=rel2_coe, scale_wise_analyzer=scale_wise_analyzer,
-                                     E_base_raw=E_base_raw if analyzer is not None else None)
-
-        # optional ablation on rel
-        if ablate is not None and layer_idx in ablate:
-            for h in ablate[layer_idx]:
-                rel[:, h].zero_()
-        E_wav_raw = E_base_raw + rel
-    else:
-        rel = None
-        E_wav_raw = E_base_raw
-    E_wav = E_wav_raw * scale
-    wave_fill = causal_mask_fill_value(E_wav.dtype)
-    E_wav = E_wav.masked_fill(future, wave_fill)
-    P_wav = torch.softmax(E_wav, dim=-1)
-    out_wav = torch.einsum("b h i j, b j h d -> b i h d", P_wav, v.to(compute_dtype))
-
-    if analyzer is not None and rel is not None:
-        w0 = w.to(compute_dtype)
-        deltaQ = torch.einsum("b h i j, b j h d -> b i h d", M_used, w0)
-        analyzer['layer_attention_analyzer'].update(layer_idx, E_base_raw, rel, P_base, P_wav, q, deltaQ)
-
-    pwav_logger = analyzer.get("pwav_mean_logger") if isinstance(analyzer, dict) else None
-    if pwav_logger is not None:
-        pwav_logger.update(layer_idx, out_wav)
-    return out_base, out_wav
 
 class PathToWaveletRouter(torch.nn.Module):
     def __init__(self, head_dim_feat: int, num_heads: int, num_bands: int, hidden: int = 64):
@@ -1535,93 +1442,7 @@ class LogitsToBandRouter(nn.Module):
         logits = self.out(x) / temperature   # [B,H,K]
         alpha = torch.softmax(logits, dim=-1)
         return alpha
-def wavelet_rel_from_M_scale_router(
-    q: torch.Tensor,            # [B,T,H,D]
-    w: torch.Tensor,            # [B,T,H,D]
-    M: torch.Tensor,            # [B,H,T,T]
-    wavelet_dtt: torch.Tensor,  # [D,T,T]
-    compute_dtype: torch.dtype = torch.float32,
-    d_chunk: int = 8,
-    layer_idx: int = None,
-    rel_selection: str = "all",     # "rel1" | "rel2" | "all"
-    # gates (推荐 token-wise): [B,T,H,S]，也可广播成 [1,1,H,S] / [B,1,H,S]
-    gate1: torch.Tensor = None,     # for rel1
-    gate2: torch.Tensor = None,     # for rel2
-    # fallback coe（如果你还想保留 head-wise 标量）: [H] or [H,1,1]
-    rel1_coe: torch.Tensor = None,
-    rel2_coe: torch.Tensor = None,
-    scale_wise_analyzer=None,
-    E_base_raw: torch.Tensor = None,  # [B,H,T,T]
-) -> torch.Tensor:
-    """
-    Scale-wise routed:
-      rel1 = sum_s (gate1 * q_s) P_s
-      rel2 = sum_s (gate2 * qcorr_s) P_s
-      rel  = rel1 - rel2   (or selection)
-    Return: rel [B,H,T,T] (NO scale, NO mask)
-    """
-    B, T, H, D = q.shape
-    assert wavelet_dtt.shape[0] == D
-    assert D % d_chunk == 0
-    S = D // d_chunk
 
-    q0 = q.to(compute_dtype)
-    w0 = w.to(compute_dtype)
-    P  = wavelet_dtt.to(compute_dtype)
-
-    # P_s: [S,T,T]  (同组共享scale -> 压缩到scale-group)
-    P_s = P.view(S, d_chunk, T, T).mean(dim=1)
-
-    # P_s = P.view(S, d_chunk, T, T)
-    # q_s: [B,T,H,S]  (组内求和；也可以改成 mean，看你定义)
-    q_s = q0.view(B, T, H, S, d_chunk).sum(dim=-1)
-    # q_s = q0.view(B, T, H, S, d_chunk)
-    # gate 默认：全 1（不路由）
-    if gate1 is None:
-        gate1 = 1.0
-        gate2 = 1.0
-    if gate1 is not None and gate2 is None:
-        gate2 = gate1
-    # rel1: [B,H,T,T]
-    rel1 = None
-    if rel_selection in ("rel1", "all"):
-        # gate1_c = gate1.unsqueeze(-1)
-        rel1 = torch.einsum("b t h s, s t n -> b h t n", gate1 * q_s, P_s)
-
-        if rel1_coe is not None:
-            # rel1_coe: [H] or [H,1,1] -> broadcast to [B,H,T,T]
-            rel1 = rel1 * rel1_coe.view(1, H, 1, 1).to(rel1.dtype)
-
-    # rel2: [B,H,T,T]
-    rel2 = None
-    q_corr = None
-    if rel_selection in ("rel2", "all"):
-        # q_corr: [B,T,H,D] = M W
-        q_corr = torch.einsum("b h t j, b j h d -> b t h d", M.to(compute_dtype), w0)
-        qcorr_s = q_corr.view(B, T, H, S, d_chunk).sum(dim=-1)
-        # qcorr_s = q_corr.view(B, T, H, S, d_chunk)
-        # gate2_c = gate2.unsqueeze(-1)
-        rel2 = torch.einsum("b t h s, s t n -> b h t n", gate2 * qcorr_s, P_s)
-
-        if rel2_coe is not None:
-            rel2 = rel2 * rel2_coe.view(1, H, 1, 1).to(rel2.dtype)
-
-    # combine
-    if rel_selection == "rel1":
-        rel = rel1
-    elif rel_selection == "rel2":
-        rel = -rel2
-    elif rel_selection == "all":
-        rel = rel1 - rel2
-    else:
-        raise ValueError(f"Unknown rel_selection={rel_selection}")
-
-    # analyzer update: only when q_corr is available (or pass None and handle it in analyzer)
-    if scale_wise_analyzer is not None and (E_base_raw is not None) and (q_corr is not None):
-        # 这里传 gate/coe 你想记录什么都行；先沿用 rel2_coe
-        scale_wise_analyzer.update(layer_idx, E_base_raw, q, q_corr, wavelet_dtt, coe=rel2_coe)
-
-    return rel
 class PaTHAttention(nn.Module):
     def __init__(
         self,
@@ -1704,30 +1525,39 @@ class PaTHAttention(nn.Module):
                         )
                         self.router2 = None
                     elif config.router_mode == 'seperate':
-                        # self.low_rank_map1 = nn.Linear(self.hidden_size, 32, bias=False)
-                        # self.low_rank_map2 = nn.Linear(self.hidden_size, 32, bias=False)
+                        if config.router_gate_use:
+                            self.low_rank_map1 = nn.Linear(self.hidden_size, 32, bias=False)
+                            self.low_rank_map2 = nn.Linear(self.hidden_size, 32, bias=False)
 
-                        # # scale logits heads
-                        # self.router1_head = nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False)
-                        # self.router2_head = nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False)
+                            # scale logits heads
+                            self.router1_head = nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False)
+                            self.router2_head = nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False)
 
-                        # # use gates (IMPORTANT: bias=True)
-                        # self.router1_gate_head = nn.Linear(32, self.num_heads, bias=True)
-                        # self.router2_gate_head = nn.Linear(32, self.num_heads, bias=True)
-                        # self.tau_router = 1.0
-                        # self.t_gate = 1.0
+                            # use gates (IMPORTANT: bias=True)
+                            self.router1_gate_head = nn.Linear(32, self.num_heads, bias=True)
+                            self.router2_gate_head = nn.Linear(32, self.num_heads, bias=True)
+                            self.tau_router = 1.0
+                            self.t_gate = 1.0
 
-                        # with torch.no_grad():
-                        #     self.router1_gate_head.bias.fill_(2.197)
-                        #     self.router2_gate_head.bias.fill_(2.197)                          
-                        self.router1 = nn.Sequential(
-                            nn.Linear(self.hidden_size, 32, bias=False),
-                            nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
-                        )
-                        self.router2 = nn.Sequential(
-                            nn.Linear(self.hidden_size, 32, bias=False),
-                            nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
-                        )
+                            with torch.no_grad():
+                                self.router1_gate_head.bias.fill_(2.197)
+                                self.router2_gate_head.bias.fill_(2.197)
+                        else:                 
+                            router_map_layer_num = getattr(config, "router_map_layer_num", 2)
+                            if router_map_layer_num == 2:
+                                self.router1 = nn.Sequential(
+                                    nn.Linear(self.hidden_size, 32, bias=False),
+                                    nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
+                                )
+                                self.router2 = nn.Sequential(
+                                    nn.Linear(self.hidden_size, 32, bias=False),
+                                    nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
+                                )
+                            elif router_map_layer_num == 1:
+                                self.router1 = nn.Linear(self.hidden_size, self.num_heads * self.config.router_band_num, bias=False)
+                                self.router2 = nn.Linear(self.hidden_size, self.num_heads * self.config.router_band_num, bias=False)
+                            else:
+                                raise ValueError(f"Unknown router_map_layer_num: {router_map_layer_num}")
                 except:
                     self.router1 = nn.Sequential(
                         nn.Linear(self.hidden_size, 32, bias=False),
@@ -1811,6 +1641,224 @@ class PaTHAttention(nn.Module):
             # self.mix_logit = nn.Parameter(torch.tensor(1.0)) if wavelet_mode == "softmix" else None
 
     # 小工具：按 head 打印
+    def wavelet_rel_from_M_scale_router(self,
+        q: torch.Tensor,            # [B,T,H,D]
+        w: torch.Tensor,            # [B,T,H,D]
+        M: torch.Tensor,            # [B,H,T,T]
+        wavelet_dtt: torch.Tensor,  # [D,T,T]
+        compute_dtype: torch.dtype = torch.float32,
+        d_chunk: int = 8,
+        layer_idx: int = None,
+        rel_selection: str = "all",     # "rel1" | "rel2" | "all"
+        # gates (推荐 token-wise): [B,T,H,S]，也可广播成 [1,1,H,S] / [B,1,H,S]
+        gate1: torch.Tensor = None,     # for rel1
+        gate2: torch.Tensor = None,     # for rel2
+        # fallback coe（如果你还想保留 head-wise 标量）: [H] or [H,1,1]
+        rel1_coe: torch.Tensor = None,
+        rel2_coe: torch.Tensor = None,
+        scale_wise_analyzer=None,
+        E_base_raw: torch.Tensor = None,  # [B,H,T,T]
+        config=None,
+    ) -> torch.Tensor:
+        """
+        Scale-wise routed:
+        rel1 = sum_s (gate1 * q_s) P_s
+        rel2 = sum_s (gate2 * qcorr_s) P_s
+        rel  = rel1 - rel2   (or selection)
+        Return: rel [B,H,T,T] (NO scale, NO mask)
+        """
+        B, T, H, D = q.shape
+        assert wavelet_dtt.shape[0] == D
+        assert D % d_chunk == 0
+        S = D // d_chunk
+
+        q0 = q.to(compute_dtype)
+        w0 = w.to(compute_dtype)
+        P  = wavelet_dtt.to(compute_dtype)
+
+        # P_s: [S,T,T]  (同组共享scale -> 压缩到scale-group)
+        shift_sep_use = bool(getattr(config, "shift_sep_use", False))
+        if shift_sep_use:
+            P_s = P.view(S, d_chunk, T, T)
+            q_s = q0.view(B, T, H, S, d_chunk)
+        else:
+            P_s = P.view(S, d_chunk, T, T).mean(dim=1)
+            q_s = q0.view(B, T, H, S, d_chunk).sum(dim=-1)
+
+        # q_s: [B,T,H,S]  (组内求和；也可以改成 mean，看你定义)
+        # 
+        # gate 默认：全 1（不路由）
+        if gate1 is None:
+            gate1 = 1.0
+            gate2 = 1.0
+        if gate1 is not None and gate2 is None:
+            gate2 = gate1
+        # rel1: [B,H,T,T]
+        rel1 = None
+        if rel_selection in ("rel1", "all"):
+            # gate1_c = gate1.unsqueeze(-1)
+            if not shift_sep_use:
+                rel1 = torch.einsum("b t h s, s t n -> b h t n", gate1 * q_s, P_s)
+            else:
+                gate1_c = gate1.unsqueeze(-1)
+                rel1 = torch.einsum("b t h s c, s c t n -> b h t n", gate1_c * q_s, P_s)
+
+            if rel1_coe is not None:
+                # rel1_coe: [H] or [H,1,1] -> broadcast to [B,H,T,T]
+                rel1 = rel1 * rel1_coe.view(1, H, 1, 1).to(rel1.dtype)
+
+        # rel2: [B,H,T,T]
+        rel2 = None
+        q_corr = None
+        if rel_selection in ("rel2", "all"):
+            # q_corr: [B,T,H,D] = M W
+            if not shift_sep_use:
+                q_corr = torch.einsum("b h t j, b j h d -> b t h d", M.to(compute_dtype), w0)
+                qcorr_s = q_corr.view(B, T, H, S, d_chunk).sum(dim=-1)
+                rel2 = torch.einsum("b t h s, s t n -> b h t n", gate2 * qcorr_s, P_s)
+            else:
+                q_corr = torch.einsum("b h t j, b j h d -> b t h d", M.to(compute_dtype), w0)
+                qcorr_s = q_corr.view(B, T, H, S, d_chunk)
+                gate2_c = gate2.unsqueeze(-1)
+                rel2 = torch.einsum("b t h s c, s c t n -> b h t n", gate2_c * qcorr_s, P_s)
+
+            if rel2_coe is not None:
+                rel2 = rel2 * rel2_coe.view(1, H, 1, 1).to(rel2.dtype)
+
+        # combine
+        if rel_selection == "rel1":
+            rel = rel1
+        elif rel_selection == "rel2":
+            rel = -rel2
+        elif rel_selection == "all":
+            rel = rel1 - rel2
+        else:
+            raise ValueError(f"Unknown rel_selection={rel_selection}")
+
+        # analyzer update: only when q_corr is available (or pass None and handle it in analyzer)
+        if scale_wise_analyzer is not None and (E_base_raw is not None) and (q_corr is not None):
+            # 这里传 gate/coe 你想记录什么都行；先沿用 rel2_coe
+            scale_wise_analyzer.update(layer_idx, E_base_raw, q, q_corr, wavelet_dtt, coe=rel2_coe)
+
+        return rel
+    
+    def path_attention_with_wavelet_QH(self,
+        q, k, v, w, beta,
+        wavelet_dtt,
+        use_wavelet_fused_H: bool = False,
+        d_chunk: int = 8,
+        compute_dtype: torch.dtype = torch.float32,
+        analyzer=None,
+        # scale_wise_analyzer=None,
+        layer_idx=None,
+        ablate=None,
+        rel1_coe=None,
+        rel2_coe=None,
+        rel_selection = None,
+        router1=None,
+        router2=None,
+        config=None,
+    ):
+        # === (A) head 对齐：先沿用你现在的 Hw 对齐（但见下文我建议改成 Hq 对齐） ===
+        Hw = w.shape[2]
+        q = _match_heads(q, Hw)
+        k = _match_heads(k, Hw)
+        v = _match_heads(v, Hw)
+        if beta.dim() == 3:  # [B,T,H]
+            beta = _match_heads(beta.unsqueeze(-1), Hw)[..., 0]
+        else:
+            beta = beta  # assume already [B,T,Hw]
+
+        B, T, H, d = q.shape
+        scale = d ** -0.5
+        future = _future_mask(T, q.device)  # [1,1,T,T]
+
+        # --- baseline raw logits and M_base ---
+        E_base_raw, M_base, strict_WK, A = path_ut_base_raw(
+            q, k, w, beta, compute_dtype=compute_dtype
+        )
+
+        # --- baseline attention ---
+        E_base = E_base_raw * scale
+        fill = causal_mask_fill_value(E_base.dtype)
+        E_base = E_base.masked_fill(future, fill)
+        P_base = torch.softmax(E_base, dim=-1)
+        out_base = torch.einsum("b h i j, b j h d -> b i h d", P_base, v.to(compute_dtype))
+
+        # --- pick M_used for defining QH in wavelet branch ---
+        if use_wavelet_fused_H:
+            M_used = path_ut_M_wave_fused(q, w, beta, A, wavelet_dtt, d_chunk=d_chunk, compute_dtype=compute_dtype)
+        else:
+            M_used = M_base
+        # dump_last_query_per_dim(
+        #     save_path=f"./D_keep_data/hotpot_qa_2048L_mix_PA_pretrain_WR_layer{layer_idx:02d}",
+        #     q=q, k=k, w=w,
+        #     M=M_used,                     # 用你想分析的那份 M（M_base 或 M_wave）
+        #     wavelet_dtt=wavelet_dtt,
+        #     layer_idx=layer_idx,           # 视显存/速度调
+        #     save_dtype=torch.float32,
+        #     compute_corr_row=True,
+        #     router1=router1,
+        #     router2=router2,
+        # )
+        
+        # if layer_idx == 11:
+        #     os._exit(0)
+        # --- wavelet rel term ---
+
+        if wavelet_dtt is not None:
+            if router1 is not None and router2 is not None:
+                rel = self.wavelet_rel_from_M_scale_router(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype, d_chunk=d_chunk, layer_idx=layer_idx,
+                                                    rel_selection=rel_selection, gate1=router1, gate2=router2,config=config)
+            else:
+                # rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype,layer_idx=layer_idx, rel_selection=rel_selection, rel1_coe=rel1_coe, rel2_coe=rel2_coe, scale_wise_analyzer=scale_wise_analyzer,
+                #                          E_base_raw=E_base_raw if scale_wise_analyzer is not None else None)
+                rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype,layer_idx=layer_idx, rel_selection=rel_selection, rel1_coe=rel1_coe, rel2_coe=rel2_coe,
+                                        E_base_raw=E_base_raw if analyzer is not None else None)
+
+            # optional ablation on rel
+            if ablate is not None and layer_idx in ablate:
+                for h in ablate[layer_idx]:
+                    rel[:, h].zero_()
+            E_wav_raw = E_base_raw + rel
+        else:
+            rel = None
+            E_wav_raw = E_base_raw
+
+        # Persist attention scores for later analysis when enabled
+        # path = Path(config.model_name_or_path)
+        # dump_dir = f"./attention_score_record/L{config.block_size}_{config.dataset_name}_{path.parent.name}_{path.name}"
+        # _ensure_dir(dump_dir)
+        # tag = f"layer{layer_idx:02d}" if layer_idx is not None else "layer_unknown"
+        # fname = f"{tag}_{int(time.time() * 1000)}.pt"
+        # payload = {
+        #     "layer_idx": layer_idx,
+        #     "has_wavelet": wavelet_dtt is not None,
+        #     "E_wav_raw": E_wav_raw.detach().to(torch.float32).cpu(),
+        # }
+        # if wavelet_dtt is not None:
+        #     payload["E_base_raw"] = E_base_raw.detach().to(torch.float32).cpu()
+        #     payload["rel"] = rel.detach().to(torch.float32).cpu() if rel is not None else None
+        # _save_block(dump_dir, fname, payload)
+        # if layer_idx == 11:
+        #     os._exit(0)
+        # Persist attention scores for later analysis when enabled
+
+        E_wav = E_wav_raw * scale
+        wave_fill = causal_mask_fill_value(E_wav.dtype)
+        E_wav = E_wav.masked_fill(future, wave_fill)
+        P_wav = torch.softmax(E_wav, dim=-1)
+        out_wav = torch.einsum("b h i j, b j h d -> b i h d", P_wav, v.to(compute_dtype))
+
+        if analyzer is not None and rel is not None:
+            w0 = w.to(compute_dtype)
+            deltaQ = torch.einsum("b h i j, b j h d -> b i h d", M_used, w0)
+            analyzer['layer_attention_analyzer'].update(layer_idx, E_base_raw, rel, P_base, P_wav, q, deltaQ)
+
+        pwav_logger = analyzer.get("pwav_mean_logger") if isinstance(analyzer, dict) else None
+        if pwav_logger is not None:
+            pwav_logger.update(layer_idx, out_wav)
+        return out_base, out_wav
     def _log_head_vector(self, name: str, vec: torch.Tensor, fmt: str = "{:.4f}", topk: Optional[int] = None):
         try:
             v = vec.detach().float().cpu()
@@ -1863,70 +1911,70 @@ class PaTHAttention(nn.Module):
             H= self.num_heads
             T = w.size(1)
 # ---- router ----
+            if self.config.router_gate_use:
+                z1 = self.low_rank_map1(hidden_states)          # [B,T,32]
+                logits1 = self.router1_head(z1).reshape(B,T,H,S)   # [B,T,H,S]
+                router1_b = torch.softmax(logits1 / self.tau_router, dim=-1)
 
-            # z1 = self.low_rank_map1(hidden_states)          # [B,T,32]
-            # logits1 = self.router1_head(z1).reshape(B,T,H,S)   # [B,T,H,S]
-            # router1 = torch.softmax(logits1 / self.tau_router, dim=-1)
+                gate_logits1 = self.router1_gate_head(z1)       # [B,T,H]
+                lam1 = torch.sigmoid(gate_logits1 / self.t_gate)
 
-            # gate_logits1 = self.router1_gate_head(z1)       # [B,T,H]
-            # lam1 = torch.sigmoid(gate_logits1 / self.t_gate)
+                z2 = self.low_rank_map2(hidden_states)          # [B,T,32]
+                logits2 = self.router2_head(z2).reshape(B,T,H,S)
+                router2_b = torch.softmax(logits2 / self.tau_router, dim=-1)
 
-            # z2 = self.low_rank_map2(hidden_states)          # [B,T,32]
-            # logits2 = self.router2_head(z2).reshape(B,T,H,S)
-            # router2 = torch.softmax(logits2 / self.tau_router, dim=-1)
+                gate_logits2 = self.router2_gate_head(z2)       # [B,T,H]
+                lam2 = torch.sigmoid(gate_logits2 / self.t_gate)
 
-            # gate_logits2 = self.router2_gate_head(z2)       # [B,T,H]
-            # lam2 = torch.sigmoid(gate_logits2 / self.t_gate)
-
-            # router1_w_gate = lam1.unsqueeze(-1) * router1
-            # router2_w_gate = lam2.unsqueeze(-1) * router2
-
-          
-            tau = 1.0 if not hasattr(self.config, "tau") else float(self.config.tau)
-            router1_logits = self.router1(hidden_states)          # [B,T,H*S]
-            router1_logits = router1_logits.view(B, T, H, S)      # [B,T,H,S]
-            # jitter hyperparams
-            jitter_std = getattr(self.config, "router_jitter_std", 0.0)   # e.g. 0.01
-            jitter_apply_in_eval = getattr(self.config, "router_jitter_apply_in_eval", False)
-            jitter_scale_by_logit_std = getattr(self.config, "router_jitter_scale_by_logit_std", True)
-
-            def _add_gaussian_jitter(logits: torch.Tensor, std: float) -> torch.Tensor:
-                """
-                logits: [B,T,H,S]
-                std: base noise std in logit space
-                """
-                if std <= 0:
-                    return logits
-                if (not self.training) and (not jitter_apply_in_eval):
-                    return logits
-
-                if jitter_scale_by_logit_std:
-                    # scale noise by per-(B,T,H) logit std over S to be robust to logit magnitude
-                    # detach so the scaling factor doesn't backprop weirdly
-                    scale = logits.detach().std(dim=-1, keepdim=True).clamp_min(1e-6)
-                    noise = torch.randn_like(logits) * (std * scale)
-                else:
-                    noise = torch.randn_like(logits) * std
-
-                return logits + noise
-
-            # add jitter BEFORE softmax
-            router1_logits = _add_gaussian_jitter(router1_logits, jitter_std)
-            router1 = torch.softmax(router1_logits / tau, dim=-1)  # [B,T,H,S]
-
-            if self.router2 is None:
-                router2 = None
+                router1 = lam1.unsqueeze(-1) * router1_b
+                router2 = lam2.unsqueeze(-1) * router2_b
             else:
-                router2_logits = self.router2(hidden_states)       # [B,T,H*S]
-                router2_logits = router2_logits.view(B, T, H, S)   # [B,T,H,S]
-                router2_logits = _add_gaussian_jitter(router2_logits, jitter_std)
-                router2 = torch.softmax(router2_logits / tau, dim=-1)  # [B,T,H,S]
+                tau = 1.0 if not hasattr(self.config, "tau") else float(self.config.tau)
+                router1_logits = self.router1(hidden_states)          # [B,T,H*S]
+                router1_logits = router1_logits.view(B, T, H, S)      # [B,T,H,S]
+                # jitter hyperparams
+                jitter_std = getattr(self.config, "router_jitter_std", 0.0)   # e.g. 0.01
+                jitter_apply_in_eval = getattr(self.config, "router_jitter_apply_in_eval", False)
+                jitter_scale_by_logit_std = getattr(self.config, "router_jitter_scale_by_logit_std", True)
+
+                def _add_gaussian_jitter(logits: torch.Tensor, std: float) -> torch.Tensor:
+                    """
+                    logits: [B,T,H,S]
+                    std: base noise std in logit space
+                    """
+                    if std <= 0:
+                        return logits
+                    if (not self.training) and (not jitter_apply_in_eval):
+                        return logits
+
+                    if jitter_scale_by_logit_std:
+                        # scale noise by per-(B,T,H) logit std over S to be robust to logit magnitude
+                        # detach so the scaling factor doesn't backprop weirdly
+                        scale = logits.detach().std(dim=-1, keepdim=True).clamp_min(1e-6)
+                        noise = torch.randn_like(logits) * (std * scale)
+                    else:
+                        noise = torch.randn_like(logits) * std
+
+                    return logits + noise
+
+                # add jitter BEFORE softmax
+                router1_logits = _add_gaussian_jitter(router1_logits, jitter_std)
+                router1 = torch.softmax(router1_logits / tau, dim=-1)  # [B,T,H,S]
+
+                if self.router2 is None:
+                    router2 = None
+                else:
+                    router2_logits = self.router2(hidden_states)       # [B,T,H*S]
+                    router2_logits = router2_logits.view(B, T, H, S)   # [B,T,H,S]
+                    router2_logits = _add_gaussian_jitter(router2_logits, jitter_std)
+                    router2 = torch.softmax(router2_logits / tau, dim=-1)  # [B,T,H,S]
 
             if analyzer is not None:
                 checkpoint = Path(self.config.model_name_or_path).name
                 proj_name = Path(self.config.model_name_or_path).parent.name
                 analyzer['router_analyzer'].update(self.layer_idx, router1, router2)
                 analyzer['token_scale_dumper'].update(step=int(checkpoint.split('-')[-1]), layer_idx=self.layer_idx, input_ids=input_ids, gate1=router1, gate2=router2)
+        
         beta_logits = self.bt_proj(hidden_states)  # [B,T,H*R]
         g = F.logsigmoid(self.g_proj(hidden_states).float()) if self.use_forget_gate else None
 
@@ -1980,7 +2028,7 @@ class PaTHAttention(nn.Module):
 
                 # o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
                 
-                out_base, o = path_attention_with_wavelet_QH(
+                out_base, o = self.path_attention_with_wavelet_QH(
                     q=q, k=k, v=v,
                     w=w, beta=beta,
                     wavelet_dtt=wavelet_decay_table,
@@ -1998,6 +2046,7 @@ class PaTHAttention(nn.Module):
                     rel_selection=self.config.rel_selection,
                     router1=router1 if self.config.wavelet_router else None,
                     router2=router2 if self.config.wavelet_router else None,
+                    config=self.config,
                 )                
             else:
                 rot_q, rot_k = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3), self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3)
