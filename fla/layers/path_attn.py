@@ -1297,8 +1297,6 @@ def wavelet_rel_from_M(
     compute_dtype: torch.dtype = torch.float32,
     layer_idx: int = None,
     rel_selection = None,
-    rel1_coe=None,
-    rel2_coe=None,
     E_base_raw: torch.Tensor = None,
 ) -> torch.Tensor:
     """
@@ -1486,6 +1484,10 @@ class PaTHAttention(nn.Module):
         self.kv_dim = self.num_kv_heads * self.head_dim
 
         self.layer_idx = layer_idx
+        # Router 局部步数计数（未传全局步数时作为 fallback，每层/每卡独立）
+        self.router_local_step = 0
+        # 如果外部没传递累积步数，默认不做折算
+        self.router_grad_accum_steps = getattr(config, "gradient_accumulation_steps", 1)
         if config.distill_teacher == 'mean_wavelet_pe':
             if config.wavelet_pe_softmax_use:
                 load_spec_teacher = torch.load(f"/cl/work5/hongyu-s/gpt2_test/transformers/examples/pytorch/language-modeling/spectra_wavelet_teacher/layer_{layer_idx}_spectrum.pt")
@@ -1496,19 +1498,20 @@ class PaTHAttention(nn.Module):
         self.q_proj = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.kv_dim, bias=False)
-        try:
-            if str(getattr(config, "coe_mode", "")).lower() == "seperate":
-                self.rel1_coe = nn.Parameter(torch.ones(1, 12, 1, 1), requires_grad=True)
-                self.wavelet_coe = nn.Parameter(torch.ones(1, 12, 1, 1), requires_grad=True)
-            elif str(getattr(config, "coe_mode", "")).lower() == "unify":
-                self.rel1_coe = None
-                self.wavelet_coe = nn.Parameter(torch.zeros(1, 12, 1, 1), requires_grad=True)
-            elif str(getattr(config, "coe_mode", "")).lower() == "none":
-                self.rel1_coe = None
-                self.wavelet_coe = None
-        except:
-            self.rel1_coe = nn.Parameter(torch.zeros(1, 12, 1, 1), requires_grad=True)
-            self.wavelet_coe = nn.Parameter(torch.ones(1, 12, 1, 1), requires_grad=True)
+        self.rel1_coe, self.wavelet_coe = None, None
+        # try:
+        #     if str(getattr(config, "coe_mode", "")).lower() == "seperate":
+        #         self.rel1_coe = nn.Parameter(torch.ones(1, 12, 1, 1), requires_grad=True)
+        #         self.wavelet_coe = nn.Parameter(torch.ones(1, 12, 1, 1), requires_grad=True)
+        #     elif str(getattr(config, "coe_mode", "")).lower() == "unify":
+        #         self.rel1_coe = None
+        #         self.wavelet_coe = nn.Parameter(torch.zeros(1, 12, 1, 1), requires_grad=True)
+        #     elif str(getattr(config, "coe_mode", "")).lower() == "none":
+        #         self.rel1_coe = None
+        #         self.wavelet_coe = None
+        # except:
+        #     self.rel1_coe = nn.Parameter(torch.zeros(1, 12, 1, 1), requires_grad=True)
+        #     self.wavelet_coe = nn.Parameter(torch.ones(1, 12, 1, 1), requires_grad=True)
         # w 分支输出扩到 H*R*d
         out_w = self.kv_dim * self.r
         if use_low_rank_w:
@@ -1517,7 +1520,19 @@ class PaTHAttention(nn.Module):
                 nn.Linear(32, out_w, bias=False)
             )
             if config.wavelet_router:
-                try:
+                if getattr(config, "hierarchical_gate_use", False):
+                    d_chunk = getattr(config, "router_d_chunk", 8)
+                    assert self.head_dim % d_chunk == 0
+                    S = self.head_dim // d_chunk
+
+                    # local: token-wise, per-head, over S
+                    self.local_router1  = nn.Linear(self.head_dim, S, bias=False)
+                    self.local_router2  = nn.Linear(self.head_dim, S, bias=False)
+
+                    # global: sequence-wise pooled, per-head, over S
+                    self.global_router1 = nn.Linear(self.hidden_size, S, bias=False)
+                    self.global_router2 = nn.Linear(self.hidden_size, S, bias=False)
+                else:
                     if config.router_mode == 'unify':
                         self.router1 = nn.Sequential(
                             nn.Linear(self.hidden_size, 32, bias=False),
@@ -1558,15 +1573,6 @@ class PaTHAttention(nn.Module):
                                 self.router2 = nn.Linear(self.hidden_size, self.num_heads * self.config.router_band_num, bias=False)
                             else:
                                 raise ValueError(f"Unknown router_map_layer_num: {router_map_layer_num}")
-                except:
-                    self.router1 = nn.Sequential(
-                        nn.Linear(self.hidden_size, 32, bias=False),
-                        nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
-                    )
-                    self.router2 = nn.Sequential(
-                        nn.Linear(self.hidden_size, 32, bias=False),
-                        nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
-                    )
             else:
                 self.router1 = None
                 self.router2 = None
@@ -1654,8 +1660,6 @@ class PaTHAttention(nn.Module):
         gate1: torch.Tensor = None,     # for rel1
         gate2: torch.Tensor = None,     # for rel2
         # fallback coe（如果你还想保留 head-wise 标量）: [H] or [H,1,1]
-        rel1_coe: torch.Tensor = None,
-        rel2_coe: torch.Tensor = None,
         scale_wise_analyzer=None,
         E_base_raw: torch.Tensor = None,  # [B,H,T,T]
         config=None,
@@ -1667,6 +1671,8 @@ class PaTHAttention(nn.Module):
         rel  = rel1 - rel2   (or selection)
         Return: rel [B,H,T,T] (NO scale, NO mask)
         """
+        hier = bool(getattr(self.config, "hierarchical_gate_use", False))
+        global_lambda = float(getattr(self.config, "global_lambda", 0.5)) 
         B, T, H, D = q.shape
         assert wavelet_dtt.shape[0] == D
         assert D % d_chunk == 0
@@ -1688,12 +1694,26 @@ class PaTHAttention(nn.Module):
         # q_s: [B,T,H,S]  (组内求和；也可以改成 mean，看你定义)
         # 
         # gate 默认：全 1（不路由）
-        if gate1 is None:
-            gate1 = 1.0
-            gate2 = 1.0
-        if gate1 is not None and gate2 is None:
-            gate2 = gate1
-        # rel1: [B,H,T,T]
+        if hier:
+            # local logits: [B,T,H,S]  (head_dim -> S)
+            local_logits1 = self.local_router1(q0)
+
+            # global logits: reshape q0 -> [B,T,H*D] == hidden_size -> [B,T,S]
+            q_global = q0.reshape(B, T, H * D)
+            # 强烈建议加一个 assert，防止未来改了模型结构
+            assert q_global.shape[-1] == self.hidden_size, f"H*D={H*D} != hidden_size={self.hidden_size}"
+            global_logits1 = self.global_router1(q_global).unsqueeze(2)  # [B,T,1,S]
+
+            mix_logits1 = local_logits1 + global_lambda * global_logits1
+            mix_logits1 = mix_logits1
+            gate1 = torch.softmax(mix_logits1, dim=-1)  # [B,T,H,S]
+        else:
+            if gate1 is None:
+                gate1 = 1.0
+                gate2 = 1.0
+            if gate1 is not None and gate2 is None:
+                gate2 = gate1
+            # rel1: [B,H,T,T]
         rel1 = None
         if rel_selection in ("rel1", "all"):
             # gate1_c = gate1.unsqueeze(-1)
@@ -1703,9 +1723,9 @@ class PaTHAttention(nn.Module):
                 gate1_c = gate1.unsqueeze(-1)
                 rel1 = torch.einsum("b t h s c, s c t n -> b h t n", gate1_c * q_s, P_s)
 
-            if rel1_coe is not None:
+            if self.rel1_coe is not None:
                 # rel1_coe: [H] or [H,1,1] -> broadcast to [B,H,T,T]
-                rel1 = rel1 * rel1_coe.view(1, H, 1, 1).to(rel1.dtype)
+                rel1 = rel1 * self.rel1_coe
 
         # rel2: [B,H,T,T]
         rel2 = None
@@ -1714,6 +1734,16 @@ class PaTHAttention(nn.Module):
             # q_corr: [B,T,H,D] = M W
             if not shift_sep_use:
                 q_corr = torch.einsum("b h t j, b j h d -> b t h d", M.to(compute_dtype), w0)
+                if hier:
+                    local_logits2 = self.local_router2(q_corr)  # [B,T,H,S]
+
+                    qcorr_global = q_corr.reshape(B, T, H * D)
+                    assert qcorr_global.shape[-1] == self.hidden_size, f"H*D={H*D} != hidden_size={self.hidden_size}"
+                    global_logits2 = self.global_router2(qcorr_global).unsqueeze(2)  # [B,T,1,S]
+
+                    mix_logits2 = local_logits2 + global_lambda * global_logits2
+                    mix_logits2 = mix_logits2
+                    gate2 = torch.softmax(mix_logits2, dim=-1)  # [B,T,H,S]
                 qcorr_s = q_corr.view(B, T, H, S, d_chunk).sum(dim=-1)
                 rel2 = torch.einsum("b t h s, s t n -> b h t n", gate2 * qcorr_s, P_s)
             else:
@@ -1722,8 +1752,8 @@ class PaTHAttention(nn.Module):
                 gate2_c = gate2.unsqueeze(-1)
                 rel2 = torch.einsum("b t h s c, s c t n -> b h t n", gate2_c * qcorr_s, P_s)
 
-            if rel2_coe is not None:
-                rel2 = rel2 * rel2_coe.view(1, H, 1, 1).to(rel2.dtype)
+            if self.wavelet_coe is not None:
+                rel2 = rel2 * self.wavelet_coe
 
         # combine
         if rel_selection == "rel1":
@@ -1752,8 +1782,6 @@ class PaTHAttention(nn.Module):
         # scale_wise_analyzer=None,
         layer_idx=None,
         ablate=None,
-        rel1_coe=None,
-        rel2_coe=None,
         rel_selection = None,
         router1=None,
         router2=None,
@@ -1813,7 +1841,7 @@ class PaTHAttention(nn.Module):
             else:
                 # rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype,layer_idx=layer_idx, rel_selection=rel_selection, rel1_coe=rel1_coe, rel2_coe=rel2_coe, scale_wise_analyzer=scale_wise_analyzer,
                 #                          E_base_raw=E_base_raw if scale_wise_analyzer is not None else None)
-                rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype,layer_idx=layer_idx, rel_selection=rel_selection, rel1_coe=rel1_coe, rel2_coe=rel2_coe,
+                rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype,layer_idx=layer_idx, rel_selection=rel_selection,
                                         E_base_raw=E_base_raw if analyzer is not None else None)
 
             # optional ablation on rel
@@ -1890,7 +1918,6 @@ class PaTHAttention(nn.Module):
         input_ids=None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-
         if use_cache:
             assert past_key_values is not None, "past_key_values must be provided when use_cache is True"
         if attention_mask is not None:
@@ -1905,13 +1932,15 @@ class PaTHAttention(nn.Module):
         v = self.v_proj(hidden_states)           # [B,T,H*d]
         w = self.w_proj(hidden_states)           # [B,T,H*R*d]
         router1, router2 = None, None
+        record_router1, record_router2 = None, None
         if self.config.wavelet_router:
             B = w.size(0)
             S=8
             H= self.num_heads
             T = w.size(1)
 # ---- router ----
-            if self.config.router_gate_use:
+            router_gate_use = getattr(self.config, "router_gate_use", False)
+            if router_gate_use:
                 z1 = self.low_rank_map1(hidden_states)          # [B,T,32]
                 logits1 = self.router1_head(z1).reshape(B,T,H,S)   # [B,T,H,S]
                 router1_b = torch.softmax(logits1 / self.tau_router, dim=-1)
@@ -1929,52 +1958,352 @@ class PaTHAttention(nn.Module):
                 router1 = lam1.unsqueeze(-1) * router1_b
                 router2 = lam2.unsqueeze(-1) * router2_b
             else:
-                tau = 1.0 if not hasattr(self.config, "tau") else float(self.config.tau)
-                router1_logits = self.router1(hidden_states)          # [B,T,H*S]
-                router1_logits = router1_logits.view(B, T, H, S)      # [B,T,H,S]
-                # jitter hyperparams
-                jitter_std = getattr(self.config, "router_jitter_std", 0.0)   # e.g. 0.01
-                jitter_apply_in_eval = getattr(self.config, "router_jitter_apply_in_eval", False)
-                jitter_scale_by_logit_std = getattr(self.config, "router_jitter_scale_by_logit_std", True)
-
-                def _add_gaussian_jitter(logits: torch.Tensor, std: float) -> torch.Tensor:
-                    """
-                    logits: [B,T,H,S]
-                    std: base noise std in logit space
-                    """
-                    if std <= 0:
-                        return logits
-                    if (not self.training) and (not jitter_apply_in_eval):
-                        return logits
-
-                    if jitter_scale_by_logit_std:
-                        # scale noise by per-(B,T,H) logit std over S to be robust to logit magnitude
-                        # detach so the scaling factor doesn't backprop weirdly
-                        scale = logits.detach().std(dim=-1, keepdim=True).clamp_min(1e-6)
-                        noise = torch.randn_like(logits) * (std * scale)
-                    else:
-                        noise = torch.randn_like(logits) * std
-
-                    return logits + noise
-
-                # add jitter BEFORE softmax
-                router1_logits = _add_gaussian_jitter(router1_logits, jitter_std)
-                router1 = torch.softmax(router1_logits / tau, dim=-1)  # [B,T,H,S]
-
-                if self.router2 is None:
-                    router2 = None
+                if getattr(self.config, "hierarchical_gate_use", False):
+                    pass
                 else:
-                    router2_logits = self.router2(hidden_states)       # [B,T,H*S]
-                    router2_logits = router2_logits.view(B, T, H, S)   # [B,T,H,S]
-                    router2_logits = _add_gaussian_jitter(router2_logits, jitter_std)
-                    router2 = torch.softmax(router2_logits / tau, dim=-1)  # [B,T,H,S]
+                    tau = 1.0 if not hasattr(self.config, "tau") else float(self.config.tau)
+                    router1_logits = self.router1(hidden_states)          # [B,T,H*S]
+                    router1_logits = router1_logits.view(B, T, H, S)      # [B,T,H,S]
+                    # jitter hyperparams
+                    jitter_std = getattr(self.config, "router_jitter_std", 0.0)   # e.g. 0.01
+                    jitter_apply_in_eval = getattr(self.config, "router_jitter_apply_in_eval", False)
 
-            if analyzer is not None:
-                checkpoint = Path(self.config.model_name_or_path).name
-                proj_name = Path(self.config.model_name_or_path).parent.name
-                analyzer['router_analyzer'].update(self.layer_idx, router1, router2)
-                analyzer['token_scale_dumper'].update(step=int(checkpoint.split('-')[-1]), layer_idx=self.layer_idx, input_ids=input_ids, gate1=router1, gate2=router2)
-        
+                    # 进度感知：前 30%/后 70% 使用不同 std（如未提供则退回默认）
+                    # 优先用外部传入的 global_step（通常是优化步）；否则用 config 预设；再否则用本地计数，
+                    # 本地计数按前向 micro-step 计数，并除以 grad_accum_steps 以对齐优化步。
+                    global_step_ext = kwargs.get("global_step", getattr(self.config, "router_global_step", None))
+                    grad_accum = kwargs.get(
+                        "grad_accum_steps",
+                        getattr(self.config, "router_grad_accum_steps", getattr(self.config, "gradient_accumulation_steps", 1)),
+                    )
+                    if global_step_ext is None:
+                        micro_step = getattr(self, "router_local_step", 0)
+                        global_step = micro_step // max(1, int(grad_accum))
+                        self.router_local_step = micro_step + 1
+                        max_steps = kwargs.get("max_steps", getattr(self.config, "router_max_steps", 15900))
+                    else:
+                        global_step = global_step_ext
+                        max_steps = kwargs.get("max_steps", getattr(self.config, "router_max_steps", 15900))
+                    jitter_std_early = getattr(self.config, "router_jitter_std_early", jitter_std)
+                    jitter_std_late = getattr(self.config, "router_jitter_std_late", jitter_std)
+                    if (global_step is not None) and (max_steps not in (None, 0)):
+                        pct = float(global_step) / float(max_steps)
+                        jitter_std = jitter_std_early if pct < 0.3 else jitter_std_late
+
+                    # 日志监控：每 log_every 步打印一次当前 jitter_std
+                    log_every = getattr(self.config, "router_jitter_log_every", 1000)
+                    log_noise_stats = (
+                        log_every > 0
+                        and global_step is not None
+                        and max_steps not in (None, 0)
+                        and (global_step % log_every == 0)
+                    )
+
+                    def _add_gaussian_jitter(logits: torch.Tensor, std: float, router_name=None) -> torch.Tensor:
+                        """
+                        logits: [B, T, H, S]
+                        train: return logits + noise
+                        eval : NEVER add noise to logits; only compute & log stats, then return logits
+                        """
+                        if std <= 0:
+                            return logits
+
+                        # ---- config ----
+                        noise_adapt_style = getattr(self.config, "noise_adapt_style", "logit_std")
+
+                        sigma_max_cfg = getattr(self.config, "router_jitter_sigma_max", None)
+                        sigma_max = float("inf") if sigma_max_cfg is None else float(sigma_max_cfg)
+
+                        sigma_min_cfg = getattr(self.config, "router_jitter_sigma_min", None)
+                        sigma_min = 0.0 if sigma_min_cfg is None else float(sigma_min_cfg)
+
+                        # logging switches (train/eval)
+                        log_router_stats_train = bool(getattr(self.config, "log_train_router_stats", True))
+                        log_router_stats_eval  = bool(getattr(self.config, "log_eval_router_stats", True))
+                        log_every = int(getattr(self.config, "router_log_every", 500))
+
+                        logits_det = logits.detach()
+                        B, T, H, S = logits_det.shape
+                        if S < 2:
+                            return logits
+
+                        # =========================
+                        # ---- compute sigma_raw / sigma_eff ----
+                        # =========================
+                        sigma_raw = None
+                        sigma_eff = None
+
+                        if noise_adapt_style == "fliprate_head":
+                            rho0 = float(std)
+                            rho0 = min(max(rho0, 1e-6), 0.499999)
+
+                            top2 = torch.topk(logits_det, k=2, dim=-1).values  # [B,T,H,2]
+                            margin = (top2[..., 0] - top2[..., 1]).clamp_min(1e-6)  # [B,T,H]
+
+                            margin_bt = margin.reshape(-1, H)               # [BT,H]
+                            margin_head = margin_bt.median(dim=0).values    # [H]
+
+                            normal = torch.distributions.Normal(
+                                loc=logits_det.new_tensor(0.0),
+                                scale=logits_det.new_tensor(1.0),
+                            )
+                            z = normal.icdf(logits_det.new_tensor(rho0)).abs().clamp_min(1e-6)
+                            denom = (math.sqrt(2.0) * z)
+
+                            sigma_head_raw = (margin_head / denom)  # [H]   (raw, before clamp)
+                            sigma_head_eff = sigma_head_raw.clamp(min=sigma_min, max=sigma_max)  # [H]
+
+                            sigma_raw = sigma_head_raw.view(1, 1, H, 1)  # [B,T,H,1] by broadcast
+                            sigma_eff = sigma_head_eff.view(1, 1, H, 1)
+
+                        elif noise_adapt_style == "logit_std":
+                            scale = logits_det.std(dim=-1, keepdim=True).clamp_min(1e-6)  # [B,T,H,1]
+                            sigma_raw = float(std) * scale
+                            sigma_eff = sigma_raw.clamp(min=sigma_min, max=sigma_max)
+
+                        elif noise_adapt_style == "const":
+                            sigma_raw = logits.new_full(logits.shape[:-1] + (1,), float(std))
+                            sigma_eff = sigma_raw.clamp(min=sigma_min, max=sigma_max)
+
+                        else:
+                            raise ValueError(f"Unknown noise_adapt_style: {noise_adapt_style}")
+
+                        # =========================
+                        # ---- (stat monitor) log in BOTH train & eval ----
+                        # =========================
+                        def _should_log() -> bool:
+                            try:
+                                return (int(global_step) % log_every == 0)
+                            except Exception:
+                                return True
+
+                        def _fmt_vec(x: torch.Tensor, nd: int = 4) -> str:
+                            x = x.detach().float().cpu().tolist()
+                            return "[" + ",".join([f"{v:.{nd}f}" for v in x]) + "]"
+
+                        do_log = _should_log()
+                        want_log = (self.training and log_router_stats_train) or ((not self.training) and log_router_stats_eval)
+
+                        if do_log and want_log:
+                            try:
+                                # reshape to [BT,H]
+                                raw_bt = sigma_raw.detach().reshape(-1, H)
+                                eff_bt = sigma_eff.detach().reshape(-1, H)
+
+                                q = torch.tensor([0.5, 0.9, 0.95], device=raw_bt.device)
+                                raw_q = torch.quantile(raw_bt, q, dim=0)  # [3,H]
+                                eff_q = torch.quantile(eff_bt, q, dim=0)  # [3,H]
+
+                                if math.isfinite(sigma_max):
+                                    clip_rate_raw = (raw_bt > sigma_max).float().mean(dim=0)  # [H]
+                                else:
+                                    clip_rate_raw = torch.zeros((H,), device=logits.device)
+
+                                # compression ratio E[eff/raw]
+                                comp = (eff_bt / raw_bt.clamp_min(1e-12)).mean(dim=0)  # [H]
+
+                                msg = (
+                                    f"router_name={router_name} "
+                                    f"[router {'train' if self.training else 'eval'} stats] "
+                                    f"layer={self.layer_idx} step={global_step}/{max_steps} style={noise_adapt_style} "
+                                    f"rho_or_std={std} sigmax={sigma_max_cfg} sigmin={sigma_min_cfg} "
+                                    f"raw_p50={_fmt_vec(raw_q[0], 6)} raw_p90={_fmt_vec(raw_q[1], 6)} raw_p95={_fmt_vec(raw_q[2], 6)} "
+                                    f"eff_p50={_fmt_vec(eff_q[0], 6)} eff_p90={_fmt_vec(eff_q[1], 6)} eff_p95={_fmt_vec(eff_q[2], 6)} "
+                                    f"clip_rate_raw={_fmt_vec(clip_rate_raw, 4)} comp_mean={_fmt_vec(comp, 4)}"
+                                )
+
+                                logger_obj = getattr(self, "logger", None)
+                                if logger_obj is not None:
+                                    try:
+                                        logger_obj.info(msg)
+                                    except Exception:
+                                        print(msg)
+                                else:
+                                    print(msg)
+                            except Exception:
+                                pass
+
+                        # =========================
+                        # Eval: never inject
+                        # =========================
+                        if not self.training:
+                            return logits
+
+                        # =========================
+                        # Train: inject
+                        # =========================
+                        noise = torch.randn_like(logits) * sigma_eff  # [B,T,H,S]
+                        return logits + noise
+
+                    # def _add_gaussian_jitter(logits: torch.Tensor, std: float) -> torch.Tensor:
+                    #     if std <= 0:
+                    #         return logits
+                    #     if (not self.training) and (not jitter_apply_in_eval):
+                    #         return logits
+
+                    #     # ---- config ----
+                    #     noise_adapt_style = getattr(self.config, "noise_adapt_style", 'logit_std')
+                    #     # optional: "const" | "logit_std" | "fliprate_head"
+                    #     # backward compatible default:
+
+                    #     sigma_max = getattr(self.config, "router_jitter_sigma_max", None)
+                    #     sigma_max = float("inf") if sigma_max is None else float(sigma_max)
+
+                    #     # (optional but recommended for stability)
+                    #     sigma_min = getattr(self.config, "router_jitter_sigma_min", None)
+                    #     sigma_min = 0.0 if sigma_min is None else float(sigma_min)
+
+                    #     # ---- compute sigma_eff ----
+                    #     if noise_adapt_style == "fliprate_head":
+                    #         # Interpret `std` as target flip rate rho0 by default.
+                    #         # If you want rho0 from config instead, uncomment next line:
+                    #         # rho0 = float(getattr(self.config, "router_jitter_target_flip", std))
+                    #         rho0 = float(std)
+
+                    #         # sanity range; avoid icdf inf/nan
+                    #         rho0 = min(max(rho0, 1e-6), 0.499999)
+
+                    #         # margin m(b,t,h) = top1 - top2 over S
+                    #         # detach to avoid noisy gradients through calibration
+                    #         logits_det = logits.detach()
+                    #         B, T, H, S = logits_det.shape
+                    #         if S < 2:
+                    #             # routing with <2 choices doesn't make sense for margin-based flip calibration
+                    #             return logits
+
+                    #         top2 = torch.topk(logits_det, k=2, dim=-1).values  # [B,T,H,2]
+                    #         margin = (top2[..., 0] - top2[..., 1]).clamp_min(1e-6)  # [B,T,H]
+
+                    #         # head-wise aggregation over (B,T): use median (robust)
+                    #         # shape -> [BT, H]
+                    #         margin_bt = margin.reshape(-1, H)
+                    #         margin_head = margin_bt.median(dim=0).values  # [H]
+
+                    #         # sigma_head = margin_head / (sqrt(2)*|Phi^{-1}(rho0)|)
+                    #         normal = torch.distributions.Normal(
+                    #             loc=logits_det.new_tensor(0.0),
+                    #             scale=logits_det.new_tensor(1.0),
+                    #         )
+                    #         z = normal.icdf(logits_det.new_tensor(rho0)).abs().clamp_min(1e-6)
+                    #         denom = (math.sqrt(2.0) * z)
+
+                    #         sigma_head = (margin_head / denom)  # [H]
+                    #         sigma_head = sigma_head.clamp(min=sigma_min, max=sigma_max)
+
+                    #         # broadcast to [B,T,H,1]
+                    #         sigma_eff = sigma_head.view(1, 1, H, 1)
+
+                    #     elif noise_adapt_style == "logit_std":
+                    #         scale = logits.detach().std(dim=-1, keepdim=True).clamp_min(1e-6)  # [B,T,H,1]
+                    #         sigma_eff = (float(std) * scale).clamp(min=sigma_min, max=sigma_max)
+
+                    #     elif noise_adapt_style == "const":
+                    #         sigma_eff = logits.new_full(logits.shape[:-1] + (1,), float(std))
+                    #         sigma_eff = sigma_eff.clamp(min=sigma_min, max=sigma_max)
+
+                    #     else:
+                    #         raise ValueError(f"Unknown noise_adapt_style: {noise_adapt_style}")
+                    #     noise = torch.randn_like(logits) * sigma_eff  # [B,T,H,S]
+
+                    #     if log_noise_stats:
+                    #         try:
+                    #             noise_det = noise.detach()
+                    #             noise_mean = noise_det.mean().item()
+                    #             noise_std_val = noise_det.std().item()
+                    #             noise_min = noise_det.min().item()
+                    #             noise_max = noise_det.max().item()
+                    #             msg = (
+                    #                 f"[router jitter noise] layer={self.layer_idx} "
+                    #                 f"step={global_step}/{max_steps} mean={noise_mean:.6f} "
+                    #                 f"std={noise_std_val:.6f} min={noise_min:.6f} max={noise_max:.6f} "
+                    #                 f"style={noise_adapt_style}"
+                    #             )
+                    #             logger_obj = getattr(self, "logger", None)
+                    #             if logger_obj is not None:
+                    #                 try:
+                    #                     logger_obj.info(msg)
+                    #                 except Exception:
+                    #                     print(msg)
+                    #             else:
+                    #                 print(msg)
+                    #         except Exception:
+                    #             pass
+
+                    #     return logits + noise
+
+                    # def _add_gaussian_jitter(logits: torch.Tensor, std: float) -> torch.Tensor:
+                    #     if std <= 0:
+                    #         return logits
+                    #     if (not self.training) and (not jitter_apply_in_eval):
+                    #         return logits
+
+                    #     sigma_max = getattr(self.config, "router_jitter_sigma_max", None)
+                    #     if sigma_max is None:
+                    #         sigma_max = float("inf")
+                    #     else:
+                    #         sigma_max = float(sigma_max)
+
+                    #     if jitter_scale_by_logit_std:
+                    #         scale = logits.detach().std(dim=-1, keepdim=True).clamp_min(1e-6)   # [B,T,H,1]
+                    #         sigma_eff = (std * scale).clamp_max(sigma_max)                      # [B,T,H,1]
+                    #     else:
+                    #         # constant sigma for all (B,T,H); broadcast over S
+                    #         sigma_eff = logits.new_full(logits.shape[:-1] + (1,), float(std)).clamp_max(sigma_max)
+                    #     noise = torch.randn_like(logits) * sigma_eff                             # [B,T,H,S]
+                    #     if log_noise_stats:
+                    #         try:
+                    #             noise_det = noise.detach()
+                    #             noise_mean = noise_det.mean().item()
+                    #             noise_std_val = noise_det.std().item()
+                    #             noise_min = noise_det.min().item()
+                    #             noise_max = noise_det.max().item()
+                    #             msg = (
+                    #                 f"[router jitter noise] layer={self.layer_idx} "
+                    #                 f"step={global_step}/{max_steps} mean={noise_mean:.6f} "
+                    #                 f"std={noise_std_val:.6f} min={noise_min:.6f} max={noise_max:.6f}"
+                    #             )
+                    #             logger_obj = getattr(self, "logger", None)
+                    #             if logger_obj is not None:
+                    #                 try:
+                    #                     logger_obj.info(msg)
+                    #                 except Exception:
+                    #                     print(msg)
+                    #             else:
+                    #                 print(msg)
+                    #         except Exception:
+                    #             pass
+
+                    #     return logits + noise
+
+                    # add jitter BEFORE softmax
+                    router1_logits = _add_gaussian_jitter(router1_logits, jitter_std, router_name="router1")
+                    router1 = torch.softmax(router1_logits / tau, dim=-1)  # [B,T,H,S]
+
+                    if self.router2 is None:
+                        router2 = None
+                    else:
+                        router2_logits = self.router2(hidden_states)       # [B,T,H*S]
+                        router2_logits = router2_logits.view(B, T, H, S)   # [B,T,H,S]
+                        router2_logits = _add_gaussian_jitter(router2_logits, jitter_std, router_name="router2")
+                        router2 = torch.softmax(router2_logits / tau, dim=-1)  # [B,T,H,S]
+                    data_collection_style = getattr(self.config, "router_data_collection_style", None)
+                    if data_collection_style == 'logit':
+                        record_router1 = router1_logits
+                        record_router2 = router2_logits
+                    elif data_collection_style == 'prob' or data_collection_style is None:
+                        record_router1 = router1
+                        record_router2 = router2
+                    else:
+                        raise ValueError(f"Unknown data_collection_style: {data_collection_style}")
+                    # if self.layer_idx==11:
+                    #     os._exit(0)
+            # ---- end router ----
+                if analyzer is not None:
+                    checkpoint = Path(self.config.model_name_or_path).name
+                    proj_name = Path(self.config.model_name_or_path).parent.name
+                    analyzer['router_analyzer'].update(self.layer_idx, router1, router2)
+                    analyzer['token_scale_dumper'].update(step=int(checkpoint.split('-')[-1]), layer_idx=self.layer_idx, input_ids=input_ids, gate1=router1, gate2=router2)
+            
         beta_logits = self.bt_proj(hidden_states)  # [B,T,H*R]
         g = F.logsigmoid(self.g_proj(hidden_states).float()) if self.use_forget_gate else None
 
@@ -2040,9 +2369,6 @@ class PaTHAttention(nn.Module):
                     # scale_wise_analyzer=scale_wise_analyzer,
                     layer_idx=self.layer_idx,
                     ablate=ablate,
-                    rel1_coe=self.rel1_coe,
-                    # rel1_coe=self.wavelet_coe,
-                    rel2_coe=self.wavelet_coe,
                     rel_selection=self.config.rel_selection,
                     router1=router1 if self.config.wavelet_router else None,
                     router2=router2 if self.config.wavelet_router else None,
@@ -2150,7 +2476,7 @@ class PaTHAttention(nn.Module):
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
             # if analyzer is not None:
-            return o, None, past_key_values, dis_loss, router1, router2
+            return o, None, past_key_values, dis_loss, record_router1, record_router2
             # else:
                 # return o, None, past_key_values, dis_loss, None, None
 
