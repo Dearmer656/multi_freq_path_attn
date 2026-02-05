@@ -2033,28 +2033,40 @@ class PaTHAttention(nn.Module):
                         sigma_raw = None
                         sigma_eff = None
 
-                        if noise_adapt_style == "fliprate_head":
+                        if noise_adapt_style in ("fliprate_head", "fliprate_token"):
+                            # std is interpreted as target flip prob rho0
                             rho0 = float(std)
                             rho0 = min(max(rho0, 1e-6), 0.499999)
 
+                            # margin = top1 - top2  (per token, per head)
                             top2 = torch.topk(logits_det, k=2, dim=-1).values  # [B,T,H,2]
                             margin = (top2[..., 0] - top2[..., 1]).clamp_min(1e-6)  # [B,T,H]
 
-                            margin_bt = margin.reshape(-1, H)               # [BT,H]
-                            margin_head = margin_bt.median(dim=0).values    # [H]
-
+                            # denom from Gaussian flip approximation
                             normal = torch.distributions.Normal(
                                 loc=logits_det.new_tensor(0.0),
                                 scale=logits_det.new_tensor(1.0),
                             )
                             z = normal.icdf(logits_det.new_tensor(rho0)).abs().clamp_min(1e-6)
-                            denom = (math.sqrt(2.0) * z)
+                            denom = (math.sqrt(2.0) * z)  # scalar
 
-                            sigma_head_raw = (margin_head / denom)  # [H]   (raw, before clamp)
-                            sigma_head_eff = sigma_head_raw.clamp(min=sigma_min, max=sigma_max)  # [H]
+                            if noise_adapt_style == "fliprate_head":
+                                # head-wise: reduce (B,T) -> head scalar
+                                margin_bt = margin.reshape(-1, H)                 # [BT,H]
+                                margin_head = margin_bt.median(dim=0).values      # [H]
+                                sigma_head_raw = (margin_head / denom)            # [H]
+                                sigma_head_eff = sigma_head_raw.clamp(min=sigma_min, max=sigma_max)
 
-                            sigma_raw = sigma_head_raw.view(1, 1, H, 1)  # [B,T,H,1] by broadcast
-                            sigma_eff = sigma_head_eff.view(1, 1, H, 1)
+                                sigma_raw = sigma_head_raw.view(1, 1, H, 1)       # broadcast [B,T,H,1]
+                                sigma_eff = sigma_head_eff.view(1, 1, H, 1)
+
+                            else:
+                                # token-wise: sigma depends on (B,T,H)
+                                sigma_tok_raw = (margin / denom)                  # [B,T,H]
+                                sigma_tok_eff = sigma_tok_raw.clamp(min=sigma_min, max=sigma_max)
+
+                                sigma_raw = sigma_tok_raw.unsqueeze(-1)           # [B,T,H,1]
+                                sigma_eff = sigma_tok_eff.unsqueeze(-1)
 
                         elif noise_adapt_style == "logit_std":
                             scale = logits_det.std(dim=-1, keepdim=True).clamp_min(1e-6)  # [B,T,H,1]
