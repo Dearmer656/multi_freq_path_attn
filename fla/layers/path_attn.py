@@ -1892,19 +1892,18 @@ class PaTHAttention(nn.Module):
             # self.mix_logit = nn.Parameter(torch.tensor(1.0)) if wavelet_mode == "softmix" else None
 
     # 小工具：按 head 打印
-    def wavelet_rel_from_M_scale_router(self,
+    def wavelet_rel_from_M_scale_router(
+        self,
         q: torch.Tensor,            # [B,T,H,D]
         w: torch.Tensor,            # [B,T,H,D]
         M: torch.Tensor,            # [B,H,T,T]
-        wavelet_dtt: torch.Tensor,  # [D,T,T]
+        wavelet_dtt: torch.Tensor,  # [D,T,T]   (A route: NOT bucketed)
         compute_dtype: torch.dtype = torch.float32,
         d_chunk: int = 8,
         layer_idx: int = None,
         rel_selection: str = "all",     # "rel1" | "rel2" | "all"
-        # gates (推荐 token-wise): [B,T,H,S]，也可广播成 [1,1,H,S] / [B,1,H,S]
-        gate1: torch.Tensor = None,     # for rel1
-        gate2: torch.Tensor = None,     # for rel2
-        # fallback coe（如果你还想保留 head-wise 标量）: [H] or [H,1,1]
+        gate1: torch.Tensor = None,     # [B,T,H,S] or broadcast
+        gate2: torch.Tensor = None,
         scale_wise_analyzer=None,
         E_base_raw: torch.Tensor = None,  # [B,H,T,T]
         config=None,
@@ -1912,276 +1911,358 @@ class PaTHAttention(nn.Module):
         max_steps: int = None,
     ) -> torch.Tensor:
         """
-        Scale-wise routed:
-        rel1 = sum_s (gate1 * q_s) P_s
-        rel2 = sum_s (gate2 * qcorr_s) P_s
-        rel  = rel1 - rel2   (or selection)
-        Return: rel [B,H,T,T] (NO scale, NO mask)
+        A-route (recommended, no OOM):
+        wavelet_dtt: [D,T,T] only once.
+        Time-shift uses gather+mask to produce shifted P bank on the fly.
         """
-def wavelet_rel_from_M_scale_router(
-    self,
-    q: torch.Tensor,            # [B,T,H,D]
-    w: torch.Tensor,            # [B,T,H,D]
-    M: torch.Tensor,            # [B,H,T,T]
-    wavelet_dtt: torch.Tensor,  # [K,D,T,T]  (bucketed!)
-    compute_dtype: torch.dtype = torch.float32,
-    d_chunk: int = 8,
-    layer_idx: int = None,
-    rel_selection: str = "all",     # "rel1" | "rel2" | "all"
-    gate1: torch.Tensor = None,     # [B,T,H,S] or broadcast
-    gate2: torch.Tensor = None,
-    scale_wise_analyzer=None,
-    E_base_raw: torch.Tensor = None,  # [B,H,T,T]
-    config=None,
-    global_step: int = None,
-    max_steps: int = None,
-) -> torch.Tensor:
-    """
-    Bucketed time-shift version (recommended):
-      wavelet_dtt is precomputed: [K, D, T, T], each bucket already causal (tril) and already includes (beta + offset_k).
 
-    Scale-wise routed (same as before, just with bucket mixture):
-      rel1 = sum_k pi1_k * sum_s (gate1 * q_s) P_s^{(k)}
-      rel2 = sum_k pi2_k * sum_s (gate2 * qcorr_s) P_s^{(k)}
-      rel  = rel1 - rel2   (or selection)
-    Return: rel [B,H,T,T] (NO scale, NO mask)
-    """
+        # --------------------
+        # helpers
+        # --------------------
+        def _build_shift_gather_index_and_mask(T: int, offsets: torch.Tensor, device):
+            # offsets: [K] >=0
+            K = offsets.numel()
+            n = torch.arange(T, device=device)                 # [T]
+            t = torch.arange(T, device=device)                 # [T]
+            nn = n.view(1, 1, 1, T)                            # [1,1,1,T]
+            tt = t.view(1, 1, T, 1)                            # [1,1,T,1]
+            off = offsets.view(K, 1, 1, 1)                     # [K,1,1,1]
 
-    # --------------------
-    # config
-    # --------------------
-    K = int(getattr(config, "shift_bucket_K", 16))
-    T_max = int(getattr(config, "shift_T_max", 256))
-    use_time_shift = bool(getattr(config, "use_time_shift", False))
-    shift_sep_use = bool(getattr(config, "shift_sep_use", False))
+            n_shift = nn + off                                 # [K,1,1,T]
+            idx = n_shift.clamp(0, T - 1).expand(K, 1, T, T)    # [K,1,T,T]
 
-    # If you *really* want "shift only when hier", set this flag in config
-    shift_only_when_hier = bool(getattr(config, "shift_only_when_hier", False))
+            valid = (n_shift <= tt) & (n_shift >= 0) & (n_shift < T)  # [K,1,T,T]
+            mask = valid.to(torch.float32)
+            return idx, mask
 
-    hier = bool(getattr(self.config, "hierarchical_gate_use", False))
-    do_shift = use_time_shift and (hier if shift_only_when_hier else True)
+        def _shift_Ps_bank(P_s_base: torch.Tensor, idx: torch.Tensor, mask: torch.Tensor):
+            """
+            P_s_base:
+            - shift_sep_use=False: [S,T,T]
+            - shift_sep_use=True:  [S,C,T,T]
+            idx/mask: [K,1,T,T]
+            Returns:
+            - False: [K,S,T,T]
+            - True:  [K,S,C,T,T]
+            """
+            if P_s_base.dim() == 3:
+                # [S,T,T]
+                K = idx.shape[0]
+                S, T, _ = P_s_base.shape
+                P0 = P_s_base.unsqueeze(0).expand(K, S, T, T)          # [K,S,T,T]
+                idxS = idx.expand(K, S, T, T)                          # [K,S,T,T]
+                out = torch.gather(P0, dim=-1, index=idxS)             # [K,S,T,T]
+                out = out * mask.expand_as(out)
+                return out
+            elif P_s_base.dim() == 4:
+                # [S,C,T,T]
+                K = idx.shape[0]
+                S, C, T, _ = P_s_base.shape
+                P0 = P_s_base.unsqueeze(0).expand(K, S, C, T, T)       # [K,S,C,T,T]
+                idxSC = idx.view(K, 1, 1, T, T).expand(K, S, C, T, T)  # [K,S,C,T,T]
+                out = torch.gather(P0, dim=-1, index=idxSC)
+                out = out * mask.view(K, 1, 1, T, T).expand_as(out)
+                return out
+            else:
+                raise ValueError(f"Unexpected P_s_base shape {tuple(P_s_base.shape)}")
 
-    B, T, H, D = q.shape
-    assert D % d_chunk == 0
-    S = D // d_chunk
+        def _mixture_rel(
+            *,
+            q_like: torch.Tensor,        # [B,T,H,S] or [B,T,H,S,C]
+            gate: torch.Tensor,          # [B,T,H,S]
+            pi: torch.Tensor,            # [B,T,H,K]
+            P_s_base: torch.Tensor,      # [S,T,T] or [S,C,T,T]
+            idx: torch.Tensor,           # [K,1,T,T]
+            mask: torch.Tensor,          # [K,1,T,T]
+            shift_sep_use: bool,
+            k_chunk: int,
+        ) -> torch.Tensor:
+            """
+            returns rel: [B,H,T,T]
+            rel = sum_k pi_k * einsum(qg, P_shift_k)
+            """
+            qg = (gate * q_like).to(compute_dtype) if (q_like.dim() == 4) else (gate.unsqueeze(-1) * q_like).to(compute_dtype)
 
-    # wavelet_dtt must be bucketed
-    P = wavelet_dtt.to(compute_dtype)
-    assert P.dim() == 4, f"Expected wavelet_dtt [K,D,T,T], got {tuple(P.shape)}"
-    assert P.shape[0] == K and P.shape[1] == D and P.shape[2] == T and P.shape[3] == T, \
-        f"Expected [K={K},D={D},T={T},T], got {tuple(P.shape)}"
+            # chunk over K to control memory if needed
+            K = pi.shape[-1]
+            if k_chunk and k_chunk > 0:
+                out = 0.0
+                for ks in range(0, K, k_chunk):
+                    ke = min(K, ks + k_chunk)
+                    P_bank = _shift_Ps_bank(P_s_base, idx[ks:ke], mask[ks:ke])  # [kc,...]
 
-    # --------------------
-    # jitter std (only affects scale routers)
-    # --------------------
-    jitter_std = 0.0
-    if hier:
-        jitter_std = float(getattr(self.config, "router_jitter_std", 0.0))
-        jitter_std_early = getattr(self.config, "router_jitter_std_early", jitter_std)
-        jitter_std_late = getattr(self.config, "router_jitter_std_late", jitter_std)
-        if (global_step is not None) and (max_steps not in (None, 0)):
-            pct = float(global_step) / float(max_steps)
-            jitter_std = jitter_std_early if pct < 0.3 else jitter_std_late
+                    if not shift_sep_use:
+                        rel_all = torch.einsum("b t h s, k s t n -> b h t n k", qg, P_bank)
+                    else:
+                        rel_all = torch.einsum("b t h s c, k s c t n -> b h t n k", qg, P_bank)
 
-    # --------------------
-    # cast
-    # --------------------
-    q0 = q.to(compute_dtype)
-    w0 = w.to(compute_dtype)
+                    pi_c = pi[..., ks:ke].permute(0, 2, 1, 3)  # [B,H,T,kc]
+                    out = out + torch.einsum("b h t n k, b h t k -> b h t n", rel_all, pi_c)
+                return out
 
-    # q_s for rel1
-    if shift_sep_use:
-        # q_s: [B,T,H,S,C]
-        q_s = q0.view(B, T, H, S, d_chunk)
-    else:
-        # q_s: [B,T,H,S]
-        q_s = q0.view(B, T, H, S, d_chunk).sum(dim=-1)
+            # no chunk
+            P_bank = _shift_Ps_bank(P_s_base, idx, mask)  # [K,...]
+            if not shift_sep_use:
+                rel_all = torch.einsum("b t h s, k s t n -> b h t n k", qg, P_bank)
+            else:
+                rel_all = torch.einsum("b t h s c, k s c t n -> b h t n k", qg, P_bank)
 
-    # --------------------
-    # shift routers (pi1/pi2 over buckets)
-    # --------------------
-    pi1 = None
-    if do_shift:
-        tau1 = float(getattr(config, "shift_tau1", 1.0))
-        topk1 = int(getattr(config, "shift_topk1", 0))
+            pi_w = pi.permute(0, 2, 1, 3)  # [B,H,T,K]
+            return torch.einsum("b h t n k, b h t k -> b h t n", rel_all, pi_w)
+        def build_bucket_offsets(*, T: int, K: int, config) -> list:
+            mode = str(getattr(config, "shift_offset_mode", "linear"))
 
-        # shift1_router output must be [B,T,H,K]
-        pi1_logits = self.shift1_router(q0).to(compute_dtype)          # [B,T,H,K]
-        pi1 = torch.softmax(pi1_logits / max(tau1, 1e-6), dim=-1)      # [B,T,H,K]
+            cap = int(getattr(config, "shift_offset_cap", 0))           # 0 => no cap
+            off_min = int(getattr(config, "shift_offset_min", 0))
 
-        if topk1 and 0 < topk1 < K:
-            topv, topi = torch.topk(pi1, k=topk1, dim=-1)
-            mask = torch.zeros_like(pi1).scatter_(-1, topi, 1.0)
-            pi1 = pi1 * mask
-            pi1 = pi1 / (pi1.sum(dim=-1, keepdim=True) + 1e-12)
+            def _apply_cap(x: int) -> int:
+                if cap and cap > 0:
+                    x = min(x, cap)
+                # 不能超过 T-1，否则必然全被 mask 掉
+                x = min(x, T - 1)
+                # 最小值约束
+                x = max(x, off_min)
+                return int(x)
 
-    # --------------------
-    # scale routers (gate1/gate2 over S)
-    # --------------------
-    local_logits1 = None
-    local_logits2 = None
+            if mode == "linear":
+                stride = int(getattr(config, "shift_stride", 16))
+                center = int(getattr(config, "shift_center", 8))
+                offsets = [0] + [stride * j + center for j in range(1, K)]
+                return [_apply_cap(x) for x in offsets]
 
-    if hier:
-        local_logits1 = self.local_router1(q0)                         # [B,T,H,S]
-        if jitter_std > 0:
-            local_logits1 = self._add_gaussian_jitter(
-                local_logits1, jitter_std,
-                router_name="local_router1",
-                global_step=global_step, max_steps=max_steps,
-            )
-        gate1 = torch.softmax(local_logits1, dim=-1)                   # [B,T,H,S]
-    else:
-        # fallback broadcast
-        if gate1 is None:
-            gate1 = 1.0
-        if gate2 is None:
-            gate2 = gate1
+            if mode == "list":
+                offsets = list(getattr(config, "shift_offsets", []))
+                assert len(offsets) == K, f"shift_offsets must have length K={K}, got {len(offsets)}"
+                return [_apply_cap(int(x)) for x in offsets]
 
-    # --------------------
-    # helper: get P_s for a given bucket k
-    # --------------------
-    def _get_P_s_from_bucket(P_k: torch.Tensor):
-        # P_k: [D,T,T]
+            if mode == "ratio":
+                ratios = list(getattr(config, "shift_offsets_ratio", []))
+                assert len(ratios) == K, f"shift_offsets_ratio must have length K={K}, got {len(ratios)}"
+                offsets = [int(round(r * T)) for r in ratios]
+                return [_apply_cap(x) for x in offsets]
+
+            if mode == "geom":
+                a = float(getattr(config, "shift_geom_a", 32.0))
+                r = float(getattr(config, "shift_geom_r", 2.0))
+                offsets = [0]
+                for j in range(1, K):
+                    offsets.append(int(round(a * (r ** (j - 1)))))
+                return [_apply_cap(x) for x in offsets]
+
+            raise ValueError(f"Unknown shift_offset_mode={mode}")
+        # --------------------
+        # config
+        # --------------------
+        K = int(getattr(config, "shift_bucket_K", 16))
+        use_time_shift = bool(getattr(config, "use_time_shift", False))
+        shift_sep_use = bool(getattr(config, "shift_sep_use", False))
+        shift_only_when_hier = bool(getattr(config, "shift_only_when_hier", False))
+        shift_k_chunk = int(getattr(config, "shift_k_chunk", 0))  # e.g. 0 / 4 / 8
+
+        hier = bool(getattr(self.config, "hierarchical_gate_use", False))
+        do_shift = use_time_shift and (hier if shift_only_when_hier else True)
+
+        # define offsets (ties to your bucket design)
+        # NOTE: you can make this depend on shift_T_max if you want (not required for correctness)
+        # bucket_offsets = [0] + [16 * j + 8 for j in range(1, K)]
+        bucket_offsets = build_bucket_offsets(T=config.block_size, K=K, config=config)
+        # (optional) clamp offsets to <= T-1 at runtime via mask anyway; no need to pre-clamp.
+
+        # --------------------
+        # shapes / cast
+        # --------------------
+        B, T, H, D = q.shape
+        assert D % d_chunk == 0
+        S = D // d_chunk
+
+        q0 = q.to(compute_dtype)
+        w0 = w.to(compute_dtype)
+
+        P = wavelet_dtt.to(compute_dtype)
+        assert P.dim() == 3 and P.shape[0] == D and P.shape[1] == T and P.shape[2] == T, \
+            f"A-route expects wavelet_dtt [D,T,T], got {tuple(P.shape)}"
+
+        # P_s_base
         if shift_sep_use:
             # [S,C,T,T]
-            return P_k.view(S, d_chunk, T, T)
+            P_s_base = P.view(S, d_chunk, T, T)
+            q_s = q0.view(B, T, H, S, d_chunk)              # [B,T,H,S,C]
         else:
             # [S,T,T]
-            return P_k.view(S, d_chunk, T, T).mean(dim=1)
+            P_s_base = P.view(S, d_chunk, T, T).mean(dim=1)
+            q_s = q0.view(B, T, H, S, d_chunk).sum(dim=-1)  # [B,T,H,S]
 
-    # --------------------
-    # rel1
-    # --------------------
-    rel1 = None
-    if rel_selection in ("rel1", "all"):
-        if do_shift:
-            shifted1 = 0.0
-            for k in range(K):
-                P_s_k = _get_P_s_from_bucket(P[k])  # [S,T,T] or [S,C,T,T]
-                if not shift_sep_use:
-                    relk = torch.einsum("b t h s, s t n -> b h t n", gate1 * q_s, P_s_k)
-                else:
-                    gate1_c = gate1.unsqueeze(-1)  # [B,T,H,S,1]
-                    relk = torch.einsum("b t h s c, s c t n -> b h t n", gate1_c * q_s, P_s_k)
-
-                wk = pi1[..., k].permute(0, 2, 1).unsqueeze(-1)  # [B,H,T,1]
-                shifted1 = shifted1 + wk * relk
-            rel1 = shifted1
-        else:
-            # default: use bucket 0 as base (or you can average; bucket 0 usually corresponds to "near")
-            P_s0 = _get_P_s_from_bucket(P[0])
-            if not shift_sep_use:
-                rel1 = torch.einsum("b t h s, s t n -> b h t n", gate1 * q_s, P_s0)
-            else:
-                gate1_c = gate1.unsqueeze(-1)
-                rel1 = torch.einsum("b t h s c, s c t n -> b h t n", gate1_c * q_s, P_s0)
-
-        if self.rel1_coe is not None:
-            rel1 = rel1 * self.rel1_coe
-
-    # --------------------
-    # rel2
-    # --------------------
-    rel2 = None
-    q_corr = None
-    if rel_selection in ("rel2", "all"):
-        # q_corr: [B,T,H,D] = M W
-        q_corr = torch.einsum("b h t j, b j h d -> b t h d", M.to(compute_dtype), w0)
-
-        # qcorr_s
-        if shift_sep_use:
-            qcorr_s = q_corr.view(B, T, H, S, d_chunk)                 # [B,T,H,S,C]
-        else:
-            qcorr_s = q_corr.view(B, T, H, S, d_chunk).sum(dim=-1)     # [B,T,H,S]
-
-        # gate2 (if hier)
+        # --------------------
+        # jitter std for scale routers
+        # --------------------
+        jitter_std = 0.0
         if hier:
-            local_logits2 = self.local_router2(q_corr)                 # [B,T,H,S]
+            jitter_std = float(getattr(self.config, "router_jitter_std", 0.0))
+            jitter_std_early = getattr(self.config, "router_jitter_std_early", jitter_std)
+            jitter_std_late = getattr(self.config, "router_jitter_std_late", jitter_std)
+            if (global_step is not None) and (max_steps not in (None, 0)):
+                pct = float(global_step) / float(max_steps)
+                jitter_std = jitter_std_early if pct < 0.3 else jitter_std_late
+
+        # --------------------
+        # pi1 / pi2 (shift routers)
+        # --------------------
+        pi1 = pi2 = None
+        if do_shift:
+            tau1 = float(getattr(config, "shift_tau1", 1.0))
+            topk1 = int(getattr(config, "shift_topk1", 0))
+            pi1_logits = self.shift1_router(q0).to(compute_dtype)      # [B,T,H,K]
+            pi1 = torch.softmax(pi1_logits / max(tau1, 1e-6), dim=-1)
+
+            if topk1 and 0 < topk1 < K:
+                topv, topi = torch.topk(pi1, k=topk1, dim=-1)
+                m = torch.zeros_like(pi1).scatter_(-1, topi, 1.0)
+                pi1 = (pi1 * m) / (pi1.mul(m).sum(dim=-1, keepdim=True) + 1e-12)
+
+        # --------------------
+        # gate1 / gate2 (scale routers)
+        # --------------------
+        local_logits1 = None
+        local_logits2 = None
+        if hier:
+            local_logits1 = self.local_router1(q0)
             if jitter_std > 0:
-                local_logits2 = self._add_gaussian_jitter(
-                    local_logits2, jitter_std,
-                    router_name="local_router2",
+                local_logits1 = self._add_gaussian_jitter(
+                    local_logits1, jitter_std,
+                    router_name="local_router1",
                     global_step=global_step, max_steps=max_steps,
                 )
-            gate2 = torch.softmax(local_logits2, dim=-1)               # [B,T,H,S]
+            gate1 = torch.softmax(local_logits1, dim=-1)  # [B,T,H,S]
         else:
+            if gate1 is None:
+                gate1 = 1.0
             if gate2 is None:
                 gate2 = gate1
 
-        # pi2
-        pi2 = None
+        # prebuild idx/mask once
         if do_shift:
-            tau2 = float(getattr(config, "shift_tau2", 1.0))
-            topk2 = int(getattr(config, "shift_topk2", 0))
+            offsets = torch.tensor(bucket_offsets, device=q.device, dtype=torch.long)
+            idx, mask = _build_shift_gather_index_and_mask(T, offsets, device=q.device)
 
-            pi2_logits = self.shift2_router(q_corr).to(compute_dtype)  # [B,T,H,K]
-            pi2 = torch.softmax(pi2_logits / max(tau2, 1e-6), dim=-1)  # [B,T,H,K]
-
-            if topk2 and 0 < topk2 < K:
-                topv, topi = torch.topk(pi2, k=topk2, dim=-1)
-                mask = torch.zeros_like(pi2).scatter_(-1, topi, 1.0)
-                pi2 = pi2 * mask
-                pi2 = pi2 / (pi2.sum(dim=-1, keepdim=True) + 1e-12)
-
-        if do_shift:
-            shifted2 = 0.0
-            for k in range(K):
-                P_s_k = _get_P_s_from_bucket(P[k])
-                if not shift_sep_use:
-                    relk = torch.einsum("b t h s, s t n -> b h t n", gate2 * qcorr_s, P_s_k)
-                else:
-                    gate2_c = gate2.unsqueeze(-1)
-                    relk = torch.einsum("b t h s c, s c t n -> b h t n", gate2_c * qcorr_s, P_s_k)
-
-                wk = pi2[..., k].permute(0, 2, 1).unsqueeze(-1)  # [B,H,T,1]
-                shifted2 = shifted2 + wk * relk
-            rel2 = shifted2
-        else:
-            P_s0 = _get_P_s_from_bucket(P[0])
-            if not shift_sep_use:
-                rel2 = torch.einsum("b t h s, s t n -> b h t n", gate2 * qcorr_s, P_s0)
+        # --------------------
+        # rel1
+        # --------------------
+        rel1 = None
+        if rel_selection in ("rel1", "all"):
+            if do_shift:
+                rel1 = _mixture_rel(
+                    q_like=q_s,
+                    gate=gate1,
+                    pi=pi1,
+                    P_s_base=P_s_base,
+                    idx=idx,
+                    mask=mask,
+                    shift_sep_use=shift_sep_use,
+                    k_chunk=shift_k_chunk,
+                )
             else:
-                gate2_c = gate2.unsqueeze(-1)
-                rel2 = torch.einsum("b t h s c, s c t n -> b h t n", gate2_c * qcorr_s, P_s0)
+                # no shift: just base P_s_base
+                if not shift_sep_use:
+                    rel1 = torch.einsum("b t h s, s t n -> b h t n", gate1 * q_s, P_s_base)
+                else:
+                    rel1 = torch.einsum("b t h s c, s c t n -> b h t n", gate1.unsqueeze(-1) * q_s, P_s_base)
 
-        if self.wavelet_coe is not None:
-            rel2 = rel2 * self.wavelet_coe
+            if self.rel1_coe is not None:
+                rel1 = rel1 * self.rel1_coe
 
-    # --------------------
-    # combine
-    # --------------------
-    if rel_selection == "rel1":
-        rel = rel1
-    elif rel_selection == "rel2":
-        rel = -rel2
-    elif rel_selection == "all":
-        rel = rel1 - rel2
-    else:
-        raise ValueError(f"Unknown rel_selection={rel_selection}")
+        # --------------------
+        # rel2
+        # --------------------
+        rel2 = None
+        q_corr = None
+        qcorr_s = None
+        if rel_selection in ("rel2", "all"):
+            q_corr = torch.einsum("b h t j, b j h d -> b t h d", M.to(compute_dtype), w0)
 
-    # --------------------
-    # logging (keep your existing)
-    # --------------------
-    log_every = int(getattr(self.config, "router_log_every", 500))
-    want_log = bool(getattr(self.config, "log_router_gate_stats", True))
-    if want_log:
-        try:
-            _log_router_gate_stats(
-                gate1=gate1, gate2=gate2,
-                q_s=q_s if (not shift_sep_use) else None,
-                qcorr_s=qcorr_s if ('qcorr_s' in locals() and (not shift_sep_use)) else None,
-                rel1=rel1, rel2=rel2, E_base_raw=E_base_raw,
-                gate1_logits=local_logits1, gate2_logits=local_logits2,
-                layer_idx=self.layer_idx if hasattr(self, "layer_idx") else (layer_idx if layer_idx is not None else -1),
-                global_step=int(global_step) if global_step is not None else -1,
-                max_steps=int(max_steps) if max_steps is not None else -1,
-                log_every=log_every,
-                logger_obj=getattr(self, "logger", None),
-            )
-        except Exception:
-            pass
+            if shift_sep_use:
+                qcorr_s = q_corr.view(B, T, H, S, d_chunk)                 # [B,T,H,S,C]
+            else:
+                qcorr_s = q_corr.view(B, T, H, S, d_chunk).sum(dim=-1)     # [B,T,H,S]
 
-    return rel
+            if hier:
+                local_logits2 = self.local_router2(q_corr)
+                if jitter_std > 0:
+                    local_logits2 = self._add_gaussian_jitter(
+                        local_logits2, jitter_std,
+                        router_name="local_router2",
+                        global_step=global_step, max_steps=max_steps,
+                    )
+                gate2 = torch.softmax(local_logits2, dim=-1)
+            else:
+                if gate2 is None:
+                    gate2 = gate1
+
+            if do_shift:
+                tau2 = float(getattr(config, "shift_tau2", 1.0))
+                topk2 = int(getattr(config, "shift_topk2", 0))
+                pi2_logits = self.shift2_router(q_corr).to(compute_dtype)  # [B,T,H,K]
+                pi2 = torch.softmax(pi2_logits / max(tau2, 1e-6), dim=-1)
+
+                if topk2 and 0 < topk2 < K:
+                    topv, topi = torch.topk(pi2, k=topk2, dim=-1)
+                    m = torch.zeros_like(pi2).scatter_(-1, topi, 1.0)
+                    pi2 = (pi2 * m) / (pi2.mul(m).sum(dim=-1, keepdim=True) + 1e-12)
+
+                rel2 = _mixture_rel(
+                    q_like=qcorr_s,
+                    gate=gate2,
+                    pi=pi2,
+                    P_s_base=P_s_base,
+                    idx=idx,
+                    mask=mask,
+                    shift_sep_use=shift_sep_use,
+                    k_chunk=shift_k_chunk,
+                )
+            else:
+                if not shift_sep_use:
+                    rel2 = torch.einsum("b t h s, s t n -> b h t n", gate2 * qcorr_s, P_s_base)
+                else:
+                    rel2 = torch.einsum("b t h s c, s c t n -> b h t n", gate2.unsqueeze(-1) * qcorr_s, P_s_base)
+
+            if self.wavelet_coe is not None:
+                rel2 = rel2 * self.wavelet_coe
+
+        # --------------------
+        # combine
+        # --------------------
+        if rel_selection == "rel1":
+            rel = rel1
+        elif rel_selection == "rel2":
+            rel = -rel2
+        elif rel_selection == "all":
+            rel = rel1 - rel2
+        else:
+            raise ValueError(f"Unknown rel_selection={rel_selection}")
+
+        # --------------------
+        # logging (your existing)
+        # --------------------
+        log_every = int(getattr(self.config, "router_log_every", 500))
+        want_log = bool(getattr(self.config, "log_router_gate_stats", True))
+        if want_log:
+            try:
+                _log_router_gate_stats(
+                    gate1=gate1, gate2=gate2,
+                    q_s=(q_s if (not shift_sep_use) else None),
+                    qcorr_s=(qcorr_s if ((qcorr_s is not None) and (not shift_sep_use)) else None),
+                    rel1=rel1, rel2=rel2, E_base_raw=E_base_raw,
+                    gate1_logits=local_logits1, gate2_logits=local_logits2,
+                    layer_idx=self.layer_idx if hasattr(self, "layer_idx") else (layer_idx if layer_idx is not None else -1),
+                    global_step=int(global_step) if global_step is not None else -1,
+                    max_steps=int(max_steps) if max_steps is not None else -1,
+                    log_every=log_every,
+                    logger_obj=getattr(self, "logger", None),
+                )
+            except Exception:
+                pass
+
+        return rel
+
     
     def path_attention_with_wavelet_QH(self,
         q, k, v, w, beta,
