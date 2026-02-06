@@ -29,11 +29,24 @@ from scipy.signal import find_peaks
 if TYPE_CHECKING:
     from fla.models.utils import Cache
 from rotary_embedding_torch import RotaryEmbedding
+from transformers.activations import NewGELUActivation
 
 import pdb
 import os
 import torch
 from tqdm import tqdm
+
+def _make_router_mlp(hidden_size: int, out_dim: int, use_non_linear: bool) -> nn.Sequential:
+    if use_non_linear:
+        return nn.Sequential(
+            nn.Linear(hidden_size, 32, bias=False),
+            NewGELUActivation(),
+            nn.Linear(32, out_dim, bias=False),
+        )
+    return nn.Sequential(
+        nn.Linear(hidden_size, 32, bias=False),
+        nn.Linear(32, out_dim, bias=False),
+    )
 
 def _ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
@@ -1534,9 +1547,10 @@ class PaTHAttention(nn.Module):
                     self.global_router2 = nn.Linear(self.hidden_size, S, bias=False)
                 else:
                     if config.router_mode == 'unify':
-                        self.router1 = nn.Sequential(
-                            nn.Linear(self.hidden_size, 32, bias=False),
-                            nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
+                        self.router1 = _make_router_mlp(
+                            self.hidden_size,
+                            self.num_heads * self.config.router_band_num,
+                            bool(getattr(config, "router_non_linear_use", False)),
                         )
                         self.router2 = None
                     elif config.router_mode == 'seperate':
@@ -1560,14 +1574,17 @@ class PaTHAttention(nn.Module):
                         else:                 
                             router_map_layer_num = getattr(config, "router_map_layer_num", 2)
                             if router_map_layer_num == 2:
-                                self.router1 = nn.Sequential(
-                                    nn.Linear(self.hidden_size, 32, bias=False),
-                                    nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
+                                self.router1 = _make_router_mlp(
+                                    self.hidden_size,
+                                    self.num_heads * self.config.router_band_num,
+                                    bool(getattr(config, "router_non_linear_use", False)),
                                 )
-                                self.router2 = nn.Sequential(
-                                    nn.Linear(self.hidden_size, 32, bias=False),
-                                    nn.Linear(32, self.num_heads * self.config.router_band_num, bias=False),
+                                self.router2 = _make_router_mlp(
+                                    self.hidden_size,
+                                    self.num_heads * self.config.router_band_num,
+                                    bool(getattr(config, "router_non_linear_use", False)),
                                 )
+                                print('router_non_linear_use', getattr(config, "router_non_linear_use", False))
                             elif router_map_layer_num == 1:
                                 self.router1 = nn.Linear(self.hidden_size, self.num_heads * self.config.router_band_num, bias=False)
                                 self.router2 = nn.Linear(self.hidden_size, self.num_heads * self.config.router_band_num, bias=False)
