@@ -17,12 +17,20 @@ import time
 
 from fla.layers.utils import pad_input, unpad_input
 from fla.layers.freq_analysis_utils import *
+from fla.layers.router_norm import (
+    RouterNorm,
+    RouterNormStatsLogger,
+    apply_router_norm_mode,
+    build_router_norm_config,
+)
 from fla.modules import RMSNorm, ShortConvolution
 from fla.modules.l2norm import l2_norm
 from fla.ops.attn.decoding import attn_decoding_one_step
 from fla.ops.path_attn.parallel import parallel_path_attn
 
 import math
+import random
+import re
 import matplotlib.pyplot as plt
 from scipy.ndimage import gaussian_filter1d
 from scipy.signal import find_peaks
@@ -71,6 +79,335 @@ def _log_stats(stats: dict, prefix: str = "[rel_record]"):
     # keep it single-line-ish for grep
     msg = prefix + " " + " ".join([f"{k}={v}" for k, v in stats.items()])
     print(msg)
+
+
+class RunningBinStats:
+    """
+    Streaming stats over query-position bins for eval-only diagnostics.
+    """
+
+    _SUM_KEYS = (
+        "sum_mu_base",
+        "sum_std_base",
+        "sum_mu_rel",
+        "sum_std_rel",
+        "sum_r",
+        "sum_kl",
+        "sum_abs_base",
+        "sum_abs_rel",
+    )
+    _SAMPLE_KEYS = (
+        "samples_std_base",
+        "samples_std_rel",
+        "samples_r",
+        "samples_kl",
+    )
+
+    def __init__(
+        self,
+        bin_size: int = 256,
+        eps: float = 1e-6,
+        per_head: bool = False,
+        stats_dtype: torch.dtype = torch.float32,
+        max_samples_per_bin: int = 4096,
+    ):
+        self.bin_size = max(1, int(bin_size))
+        self.eps = float(eps)
+        self.per_head = bool(per_head)
+        self.stats_dtype = stats_dtype
+        self.max_samples_per_bin = max(128, int(max_samples_per_bin))
+        self._bins = {}
+        self._vec_len = None
+
+    def _new_bucket(self, vec_len: int):
+        z = torch.zeros(vec_len, dtype=self.stats_dtype, device="cpu")
+        return {
+            "sum_mu_base": z.clone(),
+            "sum_std_base": z.clone(),
+            "sum_mu_rel": z.clone(),
+            "sum_std_rel": z.clone(),
+            "sum_r": z.clone(),
+            "sum_kl": z.clone(),
+            "sum_abs_base": z.clone(),
+            "sum_abs_rel": z.clone(),
+            "count": z.clone(),
+            "samples_std_base": [],
+            "samples_std_rel": [],
+            "samples_r": [],
+            "samples_kl": [],
+            "seen_std_base": 0,
+            "seen_std_rel": 0,
+            "seen_r": 0,
+            "seen_kl": 0,
+        }
+
+    def _ensure_bucket(self, bin_idx: int, vec_len: int):
+        if self._vec_len is None:
+            self._vec_len = int(vec_len)
+        if self._vec_len != int(vec_len):
+            raise ValueError(f"RunningBinStats vec_len mismatch: {self._vec_len} vs {vec_len}")
+        bucket = self._bins.get(int(bin_idx))
+        if bucket is None:
+            bucket = self._new_bucket(vec_len)
+            self._bins[int(bin_idx)] = bucket
+        return bucket
+
+    def _reservoir_add(self, bucket: dict, sample_key: str, seen_key: str, values: torch.Tensor):
+        vals = values.detach().flatten().to(torch.float32).cpu().tolist()
+        if not vals:
+            return
+        sample = bucket[sample_key]
+        seen = int(bucket.get(seen_key, 0))
+        cap = self.max_samples_per_bin
+        for v in vals:
+            seen += 1
+            if len(sample) < cap:
+                sample.append(float(v))
+            else:
+                j = random.randint(1, seen)
+                if j <= cap:
+                    sample[j - 1] = float(v)
+        bucket[seen_key] = seen
+
+    @torch.no_grad()
+    def update(self, z_base: torch.Tensor, rel: torch.Tensor, coe_for_rel=None):
+        if z_base is None or rel is None:
+            return
+        zb = z_base.detach().to(dtype=self.stats_dtype)
+        rr = rel.detach().to(dtype=self.stats_dtype)
+        if coe_for_rel is None:
+            z_total = zb + rr
+        else:
+            if not torch.is_tensor(coe_for_rel):
+                coe_for_rel = torch.tensor(float(coe_for_rel), device=zb.device, dtype=self.stats_dtype)
+            else:
+                coe_for_rel = coe_for_rel.detach().to(device=zb.device, dtype=self.stats_dtype)
+            z_total = zb + coe_for_rel * rr
+
+        if self.per_head:
+            # [H, T]
+            mu_base = zb.mean(dim=-1).mean(dim=0)
+            std_base = zb.std(dim=-1, unbiased=False).mean(dim=0)
+            mu_rel = rr.mean(dim=-1).mean(dim=0)
+            std_rel = rr.std(dim=-1, unbiased=False).mean(dim=0)
+            abs_base = zb.abs().mean(dim=-1).mean(dim=0)
+            abs_rel = rr.abs().mean(dim=-1).mean(dim=0)
+        else:
+            # [T]
+            mu_base = zb.mean(dim=-1).mean(dim=(0, 1))
+            std_base = zb.std(dim=-1, unbiased=False).mean(dim=(0, 1))
+            mu_rel = rr.mean(dim=-1).mean(dim=(0, 1))
+            std_rel = rr.std(dim=-1, unbiased=False).mean(dim=(0, 1))
+            abs_base = zb.abs().mean(dim=-1).mean(dim=(0, 1))
+            abs_rel = rr.abs().mean(dim=-1).mean(dim=(0, 1))
+
+        logp_base = F.log_softmax(zb, dim=-1)
+        logp_total = F.log_softmax(z_total, dim=-1)
+        p_base = logp_base.exp()
+        kl_full = (p_base * (logp_base - logp_total)).sum(dim=-1)  # [B,H,T]
+        if self.per_head:
+            kl = kl_full.mean(dim=0)  # [H,T]
+        else:
+            kl = kl_full.mean(dim=(0, 1))  # [T]
+        r = std_rel / (std_base + self.eps)
+
+        if self.per_head:
+            _, T = mu_base.shape
+            vec_len = int(mu_base.shape[0])
+        else:
+            T = int(mu_base.shape[0])
+            vec_len = 1
+
+        for start in range(0, T, self.bin_size):
+            end = min(start + self.bin_size, T)
+            bidx = start // self.bin_size
+            bucket = self._ensure_bucket(bidx, vec_len=vec_len)
+            seg_len = end - start
+            if seg_len <= 0:
+                continue
+
+            if self.per_head:
+                bucket["sum_mu_base"] += mu_base[:, start:end].sum(dim=-1).cpu()
+                bucket["sum_std_base"] += std_base[:, start:end].sum(dim=-1).cpu()
+                bucket["sum_mu_rel"] += mu_rel[:, start:end].sum(dim=-1).cpu()
+                bucket["sum_std_rel"] += std_rel[:, start:end].sum(dim=-1).cpu()
+                bucket["sum_r"] += r[:, start:end].sum(dim=-1).cpu()
+                bucket["sum_kl"] += kl[:, start:end].sum(dim=-1).cpu()
+                bucket["sum_abs_base"] += abs_base[:, start:end].sum(dim=-1).cpu()
+                bucket["sum_abs_rel"] += abs_rel[:, start:end].sum(dim=-1).cpu()
+                bucket["count"] += float(seg_len)
+
+                self._reservoir_add(bucket, "samples_std_base", "seen_std_base", std_base[:, start:end])
+                self._reservoir_add(bucket, "samples_std_rel", "seen_std_rel", std_rel[:, start:end])
+                self._reservoir_add(bucket, "samples_r", "seen_r", r[:, start:end])
+                self._reservoir_add(bucket, "samples_kl", "seen_kl", kl[:, start:end])
+            else:
+                bucket["sum_mu_base"] += torch.tensor([mu_base[start:end].sum().item()], dtype=self.stats_dtype)
+                bucket["sum_std_base"] += torch.tensor([std_base[start:end].sum().item()], dtype=self.stats_dtype)
+                bucket["sum_mu_rel"] += torch.tensor([mu_rel[start:end].sum().item()], dtype=self.stats_dtype)
+                bucket["sum_std_rel"] += torch.tensor([std_rel[start:end].sum().item()], dtype=self.stats_dtype)
+                bucket["sum_r"] += torch.tensor([r[start:end].sum().item()], dtype=self.stats_dtype)
+                bucket["sum_kl"] += torch.tensor([kl[start:end].sum().item()], dtype=self.stats_dtype)
+                bucket["sum_abs_base"] += torch.tensor([abs_base[start:end].sum().item()], dtype=self.stats_dtype)
+                bucket["sum_abs_rel"] += torch.tensor([abs_rel[start:end].sum().item()], dtype=self.stats_dtype)
+                bucket["count"] += float(seg_len)
+
+                self._reservoir_add(bucket, "samples_std_base", "seen_std_base", std_base[start:end])
+                self._reservoir_add(bucket, "samples_std_rel", "seen_std_rel", std_rel[start:end])
+                self._reservoir_add(bucket, "samples_r", "seen_r", r[start:end])
+                self._reservoir_add(bucket, "samples_kl", "seen_kl", kl[start:end])
+
+    @staticmethod
+    def _to_vec(value, vec_len: int):
+        if isinstance(value, torch.Tensor):
+            out = value.detach().float().cpu().view(-1)
+            if out.numel() == vec_len:
+                return out
+            if out.numel() == 1 and vec_len > 1:
+                return out.repeat(vec_len)
+            return torch.zeros(vec_len, dtype=torch.float32)
+        if isinstance(value, (list, tuple)):
+            vals = [float(v) for v in value]
+            if len(vals) == vec_len:
+                return torch.tensor(vals, dtype=torch.float32)
+            if len(vals) == 1 and vec_len > 1:
+                return torch.full((vec_len,), float(vals[0]), dtype=torch.float32)
+            return torch.zeros(vec_len, dtype=torch.float32)
+        try:
+            return torch.full((vec_len,), float(value), dtype=torch.float32)
+        except Exception:
+            return torch.zeros(vec_len, dtype=torch.float32)
+
+    @classmethod
+    def from_state_dict(cls, state: dict):
+        if not isinstance(state, dict):
+            return cls()
+        obj = cls(
+            bin_size=int(state.get("bin_size", 256)),
+            eps=float(state.get("eps", 1e-6)),
+            per_head=bool(state.get("per_head", False)),
+            stats_dtype=torch.float32,
+            max_samples_per_bin=int(state.get("max_samples_per_bin", 4096)),
+        )
+        vec_len = int(state.get("vec_len", 1))
+        obj._vec_len = max(1, vec_len)
+        bins = state.get("bins", {})
+        if not isinstance(bins, dict):
+            return obj
+        for bidx_raw, src in bins.items():
+            try:
+                bidx = int(bidx_raw)
+            except Exception:
+                continue
+            bucket = obj._new_bucket(obj._vec_len)
+            for k in obj._SUM_KEYS + ("count",):
+                bucket[k] = obj._to_vec(src.get(k, 0.0), obj._vec_len).to(dtype=torch.float32)
+            for sk in obj._SAMPLE_KEYS:
+                vals = src.get(sk, [])
+                if isinstance(vals, (list, tuple)):
+                    bucket[sk] = [float(v) for v in vals[: obj.max_samples_per_bin]]
+                else:
+                    bucket[sk] = []
+                seen_k = "seen_" + sk[len("samples_") :]
+                try:
+                    bucket[seen_k] = int(src.get(seen_k, len(bucket[sk])))
+                except Exception:
+                    bucket[seen_k] = len(bucket[sk])
+            obj._bins[bidx] = bucket
+        return obj
+
+    def merge(self, other):
+        if isinstance(other, dict):
+            other = RunningBinStats.from_state_dict(other)
+        if not isinstance(other, RunningBinStats):
+            return
+        if other._vec_len is None:
+            return
+        if self._vec_len is None:
+            self._vec_len = other._vec_len
+        if self._vec_len != other._vec_len:
+            return
+        for bidx, src in other._bins.items():
+            dst = self._ensure_bucket(bidx, self._vec_len)
+            for k in self._SUM_KEYS + ("count",):
+                dst[k] += src[k].to(dst[k].dtype)
+            for sk in self._SAMPLE_KEYS:
+                seen_k = "seen_" + sk[len("samples_") :]
+                vals = src.get(sk, [])
+                if vals:
+                    self._reservoir_add(dst, sk, seen_k, torch.tensor(vals, dtype=torch.float32))
+
+    def state_dict(self):
+        out = {
+            "bin_size": int(self.bin_size),
+            "eps": float(self.eps),
+            "per_head": bool(self.per_head),
+            "max_samples_per_bin": int(self.max_samples_per_bin),
+            "vec_len": int(self._vec_len or 1),
+            "bins": {},
+        }
+        for bidx in sorted(self._bins.keys()):
+            bucket = self._bins[bidx]
+            bo = {}
+            for k in self._SUM_KEYS + ("count",):
+                bo[k] = bucket[k].detach().float().cpu().tolist()
+            for sk in self._SAMPLE_KEYS:
+                bo[sk] = [float(v) for v in bucket.get(sk, [])[: self.max_samples_per_bin]]
+                seen_k = "seen_" + sk[len("samples_") :]
+                bo[seen_k] = int(bucket.get(seen_k, len(bo[sk])))
+            out["bins"][int(bidx)] = bo
+        return out
+
+    @staticmethod
+    def _quantile_dict(values):
+        if not values:
+            return {"p50": float("nan"), "p90": float("nan"), "p99": float("nan")}
+        t = torch.tensor(values, dtype=torch.float32)
+        q = torch.quantile(t, torch.tensor([0.5, 0.9, 0.99], dtype=torch.float32))
+        return {"p50": float(q[0].item()), "p90": float(q[1].item()), "p99": float(q[2].item())}
+
+    def summary(self):
+        out = {}
+        for bidx in sorted(self._bins.keys()):
+            b = self._bins[bidx]
+            c = b["count"].clamp_min(1.0)
+            mu_base = b["sum_mu_base"] / c
+            std_base = b["sum_std_base"] / c
+            mu_rel = b["sum_mu_rel"] / c
+            std_rel = b["sum_std_rel"] / c
+            r = b["sum_r"] / c
+            kl = b["sum_kl"] / c
+            abs_base = b["sum_abs_base"] / c
+            abs_rel = b["sum_abs_rel"] / c
+            rel_over_eb = abs_rel / abs_base.clamp_min(self.eps)
+            rec = {
+                "count": float(c.mean().item()),
+                "mu_base": float(mu_base.mean().item()),
+                "std_base": float(std_base.mean().item()),
+                "mu_rel": float(mu_rel.mean().item()),
+                "std_rel": float(std_rel.mean().item()),
+                "r": float(r.mean().item()),
+                "kl": float(kl.mean().item()),
+                "abs_base": float(abs_base.mean().item()),
+                "abs_rel": float(abs_rel.mean().item()),
+                "rel_over_eb": float(rel_over_eb.mean().item()),
+                "std_base_q": self._quantile_dict(b.get("samples_std_base", [])),
+                "std_rel_q": self._quantile_dict(b.get("samples_std_rel", [])),
+                "r_q": self._quantile_dict(b.get("samples_r", [])),
+                "kl_q": self._quantile_dict(b.get("samples_kl", [])),
+            }
+            if self.per_head:
+                rec["mu_base_per_head"] = mu_base.detach().float().cpu().tolist()
+                rec["std_base_per_head"] = std_base.detach().float().cpu().tolist()
+                rec["mu_rel_per_head"] = mu_rel.detach().float().cpu().tolist()
+                rec["std_rel_per_head"] = std_rel.detach().float().cpu().tolist()
+                rec["r_per_head"] = r.detach().float().cpu().tolist()
+                rec["kl_per_head"] = kl.detach().float().cpu().tolist()
+                rec["abs_base_per_head"] = abs_base.detach().float().cpu().tolist()
+                rec["abs_rel_per_head"] = abs_rel.detach().float().cpu().tolist()
+                rec["rel_over_eb_per_head"] = rel_over_eb.detach().float().cpu().tolist()
+            out[int(bidx)] = rec
+        return out
 def _make_router_mlp(hidden_size: int, out_dim: int, use_non_linear: bool) -> nn.Sequential:
     if use_non_linear:
         return nn.Sequential(
@@ -1605,6 +1942,111 @@ class PaTHAttention(nn.Module):
         config=None,
     ):
         super().__init__()
+
+        self._debug_enabled = False   # eval 开始由 callback 打开
+        self._debug_probe_done = False
+        self.debug_accum = {}         # layer_idx -> stats dict
+        self._eval_bin_stats = {}
+        self._eval_batch_step = 0
+        self._eval_stats_logged_once = False
+
+        self.eval_stats_enabled = self._as_bool(getattr(config, "eval_rel_stats_enabled", True), default=True)
+        self.eval_stats_layers = self._parse_layer_set(getattr(config, "eval_rel_stats_layers", "0"))
+        self.eval_stats_bin_size = max(1, int(getattr(config, "eval_rel_stats_bin_size", 256)))
+        self.eval_stats_log_every = max(0, int(getattr(config, "eval_rel_stats_log_every", 0)))
+        self.eval_stats_log_once = self._as_bool(getattr(config, "eval_rel_stats_log_once", True), default=True)
+        self.eval_stats_per_head = self._as_bool(getattr(config, "eval_rel_stats_per_head", False), default=False)
+        self.eval_stats_eps = float(getattr(config, "eval_rel_stats_eps", 1e-6))
+        self.eval_stats_max_samples_per_bin = max(
+            128, int(getattr(config, "eval_rel_stats_max_samples_per_bin", 4096))
+        )
+        self.eval_stats_anchor_layer = int(getattr(config, "eval_rel_stats_anchor_layer", 0))
+        self.rel_alpha = float(getattr(config, "rel_alpha", getattr(config, "attn_rel_alpha", 1.0)))
+        self.log_rel_stats = self._as_bool(getattr(config, "log_rel_stats", False), default=False)
+        self.log_rel_every = max(0, int(getattr(config, "log_rel_every", 500)))
+        self.log_rel_eval_every = max(0, int(getattr(config, "log_rel_eval_every", 0)))
+        self.log_rel_tail_tau = max(1, int(getattr(config, "log_rel_tail_tau", 1024)))
+        qpos_cfg = getattr(config, "log_rel_sample_qpos", None)
+        if qpos_cfg is None:
+            qpos_cfg = getattr(config, "log_rel_sample_tokens", "128,512,2048")
+        self.log_rel_sample_qpos = self._parse_int_list(qpos_cfg, default=[128, 512, 2048])
+        self.log_rel_sample_heads = self._parse_int_list(
+            getattr(config, "log_rel_sample_heads", "0,3,7,11"),
+            default=[0, 3, 7, 11],
+        )
+        self.log_rel_sample_key_offsets = self._parse_int_list(
+            getattr(config, "log_rel_sample_key_offsets", "0,16,64,256,1024"),
+            default=[0, 16, 64, 256, 1024],
+        )
+        self.log_rel_sample_batch_idx = max(0, int(getattr(config, "log_rel_sample_batch_idx", 0)))
+        # Eval rel stats are opt-in; callback flips this flag for selected eval rounds.
+        self._rel_eval_collect = False
+        self._rel_debug_cache = {}
+        self._rel_train_hook_buffer = {}
+        self._rel_eval_buffer = {}
+        self._rel_last_raw_logits = None
+        self._rel_last_coe_value = None
+        debug_attn_margin_cfg = getattr(config, "debug_attn_margin", None)
+        if debug_attn_margin_cfg is None:
+            debug_attn_margin_cfg = getattr(config, "attn_margin_stats_enabled", False)
+        self.attn_margin_enabled = self._as_bool(debug_attn_margin_cfg, default=False)
+        self.attn_margin_layers = self._parse_layer_set(getattr(config, "attn_margin_stats_layers", "all"))
+        # Keep margin logger bins aligned with EvalStats bins.
+        self.attn_margin_bin_size = int(self.eval_stats_bin_size)
+        self.attn_margin_log_every = max(
+            0, int(getattr(config, "attn_margin_stats_log_every", getattr(config, "debug_attn_margin_log_every", 500)))
+        )
+        self.attn_margin_log_per_head = self._as_bool(
+            getattr(config, "attn_margin_stats_log_per_head", False), default=False
+        )
+        self.attn_margin_log_head_limit = max(
+            0, int(getattr(config, "attn_margin_stats_log_head_limit", 0))
+        )
+        self.attn_margin_log_perplexity = self._as_bool(
+            getattr(config, "attn_margin_stats_log_perplexity", False), default=False
+        )
+        self.attn_margin_train_enabled = self._as_bool(
+            getattr(config, "attn_margin_stats_train_enabled", True), default=True
+        )
+        self.attn_margin_eval_enabled = self._as_bool(
+            getattr(config, "attn_margin_stats_eval_enabled", True), default=True
+        )
+        self._attn_margin_local_step = 0
+
+        self.router_norm_cfg = build_router_norm_config(config)
+        self._router_norm_local_step = 0
+        self.router_norm = None
+        self.router_norm_logger = None
+        if self.router_norm_cfg.enable:
+            norm_dim = getattr(config, "router_band_num", None) if config is not None else None
+            try:
+                if bool(getattr(config, "hierarchical_gate_use", False)):
+                    d_chunk_cfg = int(getattr(config, "router_d_chunk", 8))
+                    head_dim_local = int(hidden_size) // int(num_heads)
+                    if d_chunk_cfg > 0 and (head_dim_local % d_chunk_cfg == 0):
+                        norm_dim = head_dim_local // d_chunk_cfg
+            except Exception:
+                pass
+            if norm_dim is not None:
+                try:
+                    norm_dim = int(norm_dim)
+                    if norm_dim <= 0:
+                        norm_dim = None
+                except Exception:
+                    norm_dim = None
+            self.router_norm = RouterNorm(
+                norm_type=self.router_norm_cfg.norm_type,
+                eps=self.router_norm_cfg.eps,
+                clamp_std_min=self.router_norm_cfg.clamp_std_min,
+                affine=self.router_norm_cfg.affine,
+                feature_dim=norm_dim,
+            )
+            self.router_norm_logger = RouterNormStatsLogger(
+                log_every=self.router_norm_cfg.log_every,
+                log_heads=self.router_norm_cfg.log_heads,
+                log_tokens=self.router_norm_cfg.log_tokens,
+            )
+
         self.tau = getattr(config, "tau", 1.0)
         self._coe_for_rel_init = float(getattr(config, "coe_for_rel_init", -1))
         self.rel_coe = float(getattr(config, "coe_for_rel", 1.0))
@@ -1666,7 +2108,8 @@ class PaTHAttention(nn.Module):
                 nn.Linear(self.hidden_size, 32, bias=False),
                 nn.Linear(32, out_w, bias=False)
             )
-            if config.wavelet_router:
+            rel_use = self._rel_layer_enabled(layer_idx, config)
+            if config.wavelet_router and rel_use:
                 if getattr(config, "hierarchical_gate_use", False):
                     d_chunk = getattr(config, "router_d_chunk", 8)
                     assert self.head_dim % d_chunk == 0
@@ -1798,6 +2241,924 @@ class PaTHAttention(nn.Module):
             # self.mix_logit = nn.Parameter(torch.tensor(1.0)) if wavelet_mode == "softmix" else None
 
     # 小工具：按 head 打印
+    def _get_layer_accum(self, layer_idx: int):
+        st = self.debug_accum.get(layer_idx)
+        if st is None:
+            st = {
+                "sum_abs_rel": 0.0,
+                "sum_abs_eb":  0.0,
+                "sum_batch_ratio": 0.0,
+                "sum_elem_ratio": 0.0,
+                "sum_entropy": 0.0,   # attention entropy (not router entropy)
+                "sum_top1":    0.0,   # attention top1
+                "count":       0.0,
+                # tail quantiles: keep small reservoir sample (float32)
+                "samples_rel_abs": [],
+                "samples_eb_abs": [],
+                "samples_batch_ratio": [],
+                "samples_elem_ratio": [],
+                "samples_attn_top1": [],
+                "samples_router_top1": [],
+                "samples_router_margin": [],
+                # sequence-length buckets for extended-length comparison
+                "by_seq_len": {},
+                "eval_bin_state": None,
+            }
+            self.debug_accum[layer_idx] = st
+        return st
+
+    @staticmethod
+    def _as_bool(v, default=False):
+        if v is None:
+            return bool(default)
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            x = v.strip().lower()
+            if x in ("1", "true", "yes", "y", "on"):
+                return True
+            if x in ("0", "false", "no", "n", "off"):
+                return False
+        return bool(default)
+
+    @staticmethod
+    def _parse_layer_set(v):
+        if v is None:
+            return {0}
+        if isinstance(v, str):
+            x = v.strip().lower()
+            if x in ("all", "*"):
+                return None
+            items = [p.strip() for p in v.split(",") if p.strip()]
+            out = set()
+            for it in items:
+                try:
+                    out.add(int(it))
+                except Exception:
+                    continue
+            return out if out else {0}
+        if isinstance(v, (list, tuple, set)):
+            out = set()
+            for it in v:
+                try:
+                    out.add(int(it))
+                except Exception:
+                    continue
+            return out if out else {0}
+        try:
+            return {int(v)}
+        except Exception:
+            return {0}
+
+    def _track_eval_layer(self, layer_idx: int) -> bool:
+        if not self.eval_stats_enabled:
+            return False
+        if self.eval_stats_layers is None:
+            return True
+        return int(layer_idx) in self.eval_stats_layers
+
+    def _is_eval_anchor_layer(self, layer_idx: int) -> bool:
+        lid = int(layer_idx)
+        if self.eval_stats_layers and self.eval_stats_anchor_layer not in self.eval_stats_layers:
+            return lid == min(self.eval_stats_layers)
+        return lid == self.eval_stats_anchor_layer
+
+    @staticmethod
+    def _to_int_or_none(x):
+        if x is None:
+            return None
+        if isinstance(x, torch.Tensor):
+            if x.numel() != 1:
+                return None
+            x = x.detach().item()
+        try:
+            return int(x)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _parse_int_list(v, default=None):
+        if default is None:
+            default = []
+        out = []
+        if v is None:
+            src = list(default)
+        elif isinstance(v, str):
+            s = v.strip()
+            if not s:
+                src = list(default)
+            else:
+                s = s.strip("[]()")
+                src = []
+                for tok in re.split(r"[,\s]+", s):
+                    if tok:
+                        src.append(tok)
+        elif isinstance(v, (list, tuple, set)):
+            src = list(v)
+        else:
+            src = [v]
+        for item in src:
+            try:
+                out.append(int(item))
+            except Exception:
+                continue
+        if out:
+            return out
+        return [int(x) for x in default]
+
+    def _get_rel_layer_id(self, layer_idx: Optional[int]) -> int:
+        if layer_idx is None:
+            return int(self.layer_idx if self.layer_idx is not None else -1)
+        return int(layer_idx)
+
+    @staticmethod
+    def _parse_rel_layer_set(v):
+        """Return None for all-layers, otherwise a set[int] of enabled layers."""
+        if v is None:
+            return None
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("", "all", "*"):
+                return None
+            s = s.strip("[]()")
+            tokens = [tok for tok in re.split(r"[,\s]+", s) if tok]
+        elif isinstance(v, (list, tuple, set)):
+            tokens = list(v)
+        else:
+            tokens = [v]
+        out = set()
+        for tok in tokens:
+            try:
+                out.add(int(tok))
+            except Exception:
+                continue
+        return out if out else None
+
+    def _rel_layer_enabled(self, layer_idx: Optional[int], config=None) -> bool:
+        lid = self._get_rel_layer_id(layer_idx)
+        cfg_obj = config if config is not None else getattr(self, "config", None)
+        rel_layers_raw = getattr(cfg_obj, "rel_use_layer_list", None) if cfg_obj is not None else None
+        enabled = self._parse_rel_layer_set(rel_layers_raw)
+        if enabled is None:
+            return True
+        return int(lid) in enabled
+
+    @staticmethod
+    def _rel_to_tensor(v, ref: torch.Tensor) -> torch.Tensor:
+        if torch.is_tensor(v):
+            return v.to(device=ref.device, dtype=ref.dtype)
+        if v is None:
+            return torch.tensor(1.0, device=ref.device, dtype=ref.dtype)
+        return torch.tensor(float(v), device=ref.device, dtype=ref.dtype)
+
+    def _rel_should_log_train(self, global_step) -> tuple[bool, Optional[int]]:
+        if not self.log_rel_stats:
+            return False, None
+        if not self.training:
+            return False, None
+        if not torch.is_grad_enabled():
+            return False, None
+        if self.log_rel_every <= 0:
+            return False, None
+        step = self._to_int_or_none(global_step)
+        if step is None:
+            return False, None
+        step_eff = int(step) + 1
+        return (step_eff % int(self.log_rel_every) == 0), step_eff
+
+    def _rel_should_log_eval(self) -> bool:
+        return (
+            bool(self.log_rel_stats)
+            and int(getattr(self, "log_rel_eval_every", 0)) > 0
+            and (not self.training)
+            and bool(getattr(self, "_rel_eval_collect", False))
+        )
+
+    def _build_rel_sample_spec(self, T: int, H: int, device: torch.device):
+        if T <= 0 or H <= 0:
+            return None
+        heads = []
+        seen_heads = set()
+        src_heads = self.log_rel_sample_heads if self.log_rel_sample_heads else [0]
+        for h_raw in src_heads:
+            h = int(h_raw)
+            if h < 0:
+                h = H + h
+            h = max(0, min(H - 1, h))
+            if h not in seen_heads:
+                seen_heads.add(h)
+                heads.append(h)
+        if not heads:
+            heads = [0]
+
+        queries = []
+        seen_queries = set()
+        src_queries = self.log_rel_sample_qpos if self.log_rel_sample_qpos else [T - 1]
+        for q_raw in src_queries:
+            q = int(q_raw)
+            if q < 0:
+                q = T + q
+            q = max(0, min(T - 1, q))
+            if q not in seen_queries:
+                seen_queries.add(q)
+                queries.append(q)
+        if not queries:
+            queries = [T - 1]
+
+        pair_offsets = self.log_rel_sample_key_offsets if self.log_rel_sample_key_offsets else [0, 16, 64, 256, 1024]
+        pairs = []
+        seen_pairs = set()
+        for m in queries:
+            for off in pair_offsets:
+                n = m - int(off)
+                if n < 0 or n > m:
+                    continue
+                key = (int(m), int(n))
+                if key in seen_pairs:
+                    continue
+                seen_pairs.add(key)
+                pairs.append(key)
+        if not pairs:
+            pairs = [(queries[-1], queries[-1])]
+
+        m_idx = torch.tensor([p[0] for p in pairs], device=device, dtype=torch.long)
+        n_idx = torch.tensor([p[1] for p in pairs], device=device, dtype=torch.long)
+        h_idx = torch.tensor(heads, device=device, dtype=torch.long)
+        q_idx = torch.tensor(queries, device=device, dtype=torch.long)
+        return {
+            "head_idx": h_idx,
+            "q_idx": q_idx,
+            "m_idx": m_idx,
+            "n_idx": n_idx,
+            "query_positions": queries,
+        }
+
+    @staticmethod
+    def _sample_rel_pairs(x: torch.Tensor, sample_spec: dict) -> torch.Tensor:
+        y = x.index_select(1, sample_spec["head_idx"])
+        return y[:, :, sample_spec["m_idx"], sample_spec["n_idx"]]
+
+    def _sample_rel_pairs_b0(self, x: torch.Tensor, sample_spec: dict) -> torch.Tensor:
+        b = min(int(self.log_rel_sample_batch_idx), int(x.shape[0]) - 1)
+        y = x[b : b + 1].index_select(1, sample_spec["head_idx"])
+        return y[:, :, sample_spec["m_idx"], sample_spec["n_idx"]]
+
+    def _sample_query_rows_b0(self, x: torch.Tensor, sample_spec: dict) -> torch.Tensor:
+        b = min(int(self.log_rel_sample_batch_idx), int(x.shape[0]) - 1)
+        y = x[b : b + 1].index_select(1, sample_spec["head_idx"]).index_select(2, sample_spec["q_idx"])
+        return y
+
+    @staticmethod
+    def _rms(x: torch.Tensor) -> float:
+        t = x.detach().float().reshape(-1)
+        if t.numel() == 0:
+            return float("nan")
+        return float(torch.sqrt((t * t).mean()).item())
+
+    @staticmethod
+    def _corr_flat(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-12) -> float:
+        xv = x.detach().float().reshape(-1)
+        yv = y.detach().float().reshape(-1)
+        if xv.numel() == 0 or yv.numel() == 0 or xv.numel() != yv.numel():
+            return float("nan")
+        xv = xv - xv.mean()
+        yv = yv - yv.mean()
+        den = torch.sqrt((xv * xv).sum()) * torch.sqrt((yv * yv).sum())
+        if float(den.item()) <= eps:
+            return float("nan")
+        return float((xv * yv).sum().div(den.clamp_min(eps)).item())
+
+    @staticmethod
+    @torch.no_grad()
+    def _rel_summary_stats(x: torch.Tensor) -> dict:
+        t = x.detach().float().reshape(-1)
+        if t.numel() == 0:
+            nan = float("nan")
+            return {
+                "mean": nan,
+                "abs_mean": nan,
+                "std": nan,
+                "min": nan,
+                "max": nan,
+                "p90": nan,
+                "p99": nan,
+            }
+        q = torch.quantile(t, torch.tensor([0.9, 0.99], device=t.device, dtype=t.dtype))
+        return {
+            "mean": float(t.mean().item()),
+            "abs_mean": float(t.abs().mean().item()),
+            "std": float(t.std(unbiased=False).item()),
+            "min": float(t.min().item()),
+            "max": float(t.max().item()),
+            "p90": float(q[0].item()),
+            "p99": float(q[1].item()),
+        }
+
+    @torch.no_grad()
+    def _rel_attn_shape_stats(self, attn_probs: torch.Tensor, sample_spec: dict, tau: int) -> dict:
+        p = self._sample_query_rows_b0(attn_probs.detach().float(), sample_spec)
+        ent_vals, top1_vals, tail_vals = [], [], []
+        eps = 1e-12
+        for qi, m in enumerate(sample_spec["query_positions"]):
+            m = int(m)
+            if qi < 0 or qi >= p.shape[2]:
+                continue
+            valid = p[:, :, qi, : m + 1]
+            valid = valid / valid.sum(dim=-1, keepdim=True).clamp_min(eps)
+            ent = -(valid * valid.clamp_min(eps).log()).sum(dim=-1)
+            top1 = valid.max(dim=-1).values
+            if m >= tau:
+                tail = valid[..., : (m - tau + 1)].sum(dim=-1)
+            else:
+                tail = torch.zeros_like(top1)
+            ent_vals.append(float(ent.mean().item()))
+            top1_vals.append(float(top1.mean().item()))
+            tail_vals.append(float(tail.mean().item()))
+
+        if not ent_vals:
+            return {"ent": float("nan"), "top1": float("nan"), "tail": float("nan")}
+        return {
+            "ent": float(sum(ent_vals) / len(ent_vals)),
+            "top1": float(sum(top1_vals) / len(top1_vals)),
+            "tail": float(sum(tail_vals) / len(tail_vals)),
+        }
+
+    @torch.no_grad()
+    def _rel_record_train_hook(
+        self,
+        step: int,
+        grad_total_logits: torch.Tensor,
+        rel_logits_tensor: torch.Tensor,
+        sample_spec: dict,
+        coe_value_tensor: torch.Tensor,
+    ):
+        grad_s = self._sample_rel_pairs_b0(grad_total_logits.detach(), sample_spec).float().reshape(-1)
+        rel_s = self._sample_rel_pairs_b0(rel_logits_tensor.detach(), sample_spec).float().reshape(-1)
+        if grad_s.numel() == 0 or rel_s.numel() == 0:
+            return
+        prod = grad_s * rel_s
+        corr = self._corr_flat(grad_s, rel_s)
+        bucket = self._rel_train_hook_buffer.setdefault(
+            int(step),
+            {
+                "n_elem": 0.0,
+                "sum_A": 0.0,
+                "sum_abs_grad": 0.0,
+                "sum_grad": 0.0,
+                "sum_grad_sq": 0.0,
+                "max_abs_grad": 0.0,
+                "sum_coe": 0.0,
+                "coe_count": 0.0,
+                "sum_corr_grad_rel": 0.0,
+                "corr_count": 0.0,
+            },
+        )
+        bucket["n_elem"] += float(grad_s.numel())
+        bucket["sum_A"] += float(prod.sum().item())
+        bucket["sum_abs_grad"] += float(grad_s.abs().sum().item())
+        bucket["sum_grad"] += float(grad_s.sum().item())
+        bucket["sum_grad_sq"] += float((grad_s * grad_s).sum().item())
+        bucket["max_abs_grad"] = max(float(bucket["max_abs_grad"]), float(grad_s.abs().max().item()))
+        coe_mean = float(coe_value_tensor.detach().float().mean().item())
+        bucket["sum_coe"] += coe_mean
+        bucket["coe_count"] += 1.0
+        if math.isfinite(corr):
+            bucket["sum_corr_grad_rel"] += float(corr)
+            bucket["corr_count"] += 1.0
+
+    @torch.no_grad()
+    def _rel_accumulate_eval(
+        self,
+        layer_id: int,
+        sample_spec: dict,
+        base_logits_detached: torch.Tensor,
+        rel_logits_detached: torch.Tensor,
+        rel_effective_detached: torch.Tensor,
+        total_logits_detached: torch.Tensor,
+        coe_value_detached: torch.Tensor,
+        attention_probs_detached: torch.Tensor,
+        step: Optional[int],
+    ):
+        base_pair = self._sample_rel_pairs_b0(base_logits_detached, sample_spec)
+        rel_pair = self._sample_rel_pairs_b0(rel_logits_detached, sample_spec)
+        rel_eff_pair = self._sample_rel_pairs_b0(rel_effective_detached, sample_spec)
+        rel_stats = self._rel_summary_stats(rel_pair)
+        rel_eff_stats = self._rel_summary_stats(rel_eff_pair)
+        base_stats = self._rel_summary_stats(base_pair)
+        attn_shape = self._rel_attn_shape_stats(attention_probs_detached, sample_spec, tau=int(self.log_rel_tail_tau))
+        rms_base = self._rms(base_pair)
+        rms_rel = self._rms(rel_pair)
+        rms_rel_eff = self._rms(rel_eff_pair)
+        rho = float(rms_rel_eff / max(rms_base, 1e-12)) if math.isfinite(rms_base) and math.isfinite(rms_rel_eff) else float("nan")
+
+        z_rows = self._sample_query_rows_b0(total_logits_detached, sample_spec)
+        b_rows = self._sample_query_rows_b0(base_logits_detached, sample_spec)
+        r_rows = self._sample_query_rows_b0(rel_logits_detached, sample_spec)
+        logits_std_vals, logits_gap_vals, logits_range_vals, corr_vals = [], [], [], []
+        for qi, m in enumerate(sample_spec["query_positions"]):
+            m = int(m)
+            if qi < 0 or qi >= z_rows.shape[2]:
+                continue
+            z_valid = z_rows[:, :, qi, : m + 1]
+            if z_valid.shape[-1] == 0:
+                continue
+            logits_std_vals.append(float(z_valid.std(dim=-1, unbiased=False).mean().item()))
+            topk = torch.topk(z_valid, k=min(2, int(z_valid.shape[-1])), dim=-1).values
+            if topk.shape[-1] == 1:
+                gap = torch.zeros_like(topk[..., 0])
+            else:
+                gap = topk[..., 0] - topk[..., 1]
+            logits_gap_vals.append(float(gap.mean().item()))
+            logits_range_vals.append(float((z_valid.max(dim=-1).values - z_valid.mean(dim=-1)).mean().item()))
+
+            b_valid = b_rows[:, :, qi, : m + 1]
+            r_valid = r_rows[:, :, qi, : m + 1]
+            for hid in range(int(b_valid.shape[1])):
+                corr = self._corr_flat(b_valid[:, hid, :], r_valid[:, hid, :])
+                if math.isfinite(corr):
+                    corr_vals.append(float(corr))
+
+        logits_std = float(sum(logits_std_vals) / len(logits_std_vals)) if logits_std_vals else float("nan")
+        top1_gap = float(sum(logits_gap_vals) / len(logits_gap_vals)) if logits_gap_vals else float("nan")
+        logits_range = float(sum(logits_range_vals) / len(logits_range_vals)) if logits_range_vals else float("nan")
+        corr_base_rel = float(sum(corr_vals) / len(corr_vals)) if corr_vals else float("nan")
+
+        bucket = self._rel_eval_buffer
+        if not isinstance(bucket, dict) or bucket.get("layer_id", None) != int(layer_id):
+            bucket = {
+                "layer_id": int(layer_id),
+                "count": 0.0,
+                "sum_rms_base": 0.0,
+                "sum_rms_rel": 0.0,
+                "sum_rms_rel_eff": 0.0,
+                "sum_rho": 0.0,
+                "sum_base_abs_mean": 0.0,
+                "sum_rel_mean": 0.0,
+                "sum_rel_abs_mean": 0.0,
+                "sum_rel_std": 0.0,
+                "sum_rel_min": 0.0,
+                "sum_rel_max": 0.0,
+                "sum_rel_p90": 0.0,
+                "sum_rel_p99": 0.0,
+                "sum_rel_eff_mean": 0.0,
+                "sum_rel_eff_abs_mean": 0.0,
+                "sum_rel_eff_std": 0.0,
+                "sum_rel_eff_min": 0.0,
+                "sum_rel_eff_max": 0.0,
+                "sum_rel_eff_p90": 0.0,
+                "sum_rel_eff_p99": 0.0,
+                "sum_ent": 0.0,
+                "sum_top1": 0.0,
+                "sum_tail": 0.0,
+                "sum_logits_std": 0.0,
+                "sum_top1_gap": 0.0,
+                "sum_logits_range": 0.0,
+                "sum_corr_base_rel": 0.0,
+                "corr_base_rel_count": 0.0,
+                "sum_coe": 0.0,
+                "step": -1,
+                "tail_tau": int(self.log_rel_tail_tau),
+            }
+        bucket["count"] += 1.0
+        bucket["sum_rms_base"] += float(rms_base)
+        bucket["sum_rms_rel"] += float(rms_rel)
+        bucket["sum_rms_rel_eff"] += float(rms_rel_eff)
+        bucket["sum_rho"] += float(rho)
+        bucket["sum_base_abs_mean"] += float(base_stats["abs_mean"])
+        bucket["sum_rel_mean"] += float(rel_stats["mean"])
+        bucket["sum_rel_abs_mean"] += float(rel_stats["abs_mean"])
+        bucket["sum_rel_std"] += float(rel_stats["std"])
+        bucket["sum_rel_min"] += float(rel_stats["min"])
+        bucket["sum_rel_max"] += float(rel_stats["max"])
+        bucket["sum_rel_p90"] += float(rel_stats["p90"])
+        bucket["sum_rel_p99"] += float(rel_stats["p99"])
+        bucket["sum_rel_eff_mean"] += float(rel_eff_stats["mean"])
+        bucket["sum_rel_eff_abs_mean"] += float(rel_eff_stats["abs_mean"])
+        bucket["sum_rel_eff_std"] += float(rel_eff_stats["std"])
+        bucket["sum_rel_eff_min"] += float(rel_eff_stats["min"])
+        bucket["sum_rel_eff_max"] += float(rel_eff_stats["max"])
+        bucket["sum_rel_eff_p90"] += float(rel_eff_stats["p90"])
+        bucket["sum_rel_eff_p99"] += float(rel_eff_stats["p99"])
+        bucket["sum_ent"] += float(attn_shape["ent"])
+        bucket["sum_top1"] += float(attn_shape["top1"])
+        bucket["sum_tail"] += float(attn_shape["tail"])
+        bucket["sum_logits_std"] += float(logits_std)
+        bucket["sum_top1_gap"] += float(top1_gap)
+        bucket["sum_logits_range"] += float(logits_range)
+        if math.isfinite(corr_base_rel):
+            bucket["sum_corr_base_rel"] += float(corr_base_rel)
+            bucket["corr_base_rel_count"] += 1.0
+        bucket["sum_coe"] += float(coe_value_detached.detach().float().mean().item())
+        if step is not None:
+            bucket["step"] = int(step)
+        self._rel_eval_buffer = bucket
+
+    def _rel_prepare_debug(
+        self,
+        *,
+        layer_idx: Optional[int],
+        global_step,
+        base_logits_tensor: Optional[torch.Tensor],
+        total_logits_tensor: Optional[torch.Tensor],
+        rel_logits_tensor: Optional[torch.Tensor],
+        coe_value,
+        attention_probs_detached: Optional[torch.Tensor],
+    ):
+        if (not self.log_rel_stats) or (base_logits_tensor is None) or (total_logits_tensor is None) or (rel_logits_tensor is None):
+            return
+        if base_logits_tensor.dim() != 4 or total_logits_tensor.dim() != 4 or rel_logits_tensor.dim() != 4:
+            return
+        if attention_probs_detached is None or attention_probs_detached.dim() != 4:
+            return
+
+        layer_id = self._get_rel_layer_id(layer_idx)
+        train_log, train_step = self._rel_should_log_train(global_step)
+        eval_log = self._rel_should_log_eval()
+        if (not train_log) and (not eval_log):
+            return
+
+        sample_spec = self._build_rel_sample_spec(
+            T=int(total_logits_tensor.shape[-1]),
+            H=int(total_logits_tensor.shape[1]),
+            device=total_logits_tensor.device,
+        )
+        if sample_spec is None:
+            return
+
+        coe_tensor = self._rel_to_tensor(coe_value, total_logits_tensor)
+        rel_effective_detached = coe_tensor.detach() * rel_logits_tensor.detach()
+
+        if eval_log:
+            self._rel_accumulate_eval(
+                layer_id=layer_id,
+                sample_spec=sample_spec,
+                base_logits_detached=base_logits_tensor.detach(),
+                rel_logits_detached=rel_logits_tensor.detach(),
+                rel_effective_detached=rel_effective_detached,
+                total_logits_detached=total_logits_tensor.detach(),
+                coe_value_detached=coe_tensor.detach(),
+                attention_probs_detached=attention_probs_detached.detach(),
+                step=self._to_int_or_none(global_step),
+            )
+
+        if train_log and total_logits_tensor.requires_grad and torch.is_grad_enabled():
+            rel_ref = rel_logits_tensor
+            coe_ref = coe_tensor
+            hook_step = int(train_step)
+            self._rel_debug_cache[layer_id] = {
+                "step": int(hook_step),
+                "head_count": int(sample_spec["head_idx"].numel()),
+                "pair_count": int(sample_spec["m_idx"].numel()),
+            }
+
+            def _hook_fn(grad_total_logits):
+                if grad_total_logits is not None:
+                    self._rel_record_train_hook(
+                        step=hook_step,
+                        grad_total_logits=grad_total_logits,
+                        rel_logits_tensor=rel_ref,
+                        sample_spec=sample_spec,
+                        coe_value_tensor=coe_ref,
+                    )
+                self._rel_debug_cache.pop(layer_id, None)
+
+            total_logits_tensor.register_hook(_hook_fn)
+        elif layer_id in self._rel_debug_cache:
+            self._rel_debug_cache.pop(layer_id, None)
+
+    @torch.no_grad()
+    def _rel_pop_train_bucket(self, step: int):
+        if not isinstance(self._rel_train_hook_buffer, dict):
+            return None
+        return self._rel_train_hook_buffer.pop(int(step), None)
+
+    @torch.no_grad()
+    def _rel_pop_eval_buffer(self):
+        buf = self._rel_eval_buffer
+        self._rel_eval_buffer = {}
+        if isinstance(buf, dict) and float(buf.get("count", 0.0)) > 0:
+            return buf
+        return None
+
+    @torch.no_grad()
+    def _rel_reset_eval_buffer(self):
+        self._rel_eval_buffer = {}
+
+    def _track_attn_margin_layer(self, layer_idx: int) -> bool:
+        if not self.attn_margin_enabled:
+            return False
+        if self.attn_margin_layers is None:
+            return True
+        return int(layer_idx) in self.attn_margin_layers
+
+    @staticmethod
+    @torch.no_grad()
+    def _attn_margin_stat_monitor(x: torch.Tensor):
+        y = x.detach().float()
+        y = y.reshape(-1)
+        if y.numel() == 0:
+            return {
+                "mean": float("nan"),
+                "std": float("nan"),
+                "min": float("nan"),
+                "max": float("nan"),
+                "p50": float("nan"),
+                "p90": float("nan"),
+                "p99": float("nan"),
+            }
+        q = _quantiles_flat(y, qs=(0.5, 0.9, 0.99))
+        return {
+            "mean": float(y.mean().item()),
+            "std": float(y.std(unbiased=False).item()),
+            "min": float(y.min().item()),
+            "max": float(y.max().item()),
+            "p50": float(q["p50"]),
+            "p90": float(q["p90"]),
+            "p99": float(q["p99"]),
+        }
+
+    @staticmethod
+    @torch.no_grad()
+    def _attn_margin_per_head_summary(x: torch.Tensor):
+        if x.dim() != 3:
+            return None, None
+        y = x.detach().float().permute(1, 0, 2).reshape(x.shape[1], -1)
+        if y.is_cuda:
+            y = y.cpu()
+        if y.numel() == 0 or y.shape[1] == 0:
+            return None, None
+        head_mean = y.mean(dim=-1)
+        head_p90 = torch.quantile(y, 0.9, dim=-1)
+        return head_mean, head_p90
+
+    @staticmethod
+    def _fmt_attn_margin_per_head(x: Optional[torch.Tensor], head_limit: int = 0) -> str:
+        if x is None:
+            return "[]"
+        vals = x.detach().float().cpu().tolist()
+        if isinstance(vals, float):
+            vals = [vals]
+        total = len(vals)
+        if head_limit > 0 and total > head_limit:
+            vals = vals[:head_limit]
+            suffix = f",...(+{total - head_limit} heads)"
+        else:
+            suffix = ""
+        body = ",".join([f"h{i}:{float(v):.6e}" for i, v in enumerate(vals)])
+        return "[" + body + suffix + "]"
+
+    def _emit_attn_margin_log(self, msg: str):
+        logger_obj = getattr(self, "logger", None)
+        if logger_obj is not None:
+            try:
+                logger_obj.info(msg)
+                return
+            except Exception:
+                pass
+        print(msg)
+
+    @torch.no_grad()
+    def _log_attn_margin_distance(
+        self,
+        *,
+        layer_idx: Optional[int],
+        masked_logits: Optional[torch.Tensor],
+        global_step=None,
+    ):
+        if masked_logits is None:
+            return
+        if self.training and (not self.attn_margin_train_enabled):
+            return
+        if (not self.training) and (not self.attn_margin_eval_enabled):
+            return
+        lid = int(self.layer_idx if layer_idx is None else layer_idx)
+        if not self._track_attn_margin_layer(lid):
+            return
+
+        step_val = self._to_int_or_none(global_step)
+        if step_val is None and self.config is not None:
+            step_val = self._to_int_or_none(getattr(self.config, "router_global_step", None))
+        if step_val is None:
+            self._attn_margin_local_step += 1
+            step_val = int(self._attn_margin_local_step)
+        if self.attn_margin_log_every > 0 and (step_val % self.attn_margin_log_every != 0):
+            return
+
+        z = masked_logits.detach().to(dtype=torch.float32)
+        if z.dim() != 4 or z.shape[-1] < 2:
+            return
+
+        top2_logits = torch.topk(z, k=2, dim=-1).values
+        logit_margin = top2_logits[..., 0] - top2_logits[..., 1]  # [B,H,T]
+
+        p = torch.softmax(z, dim=-1)
+        top2_probs = torch.topk(p, k=2, dim=-1).values
+        prob_margin = top2_probs[..., 0] - top2_probs[..., 1]  # [B,H,T]
+        entropy = -(p * (p + 1e-12).log()).sum(dim=-1)  # [B,H,T]
+
+        metrics = [
+            ("logit_margin", logit_margin),
+            ("prob_margin", prob_margin),
+            ("entropy", entropy),
+        ]
+        if self.attn_margin_log_perplexity:
+            metrics.append(("perplexity", entropy.exp()))
+
+        T = int(z.shape[2])
+        for start in range(0, T, int(self.attn_margin_bin_size)):
+            end = min(start + int(self.attn_margin_bin_size), T)
+            if end <= start:
+                continue
+            bin_tag = f"{start}-{end}"
+            for metric_name, metric in metrics:
+                seg = metric[:, :, start:end]
+                st = self._attn_margin_stat_monitor(seg)
+                msg = (
+                    f"[AttnMargin] layer={lid} bin={bin_tag} "
+                    f"{metric_name}: mean={st['mean']:.6e} std={st['std']:.6e} "
+                    f"p50={st['p50']:.6e} p90={st['p90']:.6e} p99={st['p99']:.6e} "
+                    f"min={st['min']:.6e} max={st['max']:.6e} step={step_val}"
+                )
+                self._emit_attn_margin_log(msg)
+
+                if self.attn_margin_log_per_head:
+                    head_mean, head_p90 = self._attn_margin_per_head_summary(seg)
+                    msg_head = (
+                        f"[AttnMargin] layer={lid} bin={bin_tag} "
+                        f"{metric_name}_per_head: "
+                        f"mean={self._fmt_attn_margin_per_head(head_mean, self.attn_margin_log_head_limit)} "
+                        f"p90={self._fmt_attn_margin_per_head(head_p90, self.attn_margin_log_head_limit)} "
+                        f"step={step_val}"
+                    )
+                    self._emit_attn_margin_log(msg_head)
+
+    @torch.no_grad()
+    def reset_eval_stats(self):
+        self._eval_bin_stats = {}
+        self._eval_batch_step = 0
+        self._eval_stats_logged_once = False
+
+    @torch.no_grad()
+    def update_stats(self, z_base: torch.Tensor, rel: torch.Tensor, layer_idx: int, rel_alpha: float = 1.0):
+        if (not self._debug_enabled) or self.training:
+            return
+        if z_base is None or rel is None:
+            return
+        if not self._track_eval_layer(layer_idx):
+            return
+        lid = int(layer_idx)
+        running = self._eval_bin_stats.get(lid)
+        if running is None:
+            running = RunningBinStats(
+                bin_size=self.eval_stats_bin_size,
+                eps=self.eval_stats_eps,
+                per_head=self.eval_stats_per_head,
+                stats_dtype=torch.float32,
+                max_samples_per_bin=self.eval_stats_max_samples_per_bin,
+            )
+            self._eval_bin_stats[lid] = running
+        running.update(z_base, rel, coe_for_rel=rel_alpha)
+
+        st = self._get_layer_accum(lid)
+        st["eval_bin_state"] = running.state_dict()
+        st["eval_rel_alpha"] = float(rel_alpha)
+
+        if self._is_eval_anchor_layer(lid):
+            self._eval_batch_step += 1
+            if self.eval_stats_log_every > 0 and (self._eval_batch_step % self.eval_stats_log_every == 0):
+                self.log_stats(step=self._eval_batch_step, layer_idx=lid, force=False)
+
+    @torch.no_grad()
+    def log_stats(self, step, layer_idx: Optional[int] = None, force: bool = False):
+        if not self.eval_stats_enabled:
+            return
+        if (not self._debug_enabled) and (not force):
+            return
+        if (self.eval_stats_log_every <= 0) and self.eval_stats_log_once and self._eval_stats_logged_once and (not force):
+            return
+
+        if layer_idx is None:
+            layers = sorted(self._eval_bin_stats.keys())
+        else:
+            layers = [int(layer_idx)] if int(layer_idx) in self._eval_bin_stats else []
+
+        for lid in layers:
+            rec = self._eval_bin_stats[lid].summary()
+            layer_accum = self._get_layer_accum(lid)
+            alpha = float(layer_accum.get("eval_rel_alpha", self.rel_alpha))
+            for bidx in sorted(rec.keys()):
+                st = rec[bidx]
+                t0 = int(bidx) * int(self.eval_stats_bin_size)
+                t1 = t0 + int(self.eval_stats_bin_size)
+                alpha_rel_over_eb = alpha * float(st.get("rel_over_eb", float("nan")))
+                msg = (
+                    f"[EvalStats] step={step} layer={lid} bin={t0}-{t1} "
+                    f"mu_base={st['mu_base']:.6e} std_base={st['std_base']:.6e} "
+                    f"mu_rel={st['mu_rel']:.6e} std_rel={st['std_rel']:.6e} "
+                    f"R={st['r']:.6e} KL={st['kl']:.6e} "
+                    f"alpha={alpha:.6e} rel_over_eb={st['rel_over_eb']:.6e} alpha_rel_over_eb={alpha_rel_over_eb:.6e} "
+                    f"std_base_p50={st['std_base_q']['p50']:.6e} std_base_p90={st['std_base_q']['p90']:.6e} std_base_p99={st['std_base_q']['p99']:.6e} "
+                    f"std_rel_p50={st['std_rel_q']['p50']:.6e} std_rel_p90={st['std_rel_q']['p90']:.6e} std_rel_p99={st['std_rel_q']['p99']:.6e} "
+                    f"R_p50={st['r_q']['p50']:.6e} R_p90={st['r_q']['p90']:.6e} R_p99={st['r_q']['p99']:.6e} "
+                    f"KL_p50={st['kl_q']['p50']:.6e} KL_p90={st['kl_q']['p90']:.6e} KL_p99={st['kl_q']['p99']:.6e}"
+                )
+                print(msg)
+        if (self.eval_stats_log_every <= 0) and self.eval_stats_log_once:
+            self._eval_stats_logged_once = True
+
+    @torch.no_grad()
+    def _debug_update_eval_stats(
+        self, layer_idx, E_base_raw, rel,
+        attn_weights=None,  # [B,H,T,T] or [B,T,H,T] depends
+        router_top1=None, router_margin=None,  # 标量或向量
+        max_samples_per_layer=2048
+    ):
+        if (not self._debug_enabled) or self.training:
+            return
+        if (E_base_raw is None) or (rel is None):
+            return
+
+        st = self._get_layer_accum(layer_idx)
+
+        # abs_mean 用 sum_abs / count
+        eps = 1e-12
+        rel_abs_t = rel.detach().float().abs()
+        eb_abs_t = E_base_raw.detach().float().abs()
+        eb_abs = eb_abs_t.mean().item()
+        rel_abs = rel_abs_t.mean().item()
+        batch_ratio = rel_abs / max(eb_abs, eps)
+        denom_floor = max(eb_abs * 1e-2, 1e-6)
+        elem_ratio = (rel_abs_t / eb_abs_t.clamp_min(denom_floor)).mean().item()
+        st["sum_abs_eb"]  += eb_abs
+        st["sum_abs_rel"] += rel_abs
+        st["sum_batch_ratio"] += batch_ratio
+        st["sum_elem_ratio"] += elem_ratio
+        st["count"]       += 1.0
+
+        # extended-length bucket stats: compare ratio across sequence lengths
+        seq_len = int(E_base_raw.shape[-1])
+        by_len = st.get("by_seq_len")
+        if by_len is None:
+            by_len = {}
+            st["by_seq_len"] = by_len
+        bucket = by_len.get(seq_len)
+        if bucket is None:
+            bucket = {
+                "sum_abs_rel": 0.0,
+                "sum_abs_eb": 0.0,
+                "sum_batch_ratio": 0.0,
+                "sum_elem_ratio": 0.0,
+                "count": 0.0,
+            }
+            by_len[seq_len] = bucket
+        bucket["sum_abs_rel"] += rel_abs
+        bucket["sum_abs_eb"] += eb_abs
+        bucket["sum_batch_ratio"] += batch_ratio
+        bucket["sum_elem_ratio"] += elem_ratio
+        bucket["count"] += 1.0
+
+        # attention entropy/top1（注意是 attention weights，不是 router）
+        if attn_weights is not None:
+            # 你自己确保 attn_weights 是 softmax 后的概率
+            p = attn_weights.detach().float()
+            # flatten over (B,H,T) per-query distribution over keys
+            # 下面写法只是示意：你要按你真实维度改
+            p = p.reshape(-1, p.shape[-1])  # [Q, K]
+            # entropy
+            ent = -(p * (p.clamp_min(1e-9).log())).sum(dim=-1)  # [Q]
+            top1 = p.max(dim=-1).values                         # [Q]
+            st["sum_entropy"] += ent.mean().item()
+            st["sum_top1"]    += top1.mean().item()
+
+            # reservoir sample（采一些 tail）
+            if len(st["samples_attn_top1"]) < max_samples_per_layer:
+                take = min(max_samples_per_layer - len(st["samples_attn_top1"]), top1.numel())
+                st["samples_attn_top1"].extend(top1.flatten()[:take].cpu().tolist())
+
+        # router tail（你已有 top1_p99/margin_p99 相关张量的话，把 per-token 值采样）
+        if router_top1 is not None:
+            rt = router_top1.detach().float().flatten()
+            if len(st["samples_router_top1"]) < max_samples_per_layer:
+                take = min(max_samples_per_layer - len(st["samples_router_top1"]), rt.numel())
+                st["samples_router_top1"].extend(rt[:take].cpu().tolist())
+
+        if router_margin is not None:
+            rm = router_margin.detach().float().flatten()
+            if len(st["samples_router_margin"]) < max_samples_per_layer:
+                take = min(max_samples_per_layer - len(st["samples_router_margin"]), rm.numel())
+                st["samples_router_margin"].extend(rm[:take].cpu().tolist())
+
+        # rel_abs sample（同理采样）
+        if len(st["samples_rel_abs"]) < max_samples_per_layer:
+            st["samples_rel_abs"].append(rel_abs)
+        if len(st["samples_eb_abs"]) < max_samples_per_layer:
+            st["samples_eb_abs"].append(eb_abs)
+        if len(st["samples_batch_ratio"]) < max_samples_per_layer:
+            st["samples_batch_ratio"].append(batch_ratio)
+        if len(st["samples_elem_ratio"]) < max_samples_per_layer:
+            st["samples_elem_ratio"].append(elem_ratio)
     def reset_parameters(self):
         if isinstance(self.coe_for_rel, nn.Parameter):
             with torch.no_grad():
@@ -1819,6 +3180,7 @@ class PaTHAttention(nn.Module):
         scale_wise_analyzer=None,
         E_base_raw: torch.Tensor = None,  # [B,H,T,T]
         config=None,
+        global_step=None,
     ) -> torch.Tensor:
         """
         Scale-wise routed:
@@ -1827,6 +3189,8 @@ class PaTHAttention(nn.Module):
         rel  = rel1 - rel2   (or selection)
         Return: rel [B,H,T,T] (NO scale, NO mask)
         """
+        self._rel_last_raw_logits = None
+        self._rel_last_coe_value = None
         hier = bool(getattr(self.config, "hierarchical_gate_use", False))
         global_lambda = float(getattr(self.config, "global_lambda", 0.5)) 
         B, T, H, D = q.shape
@@ -1839,7 +3203,9 @@ class PaTHAttention(nn.Module):
         P  = wavelet_dtt.to(compute_dtype)
 
         # P_s: [S,T,T]  (同组共享scale -> 压缩到scale-group)
-        shift_sep_use = bool(getattr(config, "shift_sep_use", False))
+        # Current experiment default: always use averaged scale-group path.
+        # Keep shift-separate branch disabled to avoid accidental config toggles.
+        shift_sep_use = False
         if shift_sep_use:
             P_s = P.view(S, d_chunk, T, T)
             q_s = q0.view(B, T, H, S, d_chunk)
@@ -1848,7 +3214,55 @@ class PaTHAttention(nn.Module):
             q_s = q0.view(B, T, H, S, d_chunk).sum(dim=-1)
 
         # q_s: [B,T,H,S]  (组内求和；也可以改成 mean，看你定义)
-        # 
+        #
+        def _to_int_or_none(x):
+            if x is None:
+                return None
+            if isinstance(x, torch.Tensor):
+                if x.numel() != 1:
+                    return None
+                x = x.detach().item()
+            try:
+                return int(x)
+            except Exception:
+                return None
+
+        do_router_norm = bool(self.router_norm_cfg.enable)
+        step_val = None
+        emit_header = False
+        do_router_norm_log = False
+        if do_router_norm:
+            step_val = _to_int_or_none(global_step)
+            if step_val is None and config is not None:
+                step_val = _to_int_or_none(getattr(config, "router_global_step", None))
+            if step_val is None:
+                self._router_norm_local_step += 1
+                step_val = int(self._router_norm_local_step)
+            emit_header = True
+            do_router_norm_log = bool(
+                self.router_norm_logger is not None and self.router_norm_logger.should_log(step_val)
+            )
+
+        @torch.no_grad()
+        def _log_non_finite(tag: str, x: Optional[torch.Tensor]):
+            if (not do_router_norm_log) or (x is None):
+                return
+            xf = x.detach().float()
+            numel = int(xf.numel())
+            if numel == 0:
+                return
+            finite = torch.isfinite(xf)
+            n_finite = int(finite.sum().item())
+            if n_finite == numel:
+                return
+            n_nan = int(torch.isnan(xf).sum().item())
+            n_inf = int(torch.isinf(xf).sum().item())
+            layer_repr = "NA" if layer_idx is None else str(int(layer_idx))
+            print(
+                f"[RouterNorm][NonFinite] step={step_val} layer={layer_repr} tag={tag} "
+                f"finite={n_finite}/{numel} nan={n_nan} inf={n_inf}"
+            )
+
         # gate 默认：全 1（不路由）
         if hier:
             # local logits: [B,T,H,S]  (head_dim -> S)
@@ -1872,12 +3286,28 @@ class PaTHAttention(nn.Module):
             # rel1: [B,H,T,T]
         rel1 = None
         if rel_selection in ("rel1", "all"):
-            # gate1_c = gate1.unsqueeze(-1)
-            if not shift_sep_use:
-                rel1 = torch.einsum("b t h s, s t n -> b h t n", gate1 * q_s, P_s)
+            if do_router_norm:
+                rel1 = apply_router_norm_mode(
+                    q_like=q_s,
+                    gate=gate1,
+                    p_s=P_s,
+                    router_norm=self.router_norm,
+                    cfg=self.router_norm_cfg,
+                    shift_sep_use=bool(shift_sep_use),
+                    logger=self.router_norm_logger,
+                    step=step_val,
+                    layer_idx=layer_idx,
+                    tensor_name="q_s",
+                    gate_name="gate1",
+                    emit_header=emit_header,
+                )
+                emit_header = False
             else:
-                gate1_c = gate1.unsqueeze(-1)
-                rel1 = torch.einsum("b t h s c, s c t n -> b h t n", gate1_c * q_s, P_s)
+                if not shift_sep_use:
+                    rel1 = torch.einsum("b t h s, s t n -> b h t n", gate1 * q_s, P_s)
+                else:
+                    gate1_c = gate1.unsqueeze(-1)
+                    rel1 = torch.einsum("b t h s c, s c t n -> b h t n", gate1_c * q_s, P_s)
 
             if self.rel1_coe is not None:
                 # rel1_coe: [H] or [H,1,1] -> broadcast to [B,H,T,T]
@@ -1889,7 +3319,11 @@ class PaTHAttention(nn.Module):
         if rel_selection in ("rel2", "all"):
             # q_corr: [B,T,H,D] = M W
             if not shift_sep_use:
-                q_corr = torch.einsum("b h t j, b j h d -> b t h d", M.to(compute_dtype), w0)
+                m_used = M.to(compute_dtype)
+                _log_non_finite("M", m_used)
+                _log_non_finite("w0", w0)
+                q_corr = torch.einsum("b h t j, b j h d -> b t h d", m_used, w0)
+                _log_non_finite("q_corr", q_corr)
                 if hier:
                     local_logits2 = self.local_router2(q_corr)  # [B,T,H,S]
 
@@ -1901,29 +3335,76 @@ class PaTHAttention(nn.Module):
                     mix_logits2 = mix_logits2
                     gate2 = torch.softmax(mix_logits2, dim=-1)  # [B,T,H,S]
                 qcorr_s = q_corr.view(B, T, H, S, d_chunk).sum(dim=-1)
-                rel2 = torch.einsum("b t h s, s t n -> b h t n", gate2 * qcorr_s, P_s)
+                _log_non_finite("qcorr_s", qcorr_s)
+                if do_router_norm:
+                    rel2 = apply_router_norm_mode(
+                        q_like=qcorr_s,
+                        gate=gate2,
+                        p_s=P_s,
+                        router_norm=self.router_norm,
+                        cfg=self.router_norm_cfg,
+                        shift_sep_use=False,
+                        logger=self.router_norm_logger,
+                        step=step_val,
+                        layer_idx=layer_idx,
+                        tensor_name="qcorr_s",
+                        gate_name="gate2",
+                        emit_header=emit_header,
+                    )
+                    emit_header = False
+                else:
+                    rel2 = torch.einsum("b t h s, s t n -> b h t n", gate2 * qcorr_s, P_s)
             else:
-                q_corr = torch.einsum("b h t j, b j h d -> b t h d", M.to(compute_dtype), w0)
+                m_used = M.to(compute_dtype)
+                _log_non_finite("M", m_used)
+                _log_non_finite("w0", w0)
+                q_corr = torch.einsum("b h t j, b j h d -> b t h d", m_used, w0)
+                _log_non_finite("q_corr", q_corr)
                 qcorr_s = q_corr.view(B, T, H, S, d_chunk)
-                gate2_c = gate2.unsqueeze(-1)
-                rel2 = torch.einsum("b t h s c, s c t n -> b h t n", gate2_c * qcorr_s, P_s)
+                _log_non_finite("qcorr_s", qcorr_s)
+                if do_router_norm:
+                    rel2 = apply_router_norm_mode(
+                        q_like=qcorr_s,
+                        gate=gate2,
+                        p_s=P_s,
+                        router_norm=self.router_norm,
+                        cfg=self.router_norm_cfg,
+                        shift_sep_use=True,
+                        logger=self.router_norm_logger,
+                        step=step_val,
+                        layer_idx=layer_idx,
+                        tensor_name="qcorr_s",
+                        gate_name="gate2",
+                        emit_header=emit_header,
+                    )
+                    emit_header = False
+                else:
+                    gate2_c = gate2.unsqueeze(-1)
+                    rel2 = torch.einsum("b t h s c, s c t n -> b h t n", gate2_c * qcorr_s, P_s)
 
             if self.wavelet_coe is not None:
                 rel2 = rel2 * self.wavelet_coe
 
         # combine
         if rel_selection == "rel1":
-            rel = rel1
+            rel_raw = rel1
+            coe_for_rel = 1.0
+            rel = rel_raw
         elif rel_selection == "rel2":
-            rel = -rel2
+            rel_raw = -rel2
+            coe_for_rel = 1.0
+            rel = rel_raw
         elif rel_selection == "all":
-            rel = rel1 - rel2
+            rel_raw = rel1 - rel2
             coe_for_rel = self.coe_for_rel
-            if isinstance(coe_for_rel, torch.Tensor) and coe_for_rel.requires_grad:
-                coe_for_rel = torch.sigmoid(coe_for_rel)
-            rel = coe_for_rel * rel
+            # if isinstance(coe_for_rel, torch.Tensor) and coe_for_rel.requires_grad:
+            #     coe_for_rel = torch.sigmoid(coe_for_rel)
+            coe_for_rel = coe_for_rel * float(getattr(config, "rel_zoom_in_coe", 1.0))
+            rel = coe_for_rel * rel_raw
         else:
             raise ValueError(f"Unknown rel_selection={rel_selection}")
+        self._rel_last_raw_logits = rel_raw
+        self._rel_last_coe_value = coe_for_rel
 
         # analyzer update: only when q_corr is available (or pass None and handle it in analyzer)
         if scale_wise_analyzer is not None and (E_base_raw is not None) and (q_corr is not None):
@@ -2009,6 +3490,8 @@ class PaTHAttention(nn.Module):
         router1=None,
         router2=None,
         config=None,
+        global_step=None,
+        router_log_every=None,
     ):
         # === (A) head 对齐：先沿用你现在的 Hw 对齐（但见下文我建议改成 Hq 对齐） ===
         Hw = w.shape[2]
@@ -2028,14 +3511,6 @@ class PaTHAttention(nn.Module):
         E_base_raw, M_base, strict_WK, A = path_ut_base_raw(
             q, k, w, beta, compute_dtype=compute_dtype
         )
-
-        # --- baseline attention ---
-        E_base = E_base_raw * scale
-        fill = causal_mask_fill_value(E_base.dtype)
-        E_base = E_base.masked_fill(future, fill)
-        P_base = torch.softmax(E_base, dim=-1)
-        out_base = torch.einsum("b h i j, b j h d -> b i h d", P_base, v.to(compute_dtype))
-
         # --- pick M_used for defining QH in wavelet branch ---
         if use_wavelet_fused_H:
             M_used = path_ut_M_wave_fused(q, w, beta, A, wavelet_dtt, d_chunk=d_chunk, compute_dtype=compute_dtype)
@@ -2057,21 +3532,98 @@ class PaTHAttention(nn.Module):
         #     os._exit(0)
         # --- wavelet rel term ---
 
-        if wavelet_dtt is not None:
+        rel_alpha = float(getattr(config, "rel_alpha", getattr(config, "attn_rel_alpha", self.rel_alpha)))
+        rel_logits_raw = None
+        coe_layer = None
+        if wavelet_dtt is not None and self._rel_layer_enabled(layer_idx, config=config):
             if router1 is not None and router2 is not None:
                 rel = self.wavelet_rel_from_M_scale_router(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype, d_chunk=d_chunk, layer_idx=layer_idx,
-                                                    rel_selection=rel_selection, gate1=router1, gate2=router2,config=config)
+                                                    rel_selection=rel_selection, gate1=router1, gate2=router2,config=config, global_step=global_step)
             else:
-                # rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype,layer_idx=layer_idx, rel_selection=rel_selection, rel1_coe=rel1_coe, rel2_coe=rel2_coe, scale_wise_analyzer=scale_wise_analyzer,
-                #                          E_base_raw=E_base_raw if scale_wise_analyzer is not None else None)
-                rel = wavelet_rel_from_M(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype,layer_idx=layer_idx, rel_selection=rel_selection,
-                                        E_base_raw=E_base_raw if analyzer is not None else None)
-
+                raise ValueError("router1 and router2 must be provided when wavelet_dtt is not None")
             # optional ablation on rel
             if ablate is not None and layer_idx in ablate:
                 for h in ablate[layer_idx]:
                     rel[:, h].zero_()
-            E_wav_raw = E_base_raw + rel
+            rel_logits_raw = self._rel_last_raw_logits if torch.is_tensor(self._rel_last_raw_logits) else rel
+            coe_layer = self._rel_last_coe_value
+            if coe_layer is None:
+                coe_layer = 1.0
+            coe_layer = rel_alpha * coe_layer
+            # final logits: z = base + alpha * rel
+            E_wav_raw = E_base_raw + rel_alpha * rel
+            
+            def _to_int_or_none(x):
+                if x is None:
+                    return None
+                if isinstance(x, torch.Tensor):
+                    if x.numel() != 1:
+                        return None
+                    x = x.detach().item()
+                try:
+                    return int(x)
+                except Exception:
+                    return None
+
+            step_val = global_step
+            if step_val is None and config is not None:
+                step_val = getattr(config, "router_global_step", None)
+            step_val = _to_int_or_none(step_val)
+
+            log_every = router_log_every
+            if log_every is None and config is not None:
+                log_every = getattr(config, "router_log_every", 500)
+            log_every = _to_int_or_none(log_every)
+
+            should_log = (
+                self.training
+                and step_val is not None
+                and log_every is not None
+                and log_every > 0
+                and step_val >= 0
+                and (step_val % log_every == 0)
+            )
+            if should_log:
+                with torch.no_grad():
+                    eps = 1e-12
+                    rel_abs = rel.detach().float().abs()
+                    base_abs = E_base_raw.detach().float().abs()
+                    rel_abs_mean = rel_abs.mean().item()
+                    base_abs_mean = base_abs.mean().item()
+                    # More stable "average magnitude ratio": mean(|rel|) / mean(|E_base_raw|).
+                    abs_ratio_mean = rel_abs_mean / max(base_abs_mean, eps)
+                    # Keep an element-wise ratio monitor with a practical denominator floor.
+                    denom_floor = max(base_abs_mean * 1e-2, 1e-6)
+                    abs_ratio_elem_mean = (rel_abs / base_abs.clamp_min(denom_floor)).mean().item()
+
+                    p = rel_abs.reshape(-1)
+                    q_prob = base_abs.reshape(-1)
+                    p = p / p.sum().clamp_min(eps)
+                    q_prob = q_prob / q_prob.sum().clamp_min(eps)
+                    m = 0.5 * (p + q_prob)
+
+                    p_log = p.clamp_min(eps).log()
+                    q_log = q_prob.clamp_min(eps).log()
+                    m_log = m.clamp_min(eps).log()
+                    js_div = 0.5 * ((p * (p_log - m_log)).sum() + (q_prob * (q_log - m_log)).sum())
+                    js_sim = 1.0 - (js_div / math.log(2.0)).item()
+                    js_sim = max(0.0, min(1.0, js_sim))
+
+                msg = (
+                    f"[wavelet rel stats] layer={layer_idx} step={step_val} "
+                    f"abs_ratio_mean={abs_ratio_mean:.6e} "
+                    f"abs_ratio_elem_mean={abs_ratio_elem_mean:.6e} "
+                    f"rel_abs_mean={rel_abs_mean:.6e} base_abs_mean={base_abs_mean:.6e} "
+                    f"js_sim={js_sim:.6f}"
+                )
+                logger_obj = getattr(self, "logger", None)
+                if logger_obj is not None:
+                    try:
+                        logger_obj.info(msg)
+                    except Exception:
+                        print(msg)
+                else:
+                    print(msg)
         else:
             rel = None
             E_wav_raw = E_base_raw
@@ -2098,7 +3650,23 @@ class PaTHAttention(nn.Module):
         E_wav = E_wav_raw * scale
         wave_fill = causal_mask_fill_value(E_wav.dtype)
         E_wav = E_wav.masked_fill(future, wave_fill)
+        self._log_attn_margin_distance(
+            layer_idx=layer_idx,
+            masked_logits=E_wav,
+            global_step=global_step,
+        )
         P_wav = torch.softmax(E_wav, dim=-1)
+        self._rel_prepare_debug(
+            layer_idx=layer_idx,
+            global_step=global_step,
+            base_logits_tensor=E_base_raw,
+            total_logits_tensor=E_wav_raw,
+            rel_logits_tensor=rel_logits_raw,
+            coe_value=coe_layer,
+            attention_probs_detached=P_wav,
+        )
+        self._debug_update_eval_stats(layer_idx, E_base_raw, rel, attn_weights=P_wav)
+        self.update_stats(E_base_raw, rel, layer_idx, rel_alpha=rel_alpha)
         out_wav = torch.einsum("b h i j, b j h d -> b i h d", P_wav, v.to(compute_dtype))
 
         if analyzer is not None and rel is not None:
@@ -2109,7 +3677,7 @@ class PaTHAttention(nn.Module):
         pwav_logger = analyzer.get("pwav_mean_logger") if isinstance(analyzer, dict) else None
         if pwav_logger is not None:
             pwav_logger.update(layer_idx, out_wav)
-        return out_base, out_wav
+        return out_wav
     def _log_head_vector(self, name: str, vec: torch.Tensor, fmt: str = "{:.4f}", topk: Optional[int] = None):
         try:
             v = vec.detach().float().cpu()
@@ -2154,9 +3722,12 @@ class PaTHAttention(nn.Module):
         k = self.k_proj(hidden_states)           # [B,T,H*d]
         v = self.v_proj(hidden_states)           # [B,T,H*d]
         w = self.w_proj(hidden_states)           # [B,T,H*R*d]
+        global_step = kwargs.get("global_step", getattr(self.config, "router_global_step", None))
         router1, router2 = None, None
         record_router1, record_router2 = None, None
-        if self.config.wavelet_router:
+        rel_use = self._rel_layer_enabled(self.layer_idx, self.config)
+        router_active = bool(self.config.wavelet_router) and bool(rel_use)
+        if router_active:
             B = w.size(0)
             S=8
             H= self.num_heads
@@ -2500,7 +4071,7 @@ class PaTHAttention(nn.Module):
 
                 # o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
                 
-                out_base, o = self.path_attention_with_wavelet_QH(
+                o = self.path_attention_with_wavelet_QH(
                     q=q, k=k, v=v,
                     w=w, beta=beta,
                     wavelet_dtt=wavelet_decay_table,
@@ -2513,9 +4084,11 @@ class PaTHAttention(nn.Module):
                     layer_idx=self.layer_idx,
                     ablate=ablate,
                     rel_selection=self.config.rel_selection,
-                    router1=router1 if self.config.wavelet_router else None,
-                    router2=router2 if self.config.wavelet_router else None,
+                    router1=router1 if router_active else None,
+                    router2=router2 if router_active else None,
                     config=self.config,
+                    global_step=global_step,
+                    router_log_every=getattr(self.config, "router_log_every", 500),
                 )                
             else:
                 rot_q, rot_k = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3), self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3)
