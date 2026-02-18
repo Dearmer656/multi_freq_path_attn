@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Tuple
+from collections import deque
 
 import os
 from pathlib import Path
@@ -1567,12 +1568,638 @@ def _quantiles_flat(x: torch.Tensor, qs=(0.1, 0.5, 0.9, 0.95, 0.99)):
     else:
         y = y.float()
     y = y.flatten()
+    y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
     if y.numel() == 0:
         return {f"p{int(q*100)}": float("nan") for q in qs}
     out = {}
     for q in qs:
         out[f"p{int(q*100)}"] = torch.quantile(y, q).item()
     return out
+
+@torch.no_grad()
+def _monitor_tensor_stats_bthd(
+    x: Optional[torch.Tensor],
+    *,
+    max_tokens: int = 64,
+    max_heads: int = 4,
+):
+    if x is None:
+        return {
+            "mean": float("nan"),
+            "std": float("nan"),
+            "abs_p99": float("nan"),
+            "norm_p50": float("nan"),
+            "norm_p90": float("nan"),
+            "norm_p99": float("nan"),
+        }
+    y = x.detach().float()
+    if y.dim() == 4:
+        _, T, H, D = y.shape
+        t_take = max(1, min(int(max_tokens), int(T)))
+        h_take = max(1, min(int(max_heads), int(H)))
+        if t_take < T:
+            t_idx = torch.linspace(0, T - 1, steps=t_take, device=y.device).long()
+            y = y.index_select(1, t_idx)
+        if h_take < H:
+            h_idx = torch.linspace(0, H - 1, steps=h_take, device=y.device).long()
+            y = y.index_select(2, h_idx)
+        vec = y.reshape(-1, D)
+    else:
+        flat_tmp = y.reshape(-1)
+        vec = flat_tmp.unsqueeze(-1)
+    flat = y.reshape(-1)
+    if flat.numel() == 0:
+        return {
+            "mean": float("nan"),
+            "std": float("nan"),
+            "abs_p99": float("nan"),
+            "norm_p50": float("nan"),
+            "norm_p90": float("nan"),
+            "norm_p99": float("nan"),
+        }
+    abs_q = _quantiles_flat(flat.abs(), qs=(0.99,))
+    norm = torch.linalg.vector_norm(vec, ord=2, dim=-1)
+    norm_q = _quantiles_flat(norm, qs=(0.5, 0.9, 0.99))
+    return {
+        "mean": float(flat.mean().item()),
+        "std": float(flat.std(unbiased=False).item()),
+        "abs_p99": float(abs_q["p99"]),
+        "norm_p50": float(norm_q["p50"]),
+        "norm_p90": float(norm_q["p90"]),
+        "norm_p99": float(norm_q["p99"]),
+    }
+
+@torch.no_grad()
+def _monitor_scalar_stats(x: Optional[torch.Tensor]):
+    if x is None:
+        return {"mean": float("nan"), "p50": float("nan"), "p90": float("nan"), "p99": float("nan")}
+    y = x.detach().float().reshape(-1)
+    if y.numel() == 0:
+        return {"mean": float("nan"), "p50": float("nan"), "p90": float("nan"), "p99": float("nan")}
+    q = _quantiles_flat(y, qs=(0.5, 0.9, 0.99))
+    return {
+        "mean": float(y.mean().item()),
+        "p50": float(q["p50"]),
+        "p90": float(q["p90"]),
+        "p99": float(q["p99"]),
+    }
+
+@torch.no_grad()
+def _monitor_flat_stats(x: Optional[torch.Tensor]):
+    if x is None:
+        return {"mean": float("nan"), "std": float("nan"), "abs_p99": float("nan")}
+    y = x.detach().float().reshape(-1)
+    if y.numel() == 0:
+        return {"mean": float("nan"), "std": float("nan"), "abs_p99": float("nan")}
+    q = _quantiles_flat(y.abs(), qs=(0.99,))
+    return {
+        "mean": float(y.mean().item()),
+        "std": float(y.std(unbiased=False).item()),
+        "abs_p99": float(q["p99"]),
+    }
+
+@torch.no_grad()
+def _monitor_attn_prob_stats(
+    attn_probs: Optional[torch.Tensor],
+    *,
+    max_queries: int = 64,
+    max_heads: int = 4,
+):
+    if attn_probs is None:
+        return {
+            "entropy_mean": float("nan"),
+            "entropy_p50": float("nan"),
+            "entropy_p90": float("nan"),
+            "entropy_p99": float("nan"),
+            "top1_mean": float("nan"),
+            "top1_p50": float("nan"),
+            "top1_p90": float("nan"),
+            "top1_p99": float("nan"),
+            "margin_mean": float("nan"),
+            "margin_p50": float("nan"),
+            "margin_p90": float("nan"),
+            "margin_p99": float("nan"),
+        }
+    p = attn_probs.detach().float()
+    if p.dim() != 4:
+        return {
+            "entropy_mean": float("nan"),
+            "entropy_p50": float("nan"),
+            "entropy_p90": float("nan"),
+            "entropy_p99": float("nan"),
+            "top1_mean": float("nan"),
+            "top1_p50": float("nan"),
+            "top1_p90": float("nan"),
+            "top1_p99": float("nan"),
+            "margin_mean": float("nan"),
+            "margin_p50": float("nan"),
+            "margin_p90": float("nan"),
+            "margin_p99": float("nan"),
+        }
+
+    _, H, T, _ = p.shape
+    h_take = max(1, min(int(max_heads), int(H)))
+    q_take = max(1, min(int(max_queries), int(T)))
+    if h_take < H:
+        h_idx = torch.linspace(0, H - 1, steps=h_take, device=p.device).long()
+        p = p.index_select(1, h_idx)
+    if q_take < T:
+        q_idx = torch.linspace(0, T - 1, steps=q_take, device=p.device).long()
+        p = p.index_select(2, q_idx)
+
+    dist = p.reshape(-1, p.shape[-1]).clamp_min(1e-12)
+    ent = -(dist * dist.log()).sum(dim=-1)
+    top2 = torch.topk(dist, k=min(2, dist.shape[-1]), dim=-1).values
+    top1 = top2[..., 0]
+    if top2.shape[-1] > 1:
+        margin = top2[..., 0] - top2[..., 1]
+    else:
+        margin = torch.zeros_like(top1)
+
+    q_ent = _quantiles_flat(ent, qs=(0.5, 0.9, 0.99))
+    q_top1 = _quantiles_flat(top1, qs=(0.5, 0.9, 0.99))
+    q_margin = _quantiles_flat(margin, qs=(0.5, 0.9, 0.99))
+    return {
+        "entropy_mean": float(ent.mean().item()),
+        "entropy_p50": float(q_ent["p50"]),
+        "entropy_p90": float(q_ent["p90"]),
+        "entropy_p99": float(q_ent["p99"]),
+        "top1_mean": float(top1.mean().item()),
+        "top1_p50": float(q_top1["p50"]),
+        "top1_p90": float(q_top1["p90"]),
+        "top1_p99": float(q_top1["p99"]),
+        "margin_mean": float(margin.mean().item()),
+        "margin_p50": float(q_margin["p50"]),
+        "margin_p90": float(q_margin["p90"]),
+        "margin_p99": float(q_margin["p99"]),
+    }
+
+
+class WaveletCondFiLMv2StatsMeter:
+    def __init__(self, window: int = 200):
+        self.window = max(1, int(window))
+        self.sat_s = deque(maxlen=self.window)
+        self.sat_t = deque(maxlen=self.window)
+        self.grad_s = deque(maxlen=self.window)
+        self.grad_t = deque(maxlen=self.window)
+        self.broken = deque(maxlen=self.window)
+
+    @staticmethod
+    def _median_finite(vals):
+        finite = [float(v) for v in vals if math.isfinite(float(v))]
+        if len(finite) == 0:
+            return float("nan")
+        finite.sort()
+        n = len(finite)
+        m = n // 2
+        if (n % 2) == 1:
+            return float(finite[m])
+        return float(0.5 * (finite[m - 1] + finite[m]))
+
+    def update(self, *, sat_s: float, sat_t: float, grad_s: float, grad_t: float, broken: bool):
+        self.sat_s.append(float(sat_s))
+        self.sat_t.append(float(sat_t))
+        self.grad_s.append(float(grad_s))
+        self.grad_t.append(float(grad_t))
+        self.broken.append(bool(broken))
+
+    def detect(self, *, sat_thresh: float = 0.7, grad_eps: float = 1e-6):
+        if len(self.sat_s) == 0:
+            return False, False, {}
+        broken_window = any(bool(x) for x in self.broken)
+        sat_s_mean = float(sum(self.sat_s) / max(1, len(self.sat_s)))
+        sat_t_mean = float(sum(self.sat_t) / max(1, len(self.sat_t)))
+        grad_s_med = self._median_finite(self.grad_s)
+        grad_t_med = self._median_finite(self.grad_t)
+        locked_window = (
+            len(self.sat_s) >= self.window
+            and sat_s_mean > float(sat_thresh)
+            and sat_t_mean > float(sat_thresh)
+            and math.isfinite(grad_s_med)
+            and math.isfinite(grad_t_med)
+            and grad_s_med < float(grad_eps)
+            and grad_t_med < float(grad_eps)
+        )
+        return bool(broken_window), bool(locked_window), {
+            "sat_s_mean": sat_s_mean,
+            "sat_t_mean": sat_t_mean,
+            "grad_s_med": grad_s_med,
+            "grad_t_med": grad_t_med,
+        }
+
+
+class WaveletCondFiLM_v2(nn.Module):
+    """
+    Query-conditioned, bounded FiLM modulation for attention outputs.
+    Default: per-token scalar scale/shift applied as out = out * scale + shift.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_wavelet: Optional[int] = None,
+        hidden: int = 128,
+        alpha: float = 0.1,
+        beta: float = 0.1,
+        clamp: float = 8.0,
+        per_token_scalar: bool = True,
+        print_every: int = 100,
+        lock_window: int = 200,
+        lock_sat_thresh: float = 0.7,
+        lock_grad_eps: float = 1e-6,
+        update_eps: float = 1e-8,
+        grad_clip_value: float = 0.0,
+        use_full_backward_hook: bool = False,
+    ):
+        super().__init__()
+        self.d_model = int(d_model)
+        self.d_wavelet = None if d_wavelet is None else int(d_wavelet)
+        self.hidden = max(1, int(hidden))
+        self.alpha = float(alpha)
+        self.beta = float(beta)
+        self.clamp = float(clamp)
+        self.per_token_scalar = bool(per_token_scalar)
+        self.print_every = max(1, int(print_every))
+        self.lock_sat_thresh = float(lock_sat_thresh)
+        self.lock_grad_eps = float(lock_grad_eps)
+        self.update_eps = float(update_eps)
+        self.grad_clip_value = max(0.0, float(grad_clip_value))
+        self.use_full_backward_hook = bool(use_full_backward_hook)
+
+        out_dim = 1 if self.per_token_scalar else self.d_model
+        in_dim = self.d_model + (self.d_wavelet if self.d_wavelet is not None else 0)
+
+        self.ln_q = nn.LayerNorm(self.d_model)
+        self.ln_w = nn.LayerNorm(self.d_wavelet) if self.d_wavelet is not None else None
+        self.fc = nn.Linear(in_dim, self.hidden)
+        self.linear_s = nn.Linear(self.hidden, out_dim)
+        self.linear_t = nn.Linear(self.hidden, out_dim)
+
+        nn.init.normal_(self.linear_s.weight, mean=0.0, std=1e-3)
+        nn.init.normal_(self.linear_t.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.linear_s.bias)
+        nn.init.zeros_(self.linear_t.bias)
+
+        self._last_forward = {}
+        self._last_grads = {
+            "s_raw_finite": None,
+            "t_raw_finite": None,
+            "scale_finite": None,
+            "shift_finite": None,
+            "s_raw_abs": float("nan"),
+            "t_raw_abs": float("nan"),
+            "scale_abs": float("nan"),
+            "shift_abs": float("nan"),
+            "lin_s_w_finite": None,
+            "lin_t_w_finite": None,
+            "lin_s_w_abs": float("nan"),
+            "lin_t_w_abs": float("nan"),
+            "module_bwd_finite": None,
+        }
+        self._prev_w_s = None
+        self._prev_w_t = None
+        self._prev_step = None
+        self._last_update = {
+            "s_mean": float("nan"),
+            "s_p90": float("nan"),
+            "t_mean": float("nan"),
+            "t_p90": float("nan"),
+        }
+        self._local_step = 0
+        self._last_log_step = None
+        self._last_warn_step = None
+        self._last_attn_stats = None
+        self.stats_meter = WaveletCondFiLMv2StatsMeter(window=lock_window)
+
+        self.linear_s.weight.register_hook(self._make_grad_hook("lin_s_w"))
+        self.linear_t.weight.register_hook(self._make_grad_hook("lin_t_w"))
+        if self.use_full_backward_hook:
+            self.register_full_backward_hook(self._module_backward_hook)
+
+    @staticmethod
+    def _to_int(step):
+        if step is None:
+            return None
+        if isinstance(step, torch.Tensor):
+            if step.numel() != 1:
+                return None
+            step = step.detach().item()
+        try:
+            return int(step)
+        except Exception:
+            return None
+
+    def _resolve_step(self, step):
+        step_i = self._to_int(step)
+        if step_i is None:
+            self._local_step += 1
+            step_i = int(self._local_step)
+        return int(step_i)
+
+    def _module_backward_hook(self, module, grad_input, grad_output):
+        finite = True
+        try:
+            for g in list(grad_input) + list(grad_output):
+                if isinstance(g, torch.Tensor):
+                    finite = finite and bool(torch.isfinite(g.detach().float()).all().item())
+        except Exception:
+            finite = False
+        self._last_grads["module_bwd_finite"] = bool(finite)
+        return None
+
+    def _make_grad_hook(self, key: str):
+        def _hook(grad: torch.Tensor):
+            g = grad.detach().float()
+            finite = bool(torch.isfinite(g).all().item())
+            abs_mean = float(g.abs().mean().item()) if finite else float("nan")
+            if key == "lin_s_w":
+                self._last_grads["lin_s_w_finite"] = finite
+                self._last_grads["lin_s_w_abs"] = abs_mean
+            elif key == "lin_t_w":
+                self._last_grads["lin_t_w_finite"] = finite
+                self._last_grads["lin_t_w_abs"] = abs_mean
+            if self.grad_clip_value > 0.0 and finite:
+                g_clip = g.clamp(min=-self.grad_clip_value, max=self.grad_clip_value)
+                return g_clip.to(dtype=grad.dtype)
+            return grad
+
+        return _hook
+
+    def _make_act_grad_hook(self, key: str):
+        def _hook(grad: torch.Tensor):
+            g = grad.detach().float()
+            finite = bool(torch.isfinite(g).all().item())
+            abs_mean = float(g.abs().mean().item()) if finite else float("nan")
+            self._last_grads[f"{key}_finite"] = finite
+            self._last_grads[f"{key}_abs"] = abs_mean
+            if self.grad_clip_value > 0.0 and finite:
+                g_clip = g.clamp(min=-self.grad_clip_value, max=self.grad_clip_value)
+                return g_clip.to(dtype=grad.dtype)
+            return grad
+
+        return _hook
+
+    def should_log(self, step=None):
+        step_i = self._resolve_step(step)
+        return (step_i % int(self.print_every)) == 0
+
+    def _safe_corr(self, x: torch.Tensor, y: torch.Tensor):
+        if x.numel() <= 1 or y.numel() <= 1:
+            return float("nan")
+        xc = x - x.mean()
+        yc = y - y.mean()
+        den = (torch.linalg.vector_norm(xc) * torch.linalg.vector_norm(yc)).clamp_min(1e-12)
+        return float((xc * yc).sum().div(den).item())
+
+    def _update_param_delta(self, step_i: int):
+        w_s = self.linear_s.weight.detach().float()
+        w_t = self.linear_t.weight.detach().float()
+        if self._prev_w_s is None or self._prev_w_t is None:
+            self._prev_w_s = w_s.clone()
+            self._prev_w_t = w_t.clone()
+            self._prev_step = int(step_i)
+            self._last_update = {
+                "s_mean": float("nan"),
+                "s_p90": float("nan"),
+                "t_mean": float("nan"),
+                "t_p90": float("nan"),
+            }
+            return
+        if self._prev_step == int(step_i):
+            return
+
+        rs = (w_s - self._prev_w_s).abs() / (self._prev_w_s.abs() + float(self.update_eps))
+        rt = (w_t - self._prev_w_t).abs() / (self._prev_w_t.abs() + float(self.update_eps))
+        qs = _quantiles_flat(rs.reshape(-1), qs=(0.9,))
+        qt = _quantiles_flat(rt.reshape(-1), qs=(0.9,))
+        self._last_update = {
+            "s_mean": float(rs.mean().item()),
+            "s_p90": float(qs["p90"]),
+            "t_mean": float(rt.mean().item()),
+            "t_p90": float(qt["p90"]),
+        }
+        self._prev_w_s = w_s.clone()
+        self._prev_w_t = w_t.clone()
+        self._prev_step = int(step_i)
+
+    def forward(self, q_in: torch.Tensor, attn_out: torch.Tensor, w_ctx: Optional[torch.Tensor] = None):
+        assert q_in.dim() == 3, f"q_in must be [B,T,D], got {tuple(q_in.shape)}"
+        assert attn_out.dim() >= 3, f"attn_out must be [B,T,...], got {tuple(attn_out.shape)}"
+        assert torch.is_floating_point(q_in), f"q_in must be floating, got {q_in.dtype}"
+        assert torch.is_floating_point(attn_out), f"attn_out must be floating, got {attn_out.dtype}"
+        assert q_in.shape[0] == attn_out.shape[0] and q_in.shape[1] == attn_out.shape[1], (
+            tuple(q_in.shape),
+            tuple(attn_out.shape),
+        )
+        assert q_in.shape[-1] == self.d_model, (q_in.shape[-1], self.d_model)
+        if w_ctx is not None:
+            assert w_ctx.dim() == 3, f"w_ctx must be [B,T,Dw], got {tuple(w_ctx.shape)}"
+            assert w_ctx.shape[:2] == q_in.shape[:2], (tuple(w_ctx.shape), tuple(q_in.shape))
+            if self.d_wavelet is not None:
+                assert w_ctx.shape[-1] == self.d_wavelet, (w_ctx.shape[-1], self.d_wavelet)
+
+        out_dtype = attn_out.dtype
+        device_type = attn_out.device.type if isinstance(attn_out, torch.Tensor) else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            q32 = q_in.to(dtype=torch.float32)
+            out32 = attn_out.to(dtype=torch.float32)
+            u = self.ln_q(q32)
+            if w_ctx is not None:
+                w32 = w_ctx.to(dtype=torch.float32)
+                v = self.ln_w(w32) if self.ln_w is not None else w32
+                z = torch.cat([u, v], dim=-1)
+            else:
+                z = u
+
+            h = F.gelu(self.fc(z))
+            s_raw = self.linear_s(h)
+            t_raw = self.linear_t(h)
+            s_raw_clamped = s_raw.clamp(min=-self.clamp, max=self.clamp)
+            t_raw_clamped = t_raw.clamp(min=-self.clamp, max=self.clamp)
+            scale = 1.0 + float(self.alpha) * torch.tanh(s_raw_clamped)
+            shift = float(self.beta) * torch.tanh(t_raw_clamped)
+
+            if self.training and torch.is_grad_enabled():
+                if s_raw.requires_grad:
+                    s_raw.register_hook(self._make_act_grad_hook("s_raw"))
+                if t_raw.requires_grad:
+                    t_raw.register_hook(self._make_act_grad_hook("t_raw"))
+                if scale.requires_grad:
+                    scale.register_hook(self._make_act_grad_hook("scale"))
+                if shift.requires_grad:
+                    shift.register_hook(self._make_act_grad_hook("shift"))
+
+            scale_b = scale
+            shift_b = shift
+            while scale_b.dim() < out32.dim():
+                scale_b = scale_b.unsqueeze(-1)
+                shift_b = shift_b.unsqueeze(-1)
+            out_mod = out32 * scale_b + shift_b
+
+            sat_thr = max(0.0, float(self.clamp) - 0.5)
+            sat_s = float((s_raw_clamped.detach().abs() > sat_thr).float().mean().item())
+            sat_t = float((t_raw_clamped.detach().abs() > sat_thr).float().mean().item())
+
+            s_flat = s_raw_clamped.detach().reshape(-1).float()
+            t_flat = t_raw_clamped.detach().reshape(-1).float()
+            sc_flat = scale.detach().reshape(-1).float()
+            sh_flat = shift.detach().reshape(-1).float()
+            s_q = _quantiles_flat(s_flat, qs=(0.5, 0.9))
+            t_q = _quantiles_flat(t_flat, qs=(0.5, 0.9))
+            sc_q = _quantiles_flat(sc_flat, qs=(0.5, 0.9))
+            sh_q = _quantiles_flat(sh_flat, qs=(0.5, 0.9))
+
+            q_abs_tok = q32.detach().abs().mean(dim=-1).reshape(-1)
+            s_abs_tok = s_raw_clamped.detach().abs().mean(dim=-1).reshape(-1)
+            corr_q_s = self._safe_corr(q_abs_tok, s_abs_tok)
+
+            self._last_forward = {
+                "nf_s_raw": int((not torch.isfinite(s_raw).all().item())),
+                "nf_t_raw": int((not torch.isfinite(t_raw).all().item())),
+                "nf_scale": int((not torch.isfinite(scale).all().item())),
+                "nf_shift": int((not torch.isfinite(shift).all().item())),
+                "sat_s": sat_s,
+                "sat_t": sat_t,
+                "s_mean": float(s_flat.mean().item()),
+                "s_p50": float(s_q["p50"]),
+                "s_p90": float(s_q["p90"]),
+                "s_max": float(s_flat.max().item()),
+                "t_mean": float(t_flat.mean().item()),
+                "t_p50": float(t_q["p50"]),
+                "t_p90": float(t_q["p90"]),
+                "t_max": float(t_flat.max().item()),
+                "scale_mean": float(sc_flat.mean().item()),
+                "scale_p50": float(sc_q["p50"]),
+                "scale_p90": float(sc_q["p90"]),
+                "shift_mean": float(sh_flat.mean().item()),
+                "shift_p50": float(sh_q["p50"]),
+                "shift_p90": float(sh_q["p90"]),
+                "corr_q_s": float(corr_q_s),
+            }
+
+        return out_mod.to(dtype=out_dtype)
+
+    def set_attn_stats(self, attn_stats: Optional[dict]):
+        self._last_attn_stats = attn_stats
+
+    def _nf_flag(self, v):
+        if v is None:
+            return -1
+        return 0 if bool(v) else 1
+
+    def log_if_needed(self, *, step=None, layer_idx: Optional[int] = None, logger_obj=None):
+        step_i = self._resolve_step(step)
+        if self._last_log_step == step_i:
+            return
+        if (step_i % int(self.print_every)) != 0:
+            return
+        self._last_log_step = int(step_i)
+        if len(self._last_forward) == 0:
+            return
+
+        self._update_param_delta(step_i)
+
+        grad_s = float(self._last_grads.get("lin_s_w_abs", float("nan")))
+        grad_t = float(self._last_grads.get("lin_t_w_abs", float("nan")))
+        broken_now = bool(
+            self._last_forward.get("nf_s_raw", 0)
+            or self._last_forward.get("nf_t_raw", 0)
+            or self._last_forward.get("nf_scale", 0)
+            or self._last_forward.get("nf_shift", 0)
+            or (self._last_grads.get("scale_finite") is False)
+            or (self._last_grads.get("shift_finite") is False)
+        )
+
+        self.stats_meter.update(
+            sat_s=float(self._last_forward["sat_s"]),
+            sat_t=float(self._last_forward["sat_t"]),
+            grad_s=grad_s,
+            grad_t=grad_t,
+            broken=broken_now,
+        )
+        broken_win, locked_win, lock_payload = self.stats_meter.detect(
+            sat_thresh=float(self.lock_sat_thresh),
+            grad_eps=float(self.lock_grad_eps),
+        )
+
+        lid = -1 if layer_idx is None else int(layer_idx)
+        msg = (
+            f"[wavelet condfilm_v2 stats] layer={lid} step={int(step_i)} "
+            f"nf_fwd[s_raw,t_raw,scale,shift]={self._last_forward['nf_s_raw']},"
+            f"{self._last_forward['nf_t_raw']},{self._last_forward['nf_scale']},{self._last_forward['nf_shift']} "
+            f"nf_grad[s_raw,t_raw,scale,shift,lin_s,lin_t]={self._nf_flag(self._last_grads.get('s_raw_finite'))},"
+            f"{self._nf_flag(self._last_grads.get('t_raw_finite'))},"
+            f"{self._nf_flag(self._last_grads.get('scale_finite'))},"
+            f"{self._nf_flag(self._last_grads.get('shift_finite'))},"
+            f"{self._nf_flag(self._last_grads.get('lin_s_w_finite'))},"
+            f"{self._nf_flag(self._last_grads.get('lin_t_w_finite'))} | "
+            f"sat_s={self._last_forward['sat_s']:.6e} sat_t={self._last_forward['sat_t']:.6e} | "
+            f"s_raw mean={self._last_forward['s_mean']:.6e} p50={self._last_forward['s_p50']:.6e} "
+            f"p90={self._last_forward['s_p90']:.6e} max={self._last_forward['s_max']:.6e} | "
+            f"t_raw mean={self._last_forward['t_mean']:.6e} p50={self._last_forward['t_p50']:.6e} "
+            f"p90={self._last_forward['t_p90']:.6e} max={self._last_forward['t_max']:.6e} | "
+            f"scale mean={self._last_forward['scale_mean']:.6e} p50={self._last_forward['scale_p50']:.6e} "
+            f"p90={self._last_forward['scale_p90']:.6e} | "
+            f"shift mean={self._last_forward['shift_mean']:.6e} p50={self._last_forward['shift_p50']:.6e} "
+            f"p90={self._last_forward['shift_p90']:.6e} | "
+            f"upd_ratio_s mean={self._last_update['s_mean']:.6e} p90={self._last_update['s_p90']:.6e} "
+            f"upd_ratio_t mean={self._last_update['t_mean']:.6e} p90={self._last_update['t_p90']:.6e} | "
+            f"grad_abs lin_s={grad_s:.6e} lin_t={grad_t:.6e} | "
+            f"corr_abs_q_s={self._last_forward['corr_q_s']:.6e} | "
+            f"broken={int(broken_win)} locked={int(locked_win)}"
+        )
+        if isinstance(self._last_attn_stats, dict):
+            msg = (
+                msg
+                + " | "
+                + f"attn_entropy mean={self._last_attn_stats.get('entropy_mean', float('nan')):.6e} "
+                + f"attn_top1 mean={self._last_attn_stats.get('top1_mean', float('nan')):.6e} "
+                + f"attn_margin mean={self._last_attn_stats.get('margin_mean', float('nan')):.6e}"
+            )
+        if logger_obj is not None:
+            try:
+                logger_obj.info(msg)
+            except Exception:
+                print(msg)
+        else:
+            print(msg)
+
+        if (broken_win or locked_win) and (self._last_warn_step != int(step_i)):
+            self._last_warn_step = int(step_i)
+            warn = (
+                f"[wavelet condfilm_v2 alert] layer={lid} step={int(step_i)} "
+                f"broken={int(broken_win)} locked={int(locked_win)} "
+                f"sat_s_mean={lock_payload.get('sat_s_mean', float('nan')):.6e} "
+                f"sat_t_mean={lock_payload.get('sat_t_mean', float('nan')):.6e} "
+                f"grad_s_med={lock_payload.get('grad_s_med', float('nan')):.6e} "
+                f"grad_t_med={lock_payload.get('grad_t_med', float('nan')):.6e}"
+            )
+            if logger_obj is not None:
+                try:
+                    logger_obj.warning(warn)
+                except Exception:
+                    print(warn)
+            else:
+                print(warn)
+
+
+def build_wavelet_condfilm_v2_param_group(
+    model: nn.Module,
+    *,
+    base_lr: float,
+    lr_mult: float = 0.1,
+    weight_decay: float = 0.0,
+):
+    params = [p for n, p in model.named_parameters() if ("wavelet_cond_film_v2" in n and p.requires_grad)]
+    if len(params) == 0:
+        return []
+    return [
+        {
+            "params": params,
+            "lr": float(base_lr) * float(lr_mult),
+            "weight_decay": float(weight_decay),
+        }
+    ]
 
 @torch.no_grad()
 def _router_gate_stats(
@@ -1933,7 +2560,7 @@ class PaTHAttention(nn.Module):
         # NEW ↓↓↓
         num_harmonics: int = 1,   # rank 数，=1 退化为原版
         use_wavelet_beta: bool = False,
-        wavelet_mode: str = "additive",   # "additive" | "softmix"
+        wavelet_mode: str = "additive",   # off | router_rel | key_inject | logit_bias | logit_bias_ctxscale_shift_v0 | logit_bias_ctxscale_shift_v0_film | cond_film_v2
         logging_steps: int = 1000,
         wavelet_baseline_use: bool = False,
         attn_pdrop=0.1,
@@ -2062,6 +2689,109 @@ class PaTHAttention(nn.Module):
         self.total_steps = 100000
         self.use_wavelet_beta = use_wavelet_beta
         self.wavelet_mode = wavelet_mode
+        self.wavelet_mode_resolved = self._normalize_wavelet_mode(getattr(config, "wavelet_mode", wavelet_mode))
+        self.wavelet_k1_debug_assert = self._as_bool(getattr(config, "wavelet_k1_debug_assert", False), default=False)
+        self.wavelet_k1_rms_eps = float(getattr(config, "wavelet_k1_rms_eps", 1e-6))
+        self.wavelet_k1_log_sample_tokens = max(1, int(getattr(config, "wavelet_k1_log_sample_tokens", 64)))
+        self.wavelet_k1_log_sample_heads = max(1, int(getattr(config, "wavelet_k1_log_sample_heads", 4)))
+        self.wavelet_k1_local_step = 0
+        self.wavelet_logit_bias_eps = float(getattr(config, "wavelet_logit_bias_eps", 1e-6))
+        self.wavelet_logit_bias_debug_assert = self._as_bool(
+            getattr(config, "wavelet_logit_bias_debug_assert", False), default=False
+        )
+        self.wavelet_logit_bias_clamp_enable = self._as_bool(
+            getattr(config, "wavelet_logit_bias_clamp_enable", True), default=True
+        )
+        self.wavelet_logit_bias_clamp_quantile = float(getattr(config, "wavelet_logit_bias_clamp_quantile", 0.99))
+        self.wavelet_logit_bias_clamp_min = float(getattr(config, "wavelet_logit_bias_clamp_min", 0.0))
+        self.wavelet_logit_bias_clamp_scale = float(getattr(config, "wavelet_logit_bias_clamp_scale", 1.0))
+        self.wavelet_logit_bias_log_sample_tokens = max(
+            1, int(getattr(config, "wavelet_logit_bias_log_sample_tokens", 64))
+        )
+        self.wavelet_logit_bias_log_sample_heads = max(
+            1, int(getattr(config, "wavelet_logit_bias_log_sample_heads", 4))
+        )
+        self.wavelet_logit_bias_local_step = 0
+        self.wavelet_ctxscale_k = 8
+        self.wavelet_ctxscale_tau = float(getattr(config, "wavelet_ctxscale_tau", getattr(config, "tau", 1.0)))
+        self.wavelet_ctxscale_router_rms_eps = float(getattr(config, "wavelet_ctxscale_router_rms_eps", 1e-6))
+        self.wavelet_ctxscale_chunk_q = max(1, int(getattr(config, "wavelet_ctxscale_chunk_q", 128)))
+        self.wavelet_ctxscale_max_log_samples = max(
+            128, int(getattr(config, "wavelet_ctxscale_max_log_samples", 4096))
+        )
+        self.wavelet_ctx_feat_mode = str(getattr(config, "wavelet_ctx_feat_mode", "q_meanH")).strip()
+        self.wavelet_ctx_feat_rms_eps = float(getattr(config, "wavelet_ctx_feat_rms_eps", 1e-6))
+        self.wavelet_ctxscale_g_max = float(getattr(config, "wavelet_ctxscale_g_max", 0.5))
+        self.wavelet_ctxscale_g_bias_max = float(getattr(config, "wavelet_ctxscale_g_bias_max", 4.0))
+        self.wavelet_ctxscale_use_head_gate = self._as_bool(
+            getattr(config, "wavelet_ctxscale_use_head_gate", False), default=False
+        )
+        self.wavelet_ctxscale_scale_dependent_shift = self._as_bool(
+            getattr(config, "wavelet_ctxscale_scale_dependent_shift", False), default=False
+        )
+        self.wavelet_ctxscale_shift_unit_max = float(getattr(config, "wavelet_ctxscale_shift_unit_max", 1.0))
+        self.wavelet_shift_T_mode = str(getattr(config, "wavelet_shift_T_mode", "legacy")).strip().lower()
+        if self.wavelet_shift_T_mode not in ("legacy", "runtime", "train_ref"):
+            self.wavelet_shift_T_mode = "legacy"
+        self.wavelet_shift_T_ref = max(2, int(getattr(config, "wavelet_shift_T_ref", 512)))
+        self.wavelet_basis_control = str(getattr(config, "wavelet_basis_control", "none")).strip().lower()
+        if self.wavelet_basis_control not in ("none", "permute_scales", "random_basis"):
+            self.wavelet_basis_control = "none"
+        self._wavelet_basis_seed_warned = False
+        self._wavelet_basis_perm_cache = {}
+        self._wavelet_basis_random_cache = {}
+        self.wavelet_ctxscale_abs_shift_causal = self._as_bool(
+            getattr(config, "wavelet_ctxscale_abs_shift_causal", False), default=False
+        )
+        self.wavelet_ctxscale_film_hidden = max(8, int(getattr(config, "wavelet_ctxscale_film_hidden", 64)))
+        self.wavelet_ctxscale_film_alpha = float(getattr(config, "wavelet_ctxscale_film_alpha", 0.5))
+        self.wavelet_ctxscale_film_beta = float(getattr(config, "wavelet_ctxscale_film_beta", 0.1))
+        self.wavelet_ctxscale_film_clamp = float(getattr(config, "wavelet_ctxscale_film_clamp", 8.0))
+        self.wavelet_ctxscale_far_only = self._as_bool(
+            getattr(config, "wavelet_ctxscale_far_only", False), default=False
+        )
+        self.wavelet_ctxscale_far_min_delta = max(0, int(getattr(config, "wavelet_ctxscale_far_min_delta", 0)))
+        head_cfg = getattr(config, "wavelet_ctxscale_head_indices", "all")
+        if isinstance(head_cfg, str) and head_cfg.strip().lower() in ("", "all", "*", "none"):
+            self.wavelet_ctxscale_head_indices = None
+        else:
+            parsed_heads = self._parse_int_list(head_cfg, default=[])
+            self.wavelet_ctxscale_head_indices = (
+                sorted(set(int(h) for h in parsed_heads)) if len(parsed_heads) > 0 else None
+            )
+        self.wavelet_condfilm_v2_hidden = max(8, int(getattr(config, "wavelet_condfilm_v2_hidden", 128)))
+        self.wavelet_condfilm_v2_alpha = float(getattr(config, "wavelet_condfilm_v2_alpha", 0.1))
+        self.wavelet_condfilm_v2_beta = float(getattr(config, "wavelet_condfilm_v2_beta", 0.1))
+        self.wavelet_condfilm_v2_clamp = float(getattr(config, "wavelet_condfilm_v2_clamp", 8.0))
+        self.wavelet_condfilm_v2_per_token_scalar = self._as_bool(
+            getattr(config, "wavelet_condfilm_v2_per_token_scalar", True), default=True
+        )
+        self.wavelet_condfilm_v2_print_every = max(1, int(getattr(config, "wavelet_condfilm_v2_print_every", 100)))
+        self.wavelet_condfilm_v2_lock_window = max(1, int(getattr(config, "wavelet_condfilm_v2_lock_window", 200)))
+        self.wavelet_condfilm_v2_lock_sat_thresh = float(
+            getattr(config, "wavelet_condfilm_v2_lock_sat_thresh", 0.7)
+        )
+        self.wavelet_condfilm_v2_lock_grad_eps = float(
+            getattr(config, "wavelet_condfilm_v2_lock_grad_eps", 1e-6)
+        )
+        self.wavelet_condfilm_v2_lr_mult = float(getattr(config, "wavelet_condfilm_v2_lr_mult", 0.1))
+        self.wavelet_condfilm_v2_grad_clip_value = float(
+            getattr(config, "wavelet_condfilm_v2_grad_clip_value", 0.0)
+        )
+        self.wavelet_condfilm_v2_use_full_backward_hook = self._as_bool(
+            getattr(config, "wavelet_condfilm_v2_use_full_backward_hook", False), default=False
+        )
+        self.wavelet_ctxscale_lock_window = max(1, int(getattr(config, "wavelet_ctxscale_lock_window", 300)))
+        self.wavelet_ctxscale_lock_grad_eps = float(getattr(config, "wavelet_ctxscale_lock_grad_eps", 1e-6))
+        self.wavelet_ctxscale_lock_update_eps = float(getattr(config, "wavelet_ctxscale_lock_update_eps", 1e-6))
+        self.wavelet_ctxscale_lock_min_frac = float(getattr(config, "wavelet_ctxscale_lock_min_frac", 0.5))
+        self.wavelet_ctxscale_lock_clamp_abs = float(getattr(config, "wavelet_ctxscale_lock_clamp_abs", 8.0))
+        self.wavelet_gate_grad_clip = float(getattr(config, "wavelet_gate_grad_clip", 1.0))
+        self.wavelet_gate_autofix = self._as_bool(getattr(config, "wavelet_gate_autofix", False), default=False)
+        self.wavelet_gate_autofix_clamp_abs = float(
+            getattr(config, "wavelet_gate_autofix_clamp_abs", self.wavelet_ctxscale_lock_clamp_abs)
+        )
+        self._wavelet_delta_index_cache = {}
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.r = int(num_harmonics)
@@ -2071,6 +2801,116 @@ class PaTHAttention(nn.Module):
             self.num_kv_heads = num_kv_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.kv_dim = self.num_kv_heads * self.head_dim
+        k1_gain_init = float(getattr(config, "wavelet_k1_gain_init", 0.0))
+        self.wavelet_k1_gain = nn.Parameter(
+            torch.full((self.num_kv_heads,), k1_gain_init, dtype=torch.float32)
+        )
+        logit_bias_a_init = float(getattr(config, "wavelet_logit_bias_a_init", -5.0))
+        self.wavelet_logit_bias_a = nn.Parameter(torch.tensor(logit_bias_a_init, dtype=torch.float32))
+        if self.wavelet_ctxscale_use_head_gate:
+            self.wavelet_logit_bias_a_head = nn.Parameter(
+                torch.full((self.num_heads,), logit_bias_a_init, dtype=torch.float32)
+            )
+        else:
+            self.wavelet_logit_bias_a_head = None
+        self._wavelet_gate_local_step = 0
+        self._wavelet_gate_prev_a = None
+        self._wavelet_gate_prev_step = None
+        self._wavelet_gate_last_grad_abs = None
+        self._wavelet_gate_last_grad_p50 = None
+        self._wavelet_gate_last_grad_p90 = None
+        self._wavelet_gate_last_grad_max = None
+        self._wavelet_gate_last_grad_zero_ratio = None
+        self._wavelet_gate_last_grad_finite_ratio = None
+        self._wavelet_gate_last_grad_nonfinite = None
+        self._wavelet_gate_grad_seen = False
+        self._wavelet_gate_last_metrics = None
+        self._wavelet_gate_last_metrics_step = None
+        self._wavelet_gate_locked = False
+        self._wavelet_gate_last_nf_warn_step = None
+        self._wavelet_gate_last_missing_warn_step = None
+        self._wavelet_gate_hist = deque(maxlen=self.wavelet_ctxscale_lock_window)
+        self._wavelet_gate_grad_hook_handle = self.wavelet_logit_bias_a.register_hook(
+            self._capture_wavelet_gate_grad
+        )
+        self._wavelet_gate_grad_hook_param_id = id(self.wavelet_logit_bias_a)
+        self.register_buffer(
+            "wavelet_ctxscale_scales",
+            torch.tensor([2 ** (2 * i) for i in range(self.wavelet_ctxscale_k)], dtype=torch.float32),
+            persistent=False,
+        )
+        self.wavelet_ctx_feat_ln = nn.LayerNorm(self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
+        self.wavelet_ctx_path_ln = nn.LayerNorm(3 * self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
+        self.wavelet_ctx_path_proj = nn.Linear(3 * self.head_dim, self.head_dim, bias=True)
+        self.wavelet_ctx_router = nn.Linear(self.head_dim, self.wavelet_ctxscale_k + 1, bias=True)
+        self.wavelet_shift_ln = nn.LayerNorm(self.hidden_size, eps=getattr(config, "layer_norm_epsilon", 1e-5))
+        self.wavelet_shift_proj = nn.Linear(self.hidden_size, 1, bias=True)
+        film_in_dim = self.wavelet_ctxscale_k + 2
+        self.wavelet_bias_film_ln = nn.LayerNorm(film_in_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
+        self.wavelet_bias_film = nn.Sequential(
+            nn.Linear(film_in_dim, self.wavelet_ctxscale_film_hidden, bias=True),
+            nn.SiLU(),
+            nn.Linear(self.wavelet_ctxscale_film_hidden, 2, bias=True),
+        )
+        nn.init.normal_(self.wavelet_bias_film[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.wavelet_bias_film[-1].bias)
+        # Param-matched non-wavelet bias baseline branch.
+        self.mlp_bias_ctx_feat_ln = nn.LayerNorm(self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
+        self.mlp_bias_ctx_path_ln = nn.LayerNorm(3 * self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
+        self.mlp_bias_ctx_path_proj = nn.Linear(3 * self.head_dim, self.head_dim, bias=True)
+        self.mlp_bias_router = nn.Linear(self.head_dim, self.wavelet_ctxscale_k + 1, bias=True)
+        self.mlp_bias_shift_ln = nn.LayerNorm(self.hidden_size, eps=getattr(config, "layer_norm_epsilon", 1e-5))
+        self.mlp_bias_shift_proj = nn.Linear(self.hidden_size, 1, bias=True)
+        self.mlp_bias_logit_bias_a = nn.Parameter(torch.tensor(logit_bias_a_init, dtype=torch.float32))
+        if self.wavelet_ctxscale_use_head_gate:
+            self.mlp_bias_logit_bias_a_head = nn.Parameter(
+                torch.full((self.num_heads,), logit_bias_a_init, dtype=torch.float32)
+            )
+        else:
+            self.mlp_bias_logit_bias_a_head = None
+        self.mlp_bias_film_ln = nn.LayerNorm(film_in_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
+        self.mlp_bias_film = nn.Sequential(
+            nn.Linear(film_in_dim, self.wavelet_ctxscale_film_hidden, bias=True),
+            nn.SiLU(),
+            nn.Linear(self.wavelet_ctxscale_film_hidden, 2, bias=True),
+        )
+        nn.init.normal_(self.mlp_bias_film[-1].weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.mlp_bias_film[-1].bias)
+        self.mlp_bias_basis_mlp = nn.Sequential(
+            nn.Linear(1, self.head_dim, bias=True),
+            nn.SiLU(),
+            nn.Linear(self.head_dim, self.wavelet_ctxscale_k, bias=True),
+        )
+        self.mlp_bias_basis_ln = nn.LayerNorm(self.wavelet_ctxscale_k, eps=getattr(config, "layer_norm_epsilon", 1e-5))
+        self._mlp_bias_param_count_printed = False
+        self._mlp_bias_param_target = self._ctxscale_param_count(
+            use_mlp=False,
+            include_film=bool(self.wavelet_mode_resolved == "logit_bias_ctxscale_shift_v0_film"),
+        )
+        self._mlp_bias_param_current = self._ctxscale_param_count(
+            use_mlp=True,
+            include_film=bool(self.wavelet_mode_resolved == "logit_bias_ctxscale_shift_v0_film"),
+        )
+        mlp_pad_size = max(0, int(self._mlp_bias_param_target - self._mlp_bias_param_current))
+        self.mlp_bias_param_pad = nn.Parameter(torch.zeros((mlp_pad_size,), dtype=torch.float32))
+        self.wavelet_cond_film_v2 = None
+        self._wavelet_condfilm_v2_last_attn_stats = None
+        if self.wavelet_mode_resolved == "cond_film_v2":
+            self.wavelet_cond_film_v2 = WaveletCondFiLM_v2(
+                d_model=self.hidden_size,
+                d_wavelet=None,
+                hidden=self.wavelet_condfilm_v2_hidden,
+                alpha=self.wavelet_condfilm_v2_alpha,
+                beta=self.wavelet_condfilm_v2_beta,
+                clamp=self.wavelet_condfilm_v2_clamp,
+                per_token_scalar=self.wavelet_condfilm_v2_per_token_scalar,
+                print_every=self.wavelet_condfilm_v2_print_every,
+                lock_window=self.wavelet_condfilm_v2_lock_window,
+                lock_sat_thresh=self.wavelet_condfilm_v2_lock_sat_thresh,
+                lock_grad_eps=self.wavelet_condfilm_v2_lock_grad_eps,
+                grad_clip_value=self.wavelet_condfilm_v2_grad_clip_value,
+                use_full_backward_hook=self.wavelet_condfilm_v2_use_full_backward_hook,
+            )
 
         self.layer_idx = layer_idx
         # Router 局部步数计数（未传全局步数时作为 fallback，每层/每卡独立）
@@ -2337,6 +3177,1436 @@ class PaTHAttention(nn.Module):
             return int(x)
         except Exception:
             return None
+
+    @staticmethod
+    def _normalize_wavelet_mode(mode) -> str:
+        m = str(mode).strip().lower() if mode is not None else "router_rel"
+        if m in ("off", "none", "baseline"):
+            return "off"
+        if m in ("cond_film_v2", "film_v2", "wavelet_condfilm_v2", "waveletcondfilm_v2"):
+            return "cond_film_v2"
+        if m in (
+            "logit_bias_ctxscale_shift_v0_film",
+            "ctxscale_shift_v0_film",
+            "ctxscale_shift_film",
+            "ctxscale_shift_v0+film",
+        ):
+            return "logit_bias_ctxscale_shift_v0_film"
+        if m in ("mlp_bias_baseline_v0", "mlp_bias_baseline", "ctxscale_mlp_bias_baseline_v0"):
+            return "mlp_bias_baseline_v0"
+        if m in ("key_inject", "k1", "key", "key_side"):
+            return "key_inject"
+        if m in ("logit_bias", "bias", "exp_a"):
+            return "logit_bias"
+        if m in ("logit_bias_ctxscale_shift_v0", "ctxscale_shift_v0", "ctxscale_shift"):
+            return "logit_bias_ctxscale_shift_v0"
+        # Keep legacy values routed to old relative-logit path.
+        if m in ("router_rel", "router", "rel", "additive", "softmix"):
+            return "router_rel"
+        if m.startswith("db") or m.startswith("coif") or m.startswith("sym") or m == "haar":
+            return "router_rel"
+        return "router_rel"
+
+    def _k1_should_log(self, *, global_step=None, config=None) -> tuple[bool, int]:
+        step_val = self._to_int_or_none(global_step)
+        if step_val is None and config is not None:
+            step_val = self._to_int_or_none(getattr(config, "router_global_step", None))
+        if step_val is None:
+            self.wavelet_k1_local_step += 1
+            step_val = int(self.wavelet_k1_local_step)
+        log_every = None
+        if config is not None:
+            log_every = self._to_int_or_none(getattr(config, "wavelet_k1_log_every", None))
+            if log_every is None:
+                log_every = self._to_int_or_none(getattr(config, "router_log_every", 500))
+        if log_every is None:
+            log_every = 500
+        should_log = (
+            log_every > 0
+            and step_val >= 0
+            and (step_val % log_every == 0)
+        )
+        return bool(should_log), int(step_val)
+
+    def _k1_emit_log(self, msg: str):
+        # Avoid duplicated logs across DDP ranks.
+        try:
+            if dist.is_available() and dist.is_initialized() and dist.get_rank() != 0:
+                return
+        except Exception:
+            pass
+        logger_obj = getattr(self, "logger", None)
+        if logger_obj is not None:
+            try:
+                logger_obj.info(msg)
+                return
+            except Exception:
+                pass
+        print(msg)
+
+    def _ensure_wavelet_gate_grad_hook(self):
+        # from_pretrained/DDP can replace Parameter objects; keep hook bound to current gate parameter.
+        p = getattr(self, "wavelet_logit_bias_a", None)
+        if p is None or (not torch.is_tensor(p)) or (not bool(getattr(p, "requires_grad", False))):
+            return
+        cur_id = id(p)
+        prev_id = getattr(self, "_wavelet_gate_grad_hook_param_id", None)
+        handle = getattr(self, "_wavelet_gate_grad_hook_handle", None)
+        hook_missing = False
+        try:
+            hooks = getattr(p, "_backward_hooks", None)
+            hook_missing = hooks is not None and len(hooks) == 0
+        except Exception:
+            hook_missing = False
+        if prev_id == cur_id and handle is not None and (not hook_missing):
+            return
+        if handle is not None:
+            try:
+                handle.remove()
+            except Exception:
+                pass
+        self._wavelet_gate_grad_hook_handle = None
+        try:
+            self._wavelet_gate_grad_hook_handle = p.register_hook(self._capture_wavelet_gate_grad)
+        except Exception:
+            self._wavelet_gate_grad_hook_handle = None
+        self._wavelet_gate_grad_hook_param_id = cur_id
+
+    def _capture_wavelet_gate_grad(self, grad: torch.Tensor):
+        self._wavelet_gate_grad_seen = True
+        grad_abs = float("nan")
+        grad_p50 = float("nan")
+        grad_p90 = float("nan")
+        grad_max = float("nan")
+        grad_zero_ratio = float("nan")
+        grad_finite_ratio = float("nan")
+        grad_nonfinite = -1
+        grad_ret = grad
+        try:
+            if grad is not None:
+                gf = grad.detach().to(dtype=torch.float32)
+                n_all = int(gf.numel())
+                if n_all == 0:
+                    grad_abs = 0.0
+                    grad_p50 = 0.0
+                    grad_p90 = 0.0
+                    grad_max = 0.0
+                    grad_zero_ratio = 1.0
+                    grad_finite_ratio = 1.0
+                    grad_nonfinite = 0
+                    grad_clean = gf
+                else:
+                    finite_mask = torch.isfinite(gf)
+                    n_finite = int(finite_mask.sum().item())
+                    grad_nonfinite = int(n_all - n_finite)
+                    grad_finite_ratio = float(n_finite / float(max(1, n_all)))
+                    grad_clean = torch.nan_to_num(gf, nan=0.0, posinf=0.0, neginf=0.0)
+                    clip_v = float(getattr(self, "wavelet_gate_grad_clip", 0.0))
+                    if clip_v > 0.0:
+                        grad_clean = grad_clean.clamp(min=-clip_v, max=clip_v)
+                    g_abs = grad_clean.abs().reshape(-1)
+                    grad_abs = float(g_abs.mean().item())
+                    grad_max = float(g_abs.max().item())
+                    qv = _quantiles_flat(g_abs, qs=(0.5, 0.9))
+                    grad_p50 = float(qv["p50"])
+                    grad_p90 = float(qv["p90"])
+                    grad_zero_ratio = float((g_abs == 0).to(dtype=torch.float32).mean().item())
+                grad_ret = grad_clean.to(dtype=grad.dtype, device=grad.device)
+        except Exception:
+            grad_abs = float("nan")
+            grad_p50 = float("nan")
+            grad_p90 = float("nan")
+            grad_max = float("nan")
+            grad_zero_ratio = float("nan")
+            grad_finite_ratio = float("nan")
+            grad_nonfinite = -1
+            grad_ret = grad
+        self._wavelet_gate_last_grad_abs = grad_abs
+        self._wavelet_gate_last_grad_p50 = grad_p50
+        self._wavelet_gate_last_grad_p90 = grad_p90
+        self._wavelet_gate_last_grad_max = grad_max
+        self._wavelet_gate_last_grad_zero_ratio = grad_zero_ratio
+        self._wavelet_gate_last_grad_finite_ratio = grad_finite_ratio
+        self._wavelet_gate_last_grad_nonfinite = grad_nonfinite
+        return grad_ret
+
+    def _resolve_wavelet_gate_step(self, step) -> int:
+        step_val = self._to_int_or_none(step)
+        if step_val is None:
+            cfg = getattr(self, "config", None)
+            if cfg is not None:
+                step_val = self._to_int_or_none(getattr(cfg, "router_global_step", None))
+        if step_val is None:
+            self._wavelet_gate_local_step += 1
+            step_val = int(self._wavelet_gate_local_step)
+        return int(step_val)
+
+    def _ctxscale_gate_state(self, *, step, g_max: float, g_layer_raw: torch.Tensor):
+        step_val = self._resolve_wavelet_gate_step(step)
+        self._ensure_wavelet_gate_grad_hook()
+        if self._wavelet_gate_last_metrics_step == step_val and self._wavelet_gate_last_metrics is not None:
+            return dict(self._wavelet_gate_last_metrics)
+
+        a_raw_val = float(g_layer_raw.detach().to(dtype=torch.float32).item())
+        if a_raw_val >= 0.0:
+            sig = 1.0 / (1.0 + math.exp(-min(a_raw_val, 80.0)))
+        else:
+            expv = math.exp(max(a_raw_val, -80.0))
+            sig = expv / (1.0 + expv)
+        sig = float(sig)
+        g_val = float(g_max) * sig
+        sat_low = int(g_val < 0.01 * float(g_max))
+        sat_high = int(g_val > 0.99 * float(g_max))
+        sat_extreme = int(sat_low or sat_high)
+
+        grad_abs = float("nan")
+        grad_p50 = float("nan")
+        grad_p90 = float("nan")
+        grad_max = float("nan")
+        grad_zero_ratio = float("nan")
+        grad_finite_ratio = float("nan")
+        grad_nonfinite = -1
+        if self._wavelet_gate_last_grad_abs is not None:
+            try:
+                grad_abs = float(self._wavelet_gate_last_grad_abs)
+            except Exception:
+                grad_abs = float("nan")
+        if self._wavelet_gate_last_grad_finite_ratio is not None:
+            try:
+                grad_finite_ratio = float(self._wavelet_gate_last_grad_finite_ratio)
+            except Exception:
+                grad_finite_ratio = float("nan")
+        if self._wavelet_gate_last_grad_p50 is not None:
+            try:
+                grad_p50 = float(self._wavelet_gate_last_grad_p50)
+            except Exception:
+                grad_p50 = float("nan")
+        if self._wavelet_gate_last_grad_p90 is not None:
+            try:
+                grad_p90 = float(self._wavelet_gate_last_grad_p90)
+            except Exception:
+                grad_p90 = float("nan")
+        if self._wavelet_gate_last_grad_max is not None:
+            try:
+                grad_max = float(self._wavelet_gate_last_grad_max)
+            except Exception:
+                grad_max = float("nan")
+        if self._wavelet_gate_last_grad_zero_ratio is not None:
+            try:
+                grad_zero_ratio = float(self._wavelet_gate_last_grad_zero_ratio)
+            except Exception:
+                grad_zero_ratio = float("nan")
+        if self._wavelet_gate_last_grad_nonfinite is not None:
+            try:
+                grad_nonfinite = int(self._wavelet_gate_last_grad_nonfinite)
+            except Exception:
+                grad_nonfinite = -1
+        if math.isfinite(grad_abs):
+            grad_abs = abs(grad_abs)
+        else:
+            grad_abs = float("nan")
+        grad_missing = int(grad_nonfinite < 0)
+        grad_zero = int(grad_abs == 0.0) if (math.isfinite(grad_abs) and grad_nonfinite == 0) else 0
+
+        delta_a = float("nan")
+        update_ratio = float("nan")
+        if self._wavelet_gate_prev_a is not None and self._wavelet_gate_prev_step != step_val:
+            prev_a = float(self._wavelet_gate_prev_a)
+            delta_a = float(a_raw_val - prev_a)
+            update_ratio = float(abs(delta_a) / (abs(prev_a) + float(self.wavelet_ctxscale_lock_update_eps)))
+
+        if self._wavelet_gate_prev_step != step_val:
+            self._wavelet_gate_prev_a = float(a_raw_val)
+            self._wavelet_gate_prev_step = int(step_val)
+            self._wavelet_gate_hist.append(
+                {
+                    "sat_extreme": int(sat_extreme),
+                    "grad_abs": float(grad_abs),
+                    "grad_abs_p50": float(grad_p50),
+                    "grad_finite_ratio": float(grad_finite_ratio),
+                    "grad_nonfinite": int(grad_nonfinite),
+                    "grad_missing": int(grad_missing),
+                    "update_ratio": float(update_ratio),
+                }
+            )
+
+        locked = bool(self._wavelet_gate_locked)
+        if (not locked) and len(self._wavelet_gate_hist) >= int(self.wavelet_ctxscale_lock_window):
+            hist = list(self._wavelet_gate_hist)
+            n = max(1, len(hist))
+            sat_ratio = sum(int(item.get("sat_extreme", 0)) for item in hist) / float(n)
+            grad_vals = [
+                float(item.get("grad_abs_p50", float("nan")))
+                for item in hist
+                if math.isfinite(float(item.get("grad_abs_p50", float("nan"))))
+            ]
+            upd_vals = [
+                float(item.get("update_ratio", float("nan")))
+                for item in hist
+                if math.isfinite(float(item.get("update_ratio", float("nan"))))
+            ]
+            grad_med = float("inf")
+            upd_med = float("inf")
+            if len(grad_vals) > 0:
+                grad_med = float(torch.tensor(grad_vals, dtype=torch.float32).median().item())
+            if len(upd_vals) > 0:
+                upd_med = float(torch.tensor(upd_vals, dtype=torch.float32).median().item())
+            if (
+                sat_ratio > 0.7
+                and grad_med < float(self.wavelet_ctxscale_lock_grad_eps)
+                and upd_med < float(self.wavelet_ctxscale_lock_update_eps)
+            ):
+                locked = True
+                self._wavelet_gate_locked = True
+                self._k1_emit_log(
+                    f"[wavelet gate lock] layer={int(self.layer_idx)} step={int(step_val)} "
+                    f"sat_low={int(sat_low)} sat_high={int(sat_high)} "
+                    f"grad_abs={float(grad_abs):.6e} grad_finite={float(grad_finite_ratio):.6e} "
+                    f"grad_nf={int(grad_nonfinite)} update_ratio={float(update_ratio):.6e}"
+                )
+
+        metrics = {
+            "step": int(step_val),
+            "g_layer_raw": float(a_raw_val),
+            "sig": float(sig),
+            "g_layer_pre": float(g_val),
+            "sat_low": int(sat_low),
+            "sat_high": int(sat_high),
+            "sat_extreme": int(sat_extreme),
+            "grad_abs": float(grad_abs),
+            "grad_abs_p50": float(grad_p50),
+            "grad_abs_p90": float(grad_p90),
+            "grad_abs_max": float(grad_max),
+            "grad_zero_ratio": float(grad_zero_ratio),
+            "grad_finite_ratio": float(grad_finite_ratio),
+            "grad_nonfinite": int(grad_nonfinite),
+            "grad_missing": int(grad_missing),
+            "grad_zero": int(grad_zero),
+            "delta_a": float(delta_a),
+            "update_ratio": float(update_ratio),
+            "locked": int(locked),
+        }
+        if int(grad_missing) == 1 and self._wavelet_gate_last_missing_warn_step != int(step_val):
+            self._wavelet_gate_last_missing_warn_step = int(step_val)
+            self._k1_emit_log(
+                f"[wavelet gate grad missing] layer={int(self.layer_idx)} step={int(step_val)} "
+                f"req_grad={int(bool(self.wavelet_logit_bias_a.requires_grad))} "
+                f"grad_en={int(bool(torch.is_grad_enabled()))} "
+                f"sat_extreme={int(sat_extreme)} g_raw={float(a_raw_val):.6e}"
+            )
+        if int(grad_nonfinite) > 0 and self._wavelet_gate_last_nf_warn_step != int(step_val):
+            self._wavelet_gate_last_nf_warn_step = int(step_val)
+            self._k1_emit_log(
+                f"[wavelet gate grad nf] layer={int(self.layer_idx)} step={int(step_val)} "
+                f"grad_nf={int(grad_nonfinite)} grad_finite={float(grad_finite_ratio):.6e} "
+                f"grad_abs={float(grad_abs):.6e} sat_extreme={int(sat_extreme)} "
+                f"g_raw={float(a_raw_val):.6e}"
+            )
+        self._wavelet_gate_last_metrics_step = int(step_val)
+        self._wavelet_gate_last_metrics = dict(metrics)
+        return metrics
+
+    @staticmethod
+    def rms_normalize(x: torch.Tensor, eps: float = 1e-6):
+        xf = x.to(dtype=torch.float32)
+        rms = torch.sqrt(xf.pow(2).mean().clamp_min(0.0) + float(eps))
+        return xf / rms
+
+    def _logit_bias_should_log(self, *, global_step=None, config=None) -> tuple[bool, int]:
+        step_val = self._to_int_or_none(global_step)
+        if step_val is None and config is not None:
+            step_val = self._to_int_or_none(getattr(config, "router_global_step", None))
+        if step_val is None:
+            self.wavelet_logit_bias_local_step += 1
+            step_val = int(self.wavelet_logit_bias_local_step)
+        log_every = None
+        if config is not None:
+            log_every = self._to_int_or_none(getattr(config, "wavelet_logit_bias_log_every", None))
+            if log_every is None:
+                log_every = self._to_int_or_none(getattr(config, "router_log_every", 500))
+        if log_every is None:
+            log_every = 500
+        should_log = (log_every > 0 and step_val >= 0 and (step_val % log_every == 0))
+        return bool(should_log), int(step_val)
+
+    def _get_delta_index_matrix(self, T: int, device: torch.device):
+        key = (int(T), str(device))
+        idx = self._wavelet_delta_index_cache.get(key, None)
+        if idx is None or idx.device != device:
+            q_pos = torch.arange(T, device=device)
+            k_pos = torch.arange(T, device=device)
+            delta = k_pos[None, :] - q_pos[:, None]  # n - m
+            idx = (delta + (T - 1)).to(dtype=torch.long)
+            self._wavelet_delta_index_cache[key] = idx
+        return idx
+
+    def compute_wavelet_bias_delta_table(
+        self,
+        T: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        wavelet_dtt: torch.Tensor,
+    ):
+        """
+        Build delta lookup table for delta=(key_pos-query_pos)=n-m in [-(T-1), ..., T-1].
+        """
+        assert wavelet_dtt.dim() == 3, f"expected [D,T,T], got {tuple(wavelet_dtt.shape)}"
+        assert int(wavelet_dtt.shape[1]) == int(T) and int(wavelet_dtt.shape[2]) == int(T), (
+            tuple(wavelet_dtt.shape),
+            int(T),
+        )
+        wav = wavelet_dtt.to(device=device, dtype=torch.float32).mean(dim=0)  # [T,T]
+        delta_idx = self._get_delta_index_matrix(T, device).reshape(-1)  # [T*T]
+        val = wav.reshape(-1)
+        num_bins = 2 * T - 1
+        sum_buf = torch.zeros(num_bins, device=device, dtype=torch.float32)
+        cnt_buf = torch.zeros(num_bins, device=device, dtype=torch.float32)
+        sum_buf.scatter_add_(0, delta_idx, val)
+        cnt_buf.scatter_add_(0, delta_idx, torch.ones_like(val))
+        delta_table = sum_buf / cnt_buf.clamp_min(1.0)
+        return delta_table.to(dtype=dtype)
+
+    @staticmethod
+    def apply_causal_indexing(delta_table: torch.Tensor, delta_index: torch.Tensor, future_mask: torch.Tensor):
+        bias = delta_table.index_select(0, delta_index.reshape(-1)).view_as(delta_index)
+        return bias.masked_fill(future_mask, 0.0)
+
+    def _build_logit_bias_term(
+        self,
+        *,
+        wavelet_dtt: torch.Tensor,
+        T: int,
+        future: torch.Tensor,
+        device: torch.device,
+        compute_dtype: torch.dtype = torch.float32,
+    ):
+        future_2d = future.view(T, T)
+        delta_table_raw = self.compute_wavelet_bias_delta_table(
+            T=T,
+            device=device,
+            dtype=torch.float32,
+            wavelet_dtt=wavelet_dtt,
+        )
+        delta_table_hat = self.rms_normalize(delta_table_raw, eps=float(self.wavelet_logit_bias_eps))
+        if self.wavelet_logit_bias_clamp_enable:
+            abs_vals = delta_table_hat.abs().reshape(-1)
+            q = float(self.wavelet_logit_bias_clamp_quantile)
+            q = min(max(q, 0.5), 0.9999)
+            clamp_ref = torch.quantile(abs_vals, q)
+            clamp_v = torch.clamp(
+                clamp_ref * float(self.wavelet_logit_bias_clamp_scale),
+                min=float(self.wavelet_logit_bias_clamp_min),
+            )
+            delta_table_hat = delta_table_hat.clamp(min=-clamp_v, max=clamp_v)
+        delta_index = self._get_delta_index_matrix(T, device)
+        b_hat = self.apply_causal_indexing(delta_table_hat, delta_index, future_2d)  # [T,T]
+        g_layer = F.softplus(self.wavelet_logit_bias_a).to(device=device, dtype=torch.float32)
+        eff = g_layer * b_hat
+        if self.wavelet_logit_bias_debug_assert:
+            if not torch.isfinite(b_hat).all():
+                raise FloatingPointError("wavelet_logit_bias: B_hat has non-finite values")
+            if not torch.isfinite(eff).all():
+                raise FloatingPointError("wavelet_logit_bias: g*B_hat has non-finite values")
+        return (
+            b_hat.to(dtype=compute_dtype),
+            eff.to(dtype=compute_dtype),
+            g_layer.to(dtype=compute_dtype),
+            future_2d,
+        )
+
+    def _log_logit_bias_monitor(
+        self,
+        *,
+        layer_idx: Optional[int],
+        step: int,
+        g_layer: torch.Tensor,
+        b_hat: torch.Tensor,
+        eff: torch.Tensor,
+        causal_mask_2d: torch.Tensor,
+        attn_probs: torch.Tensor,
+    ):
+        T = int(b_hat.shape[0])
+        t_take = max(1, min(int(self.wavelet_logit_bias_log_sample_tokens), T))
+        if t_take < T:
+            t_idx = torch.linspace(0, T - 1, steps=t_take, device=b_hat.device).long()
+            b_eval = b_hat.index_select(0, t_idx).index_select(1, t_idx)
+            e_eval = eff.index_select(0, t_idx).index_select(1, t_idx)
+            m_eval = causal_mask_2d.index_select(0, t_idx).index_select(1, t_idx)
+        else:
+            b_eval = b_hat
+            e_eval = eff
+            m_eval = causal_mask_2d
+        valid = ~m_eval
+        b_stats = _monitor_flat_stats(b_eval[valid])
+        eff_stats = _monitor_flat_stats(e_eval[valid])
+        g_stats = _monitor_scalar_stats(g_layer)
+        attn_stats = _monitor_attn_prob_stats(
+            attn_probs,
+            max_queries=int(self.wavelet_logit_bias_log_sample_tokens),
+            max_heads=int(self.wavelet_logit_bias_log_sample_heads),
+        )
+        lid = int(self.layer_idx if layer_idx is None else layer_idx)
+        msg = (
+            f"[wavelet logit_bias stats] layer={lid} step={int(step)} "
+            f"g={float(g_layer.detach().float().item()):.6e} "
+            f"g_mean={g_stats['mean']:.6e} g_p50={g_stats['p50']:.6e} g_p90={g_stats['p90']:.6e} g_p99={g_stats['p99']:.6e} | "
+            f"B_hat mean={b_stats['mean']:.6e} std={b_stats['std']:.6e} abs_p99={b_stats['abs_p99']:.6e} | "
+            f"gB_hat mean={eff_stats['mean']:.6e} std={eff_stats['std']:.6e} abs_p99={eff_stats['abs_p99']:.6e} | "
+            f"attn_entropy mean={attn_stats['entropy_mean']:.6e} p50={attn_stats['entropy_p50']:.6e} "
+            f"p90={attn_stats['entropy_p90']:.6e} p99={attn_stats['entropy_p99']:.6e} | "
+            f"attn_top1 mean={attn_stats['top1_mean']:.6e} p50={attn_stats['top1_p50']:.6e} "
+            f"p90={attn_stats['top1_p90']:.6e} p99={attn_stats['top1_p99']:.6e} | "
+            f"attn_margin mean={attn_stats['margin_mean']:.6e} p50={attn_stats['margin_p50']:.6e} "
+            f"p90={attn_stats['margin_p90']:.6e} p99={attn_stats['margin_p99']:.6e}"
+        )
+        self._k1_emit_log(msg)
+
+    @staticmethod
+    def _rms_norm_last_dim(x: torch.Tensor, eps: float = 1e-6):
+        xf = x.to(dtype=torch.float32)
+        denom = torch.sqrt(xf.pow(2).mean(dim=-1, keepdim=True).clamp_min(0.0) + float(eps))
+        return xf / denom
+
+    @staticmethod
+    def _ricker_wavelet(u: torch.Tensor):
+        return (1.0 - u.pow(2)) * torch.exp(-0.5 * u.pow(2))
+
+    def _maybe_clamp_p99(self, x: torch.Tensor):
+        if not self.wavelet_logit_bias_clamp_enable:
+            return x.to(dtype=torch.float32)
+        x32 = x.to(dtype=torch.float32)
+        abs_flat = x32.detach().abs().reshape(-1)
+        if abs_flat.numel() == 0:
+            return x32
+        q = float(self.wavelet_logit_bias_clamp_quantile)
+        q = min(max(q, 0.5), 0.9999)
+        max_samples = max(128, int(self.wavelet_ctxscale_max_log_samples))
+        if abs_flat.numel() > max_samples:
+            idx = torch.linspace(0, abs_flat.numel() - 1, steps=max_samples, device=abs_flat.device).long()
+            abs_eval = abs_flat.index_select(0, idx)
+        else:
+            abs_eval = abs_flat
+        clamp_ref = torch.quantile(abs_eval, q)
+        clamp_v = torch.clamp(
+            clamp_ref * float(self.wavelet_logit_bias_clamp_scale),
+            min=float(self.wavelet_logit_bias_clamp_min),
+        )
+        return x32.clamp(min=-clamp_v, max=clamp_v)
+
+    def _ctxscale_router_feature(self, qf: torch.Tensor, q_corr: torch.Tensor, *, use_mlp: bool = False):
+        mode = str(getattr(self, "wavelet_ctx_feat_mode", "q_meanH")).strip().lower()
+        feat_ln = self.mlp_bias_ctx_feat_ln if use_mlp else self.wavelet_ctx_feat_ln
+        path_ln = self.mlp_bias_ctx_path_ln if use_mlp else self.wavelet_ctx_path_ln
+        path_proj = self.mlp_bias_ctx_path_proj if use_mlp else self.wavelet_ctx_path_proj
+        q_mean = qf.mean(dim=2)
+        d_mean = (qf - q_corr).mean(dim=2)
+        if mode == "q_minus_qcorr_meanh":
+            return feat_ln(d_mean)
+        if mode == "q_minus_qcorr_rmsh":
+            d = qf - q_corr
+            d_rms = torch.sqrt(d.pow(2).mean(dim=2).clamp_min(0.0) + float(self.wavelet_ctx_feat_rms_eps))
+            return feat_ln(d_rms)
+        if mode == "path_ctx":
+            x_cat = torch.cat([q_mean, q_corr.mean(dim=2), d_mean], dim=-1)
+            x_cat = path_ln(x_cat)
+            return feat_ln(path_proj(x_cat))
+        # Default safer baseline: pure query summary.
+        return feat_ln(q_mean)
+
+    def _ctxscale_param_count(self, *, use_mlp: bool, include_film: bool) -> int:
+        if use_mlp:
+            modules = [
+                self.mlp_bias_ctx_feat_ln,
+                self.mlp_bias_ctx_path_ln,
+                self.mlp_bias_ctx_path_proj,
+                self.mlp_bias_router,
+                self.mlp_bias_shift_ln,
+                self.mlp_bias_shift_proj,
+                self.mlp_bias_basis_mlp,
+                self.mlp_bias_basis_ln,
+            ]
+            params = [self.mlp_bias_logit_bias_a]
+            if self.mlp_bias_logit_bias_a_head is not None:
+                params.append(self.mlp_bias_logit_bias_a_head)
+            if include_film:
+                modules.extend([self.mlp_bias_film_ln, self.mlp_bias_film])
+            if hasattr(self, "mlp_bias_param_pad") and self.mlp_bias_param_pad is not None:
+                params.append(self.mlp_bias_param_pad)
+        else:
+            modules = [
+                self.wavelet_ctx_feat_ln,
+                self.wavelet_ctx_path_ln,
+                self.wavelet_ctx_path_proj,
+                self.wavelet_ctx_router,
+                self.wavelet_shift_ln,
+                self.wavelet_shift_proj,
+            ]
+            params = [self.wavelet_logit_bias_a]
+            if self.wavelet_logit_bias_a_head is not None:
+                params.append(self.wavelet_logit_bias_a_head)
+            if include_film:
+                modules.extend([self.wavelet_bias_film_ln, self.wavelet_bias_film])
+        total = 0
+        for mod in modules:
+            total += sum(p.numel() for p in mod.parameters())
+        total += sum(p.numel() for p in params)
+        return int(total)
+
+    def _wavelet_seed(self) -> int:
+        seed = None
+        try:
+            seed = getattr(self.config, "seed", None)
+        except Exception:
+            seed = None
+        seed_i = self._to_int_or_none(seed)
+        if seed_i is None:
+            try:
+                seed_i = int(torch.initial_seed())
+            except Exception:
+                seed_i = None
+        if seed_i is None:
+            seed_i = 0
+            if not self._wavelet_basis_seed_warned:
+                self._wavelet_basis_seed_warned = True
+                self._k1_emit_log("[wavelet basis control warn] missing seed in config and torch; fallback_seed=0")
+        return int(seed_i)
+
+    def _wavelet_basis_perm(self, *, K: int, layer_idx: int, device: torch.device) -> torch.Tensor:
+        seed_i = self._wavelet_seed()
+        key = (seed_i, int(layer_idx), int(K))
+        perm_cpu = self._wavelet_basis_perm_cache.get(key, None)
+        if perm_cpu is None:
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(int(seed_i + 131 * int(layer_idx) + 17 * int(K)))
+            perm_cpu = torch.randperm(int(K), generator=gen, device="cpu")
+            self._wavelet_basis_perm_cache[key] = perm_cpu
+        return perm_cpu.to(device=device)
+
+    def _random_basis_table(
+        self,
+        *,
+        q_len: int,
+        T: int,
+        scale_idx: int,
+        layer_idx: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        seed_i = self._wavelet_seed()
+        key = (seed_i, int(layer_idx), int(scale_idx), int(q_len), int(T))
+        tab_cpu = self._wavelet_basis_random_cache.get(key, None)
+        if tab_cpu is None:
+            gen = torch.Generator(device="cpu")
+            gen.manual_seed(int(seed_i + 1009 * int(layer_idx) + 101 * int(scale_idx) + 13 * int(q_len) + int(T)))
+            tab_cpu = torch.randn((int(q_len), int(T)), generator=gen, dtype=torch.float32, device="cpu")
+            self._wavelet_basis_random_cache[key] = tab_cpu
+        return tab_cpu.to(device=device, dtype=torch.float32)
+
+    def _ctxscale_apply_bias_film(
+        self,
+        *,
+        bias_chunk: torch.Tensor,
+        pi_chunk: torch.Tensor,
+        rho_chunk: torch.Tensor,
+        g_layer: torch.Tensor,
+        use_mlp: bool = False,
+    ):
+        B, Tq, _ = bias_chunk.shape
+        g_ctx = g_layer.reshape(1, 1, 1).expand(B, Tq, 1)
+        w_ctx = torch.cat([pi_chunk[..., 1:], rho_chunk.unsqueeze(-1), g_ctx], dim=-1)
+        film_ln = self.mlp_bias_film_ln if use_mlp else self.wavelet_bias_film_ln
+        film_mod = self.mlp_bias_film if use_mlp else self.wavelet_bias_film
+        w_ctx_ln = film_ln(w_ctx)
+        film_raw = film_mod(w_ctx_ln)
+        s_raw, t_raw = film_raw[..., :1], film_raw[..., 1:]
+        clamp_v = float(self.wavelet_ctxscale_film_clamp)
+        s_raw = s_raw.clamp(min=-clamp_v, max=clamp_v)
+        t_raw = t_raw.clamp(min=-clamp_v, max=clamp_v)
+        scale = 1.0 + float(self.wavelet_ctxscale_film_alpha) * torch.tanh(s_raw)
+        shift = float(self.wavelet_ctxscale_film_beta) * torch.tanh(t_raw)
+        bias_mod = scale * bias_chunk + shift
+        return bias_mod, s_raw, t_raw, scale, shift
+
+    def _build_ctxscale_shift_logit_bias_v0(
+        self,
+        *,
+        q: torch.Tensor,
+        w: torch.Tensor,
+        M_used: torch.Tensor,
+        hidden_states: torch.Tensor,
+        E_base_raw: torch.Tensor,
+        T: int,
+        compute_dtype: torch.dtype = torch.float32,
+        need_log: bool = False,
+        layer_idx: Optional[int] = None,
+        step: Optional[int] = None,
+        enable_film: bool = False,
+    ):
+        if hidden_states is None:
+            raise ValueError("hidden_states is required for wavelet_mode='logit_bias_ctxscale_shift_v0'")
+
+        B = int(E_base_raw.shape[0])
+        device = E_base_raw.device
+        eps = float(self.wavelet_logit_bias_eps)
+        lid = int(self.layer_idx if layer_idx is None else layer_idx)
+        step_val = self._to_int_or_none(step)
+        if step_val is None:
+            step_val = self._resolve_wavelet_gate_step(None)
+        warned_nonfinite = False
+
+        def _warn_nonfinite(name: str):
+            nonlocal warned_nonfinite
+            if warned_nonfinite:
+                return
+            warned_nonfinite = True
+            msg = f"[wavelet ctxscale_shift_v0 warn] layer={lid} step={int(step_val)} non_finite={name}"
+            logger_obj = getattr(self, "logger", None)
+            if logger_obj is not None:
+                try:
+                    logger_obj.warning(msg)
+                    return
+                except Exception:
+                    pass
+            print(msg)
+
+        qf = q.to(device=device, dtype=torch.float32)
+        wf = w.to(device=device, dtype=torch.float32)
+        mf = M_used.to(device=device, dtype=torch.float32)
+        scales = self.wavelet_ctxscale_scales.to(device=device, dtype=torch.float32)
+        K = int(scales.numel())
+        wavelet_mode_resolved = self._normalize_wavelet_mode(getattr(self.config, "wavelet_mode", self.wavelet_mode))
+        use_mlp_bias_baseline = bool(wavelet_mode_resolved == "mlp_bias_baseline_v0")
+        basis_control = str(getattr(self, "wavelet_basis_control", "none")).strip().lower()
+        if basis_control not in ("none", "permute_scales", "random_basis"):
+            basis_control = "none"
+        if use_mlp_bias_baseline:
+            basis_control = "none"
+
+        if use_mlp_bias_baseline and (not bool(getattr(self, "_mlp_bias_param_count_printed", False))) and lid == 0:
+            include_film_count = bool(enable_film)
+            wavelet_branch_params = self._ctxscale_param_count(use_mlp=False, include_film=include_film_count)
+            mlp_branch_params = self._ctxscale_param_count(use_mlp=True, include_film=include_film_count)
+            rel_diff = float(abs(float(mlp_branch_params - wavelet_branch_params)) / max(1.0, float(wavelet_branch_params)))
+            self._k1_emit_log(
+                f"[mlp_bias_baseline_v0 param_count] layer={lid} "
+                f"wavelet_branch_params={int(wavelet_branch_params)} "
+                f"mlp_branch_params={int(mlp_branch_params)} rel_diff={rel_diff:.6e}"
+            )
+            self._mlp_bias_param_count_printed = True
+            if rel_diff > 0.01:
+                raise ValueError(
+                    f"mlp_bias_baseline_v0 param mismatch: wavelet={wavelet_branch_params} "
+                    f"mlp={mlp_branch_params} rel_diff={rel_diff:.6e}"
+                )
+
+        q_corr = torch.einsum("b h t j, b j h d -> b t h d", mf, wf)
+        x_feat = self._ctxscale_router_feature(qf, q_corr, use_mlp=use_mlp_bias_baseline)
+        router_mod = self.mlp_bias_router if use_mlp_bias_baseline else self.wavelet_ctx_router
+        router_logits = router_mod(x_feat)
+        router_logits = self._rms_norm_last_dim(router_logits, eps=float(self.wavelet_ctxscale_router_rms_eps))
+        tau = max(float(self.wavelet_ctxscale_tau), 1e-6)
+        pi = torch.softmax(router_logits / tau, dim=-1)
+
+        shift_ln = self.mlp_bias_shift_ln if use_mlp_bias_baseline else self.wavelet_shift_ln
+        shift_proj = self.mlp_bias_shift_proj if use_mlp_bias_baseline else self.wavelet_shift_proj
+        h_ln = shift_ln(hidden_states.to(device=device, dtype=torch.float32))
+        rho = torch.sigmoid(shift_proj(h_ln).squeeze(-1))
+        use_scale_coupled_shift = bool(getattr(self, "wavelet_ctxscale_scale_dependent_shift", False))
+        use_abs_shift_causal = bool(getattr(self, "wavelet_ctxscale_abs_shift_causal", False))
+        shift_t_mode = str(getattr(self, "wavelet_shift_T_mode", "legacy")).strip().lower()
+        if shift_t_mode not in ("legacy", "runtime", "train_ref"):
+            shift_t_mode = "legacy"
+        T_test = int(T)
+        if shift_t_mode == "train_ref":
+            T_used = max(2, int(getattr(self, "wavelet_shift_T_ref", T_test)))
+        else:
+            T_used = max(2, int(T_test))
+        apply_shift_t_scaling = shift_t_mode in ("runtime", "train_ref")
+        shift_t_scale = float(max(1, T_used - 1))
+        if use_abs_shift_causal and apply_shift_t_scaling:
+            raise ValueError(
+                "abs_shift_causal ignores T_used; disable abs_shift_causal or set wavelet_shift_T_mode=legacy."
+            )
+        if use_scale_coupled_shift:
+            # Shift is defined in scale units and later coupled with each wavelet scale.
+            shift_unit_max = float(getattr(self, "wavelet_ctxscale_shift_unit_max", 1.0))
+            beta_m = (2.0 * rho - 1.0) * shift_unit_max
+        else:
+            if use_abs_shift_causal:
+                # Causal absolute-position shift: each query q selects center from [0, q].
+                q_pos = torch.arange(T_test, device=device, dtype=torch.float32).view(1, T_test)
+                beta_m = torch.round(rho * q_pos)
+                beta_m = torch.minimum(beta_m, q_pos).clamp_min_(0.0)
+            else:
+                # Legacy token-index shift.
+                beta_upper = max(1, int(T_used - 1)) if apply_shift_t_scaling else max(1, int(T_test - 1))
+                beta_m = torch.round(rho * float(beta_upper)).clamp_(0.0, float(beta_upper))
+
+        if self.wavelet_logit_bias_debug_assert:
+            if not torch.isfinite(pi).all():
+                raise FloatingPointError("ctxscale_shift_v0: non-finite router pi")
+            if not torch.isfinite(rho).all():
+                raise FloatingPointError("ctxscale_shift_v0: non-finite rho")
+            if not torch.isfinite(beta_m).all():
+                raise FloatingPointError("ctxscale_shift_v0: non-finite beta")
+            if not use_scale_coupled_shift:
+                if use_abs_shift_causal:
+                    q_pos = torch.arange(T_test, device=device, dtype=torch.float32).view(1, T_test)
+                    if float((beta_m < 0.0).any().item()) != 0.0:
+                        raise FloatingPointError("ctxscale_shift_v0: beta_token below 0 in abs causal mode")
+                    if float((beta_m > q_pos).any().item()) != 0.0:
+                        raise FloatingPointError("ctxscale_shift_v0: beta_token above q in abs causal mode")
+                else:
+                    beta_upper = float(max(1, int(T_used - 1)) if apply_shift_t_scaling else max(1, int(T_test - 1)))
+                    if float(beta_m.detach().amin().item()) < 0.0 or float(beta_m.detach().amax().item()) > beta_upper:
+                        raise FloatingPointError("ctxscale_shift_v0: beta_token out of range [0, T_used-1]")
+
+        clamp_abs = float(self.wavelet_ctxscale_lock_clamp_abs)
+        g_max = float(getattr(self.config, "wavelet_ctxscale_g_max", self.wavelet_ctxscale_g_max))
+        gate_param = self.mlp_bias_logit_bias_a if use_mlp_bias_baseline else self.wavelet_logit_bias_a
+        gate_head_param = self.mlp_bias_logit_bias_a_head if use_mlp_bias_baseline else self.wavelet_logit_bias_a_head
+        use_head_gate = bool(getattr(self, "wavelet_ctxscale_use_head_gate", False)) and (gate_head_param is not None)
+        g_head = None
+        if use_head_gate:
+            g_head_raw = gate_head_param.to(device=device, dtype=torch.float32)
+            g_head_raw_clipped = g_head_raw.clamp(min=-clamp_abs, max=clamp_abs)
+            g_head_raw_used = g_head_raw + (g_head_raw_clipped - g_head_raw).detach()
+            g_head_raw_clamped = int(bool((g_head_raw.detach().abs() > clamp_abs).any().item()))
+            g_head = g_max * torch.sigmoid(g_head_raw_used)
+            if not torch.isfinite(g_head).all():
+                _warn_nonfinite("g_head")
+                g_head = torch.nan_to_num(
+                    g_head,
+                    nan=0.0,
+                    posinf=g_max,
+                    neginf=0.0,
+                )
+            g_layer = g_head.mean()
+            g_layer_raw = g_head_raw.mean()
+            g_layer_raw_used = g_head_raw_used.mean()
+            sat_low_frac = float((g_head < 0.01 * float(g_max)).float().mean().item())
+            sat_high_frac = float((g_head > 0.99 * float(g_max)).float().mean().item())
+            gate_state = {
+                "sig": float((g_layer / max(float(g_max), 1e-12)).item()),
+                "sat_low": int(sat_low_frac > 0.7),
+                "sat_high": int(sat_high_frac > 0.7),
+                "sat_extreme": int((sat_low_frac > 0.7) or (sat_high_frac > 0.7)),
+                "grad_abs": float("nan"),
+                "grad_abs_p50": float("nan"),
+                "grad_abs_p90": float("nan"),
+                "grad_abs_max": float("nan"),
+                "grad_zero_ratio": float("nan"),
+                "grad_finite_ratio": float("nan"),
+                "grad_nonfinite": -1,
+                "grad_missing": 0,
+                "grad_zero": 0,
+                "delta_a": float("nan"),
+                "update_ratio": float("nan"),
+                "locked": 0,
+            }
+            autofix_active = 0
+            g_layer_raw_clamped = int(g_head_raw_clamped)
+        else:
+            g_layer_raw = gate_param.to(device=device, dtype=torch.float32)
+            gate_state = self._ctxscale_gate_state(step=step_val, g_max=g_max, g_layer_raw=g_layer_raw)
+            if (
+                need_log
+                and self.training
+                and torch.is_grad_enabled()
+                and bool(getattr(self, "_wavelet_gate_grad_seen", False))
+                and int(gate_state.get("grad_nonfinite", 0)) > 0
+            ):
+                _warn_nonfinite("gate_grad")
+            autofix_active = int(bool(self.wavelet_gate_autofix) and int(gate_state.get("locked", 0)) == 1)
+            if autofix_active == 1:
+                clamp_abs = min(clamp_abs, float(self.wavelet_gate_autofix_clamp_abs))
+            # Forward clamp for numeric safety, but keep identity gradient (STE-style)
+            # so gates initialized outside clamp range can still be optimized back.
+            g_layer_raw_clipped = g_layer_raw.clamp(min=-clamp_abs, max=clamp_abs)
+            g_layer_raw_used = g_layer_raw + (g_layer_raw_clipped - g_layer_raw).detach()
+            g_layer_raw_clamped = int(bool((g_layer_raw.detach().abs() > clamp_abs).item()))
+            g_layer = g_max * torch.sigmoid(g_layer_raw_used.to(device=device, dtype=torch.float32))
+            if not torch.isfinite(g_layer).all():
+                _warn_nonfinite("g_layer")
+                g_layer = torch.nan_to_num(
+                    g_layer,
+                    nan=0.0,
+                    posinf=g_max,
+                    neginf=0.0,
+                )
+        logits_out = E_base_raw.to(dtype=torch.float32).clone()
+        if self.wavelet_logit_bias_debug_assert:
+            assert E_base_raw.dim() == 4
+
+        diff = torch.arange(T, device=device, dtype=torch.float32)
+        q_chunk = max(1, min(int(self.wavelet_ctxscale_chunk_q), T))
+        far_only = bool(self.wavelet_ctxscale_far_only) and int(self.wavelet_ctxscale_far_min_delta) > 0
+        k_pos_long = torch.arange(T, device=device, dtype=torch.long).view(1, 1, T) if far_only else None
+        head_mask = None
+        valid_heads = None
+        if self.wavelet_ctxscale_head_indices is not None:
+            h_total = int(E_base_raw.shape[1])
+            head_mask = torch.zeros((1, h_total, 1, 1), device=device, dtype=torch.float32)
+            valid_heads = [h for h in self.wavelet_ctxscale_head_indices if 0 <= int(h) < h_total]
+            if len(valid_heads) > 0:
+                head_mask[:, valid_heads, :, :] = 1.0
+
+        sample_bias_vals = []
+        sample_eff_vals = []
+        sample_scale_vals = []
+        sample_shift_vals = []
+        sample_sraw_vals = []
+        sample_traw_vals = []
+        film_nf_flags = {"s_raw": 0, "t_raw": 0, "scale": 0, "shift": 0}
+        sat_s_num = 0
+        sat_t_num = 0
+        sat_den = 0
+        sample_budget = max(128, int(self.wavelet_ctxscale_max_log_samples))
+        sample_count = 0
+        if need_log:
+            t_take = max(1, min(int(self.wavelet_logit_bias_log_sample_tokens), T))
+            sample_q_idx = torch.linspace(0, T - 1, steps=t_take, device=device).long()
+            sample_k_idx = sample_q_idx
+        else:
+            sample_q_idx = None
+            sample_k_idx = None
+
+        for q0 in range(0, T, q_chunk):
+            q1 = min(T, q0 + q_chunk)
+
+            bias_chunk = torch.zeros((B, q1 - q0, T), device=device, dtype=torch.float32)
+            if self.wavelet_logit_bias_debug_assert:
+                assert bias_chunk.shape == (B, q1 - q0, T)
+            if use_mlp_bias_baseline:
+                # Param-matched non-wavelet baseline: low-rank U@V^T without pi-mixture.
+                u_q = torch.tanh(router_logits[:, q0:q1, 1:] / tau)
+                beta_ref = beta_m[:, q0:q1]
+                if use_scale_coupled_shift:
+                    beta_scale = torch.tanh(beta_ref)
+                else:
+                    beta_scale = torch.tanh(beta_ref / float(max(1, T - 1)))
+                u_q = u_q * (1.0 + 0.1 * beta_scale.unsqueeze(-1))
+                key_pos = (diff / float(max(1, T - 1))).view(T, 1)
+                v_k = self.mlp_bias_basis_mlp(key_pos)
+                v_k = self.mlp_bias_basis_ln(v_k)
+                v_k = self._rms_norm_last_dim(v_k, eps=eps)
+                v_k = self._maybe_clamp_p99(v_k)
+                bias_chunk = torch.einsum("bqk,tk->bqt", u_q, v_k)
+            else:
+                perm = None
+                if basis_control == "permute_scales":
+                    perm = self._wavelet_basis_perm(K=K, layer_idx=lid, device=device)
+                for i in range(K):
+                    scale_idx = int(perm[i].item()) if perm is not None else int(i)
+                    s_i = scales[scale_idx]
+                    if use_scale_coupled_shift:
+                        beta_i = beta_m[:, q0:q1] * s_i
+                    else:
+                        beta_i = beta_m[:, q0:q1]
+                    if basis_control == "random_basis":
+                        psi_table = self._random_basis_table(
+                            q_len=int(q1 - q0),
+                            T=int(T),
+                            scale_idx=int(scale_idx),
+                            layer_idx=int(lid),
+                            device=device,
+                        ).unsqueeze(0).expand(B, -1, -1)
+                    else:
+                        u_i = (diff.view(1, 1, T) - beta_i.unsqueeze(-1)) / s_i
+                        psi_table = self._ricker_wavelet(u_i)
+                    psi_table = self._rms_norm_last_dim(psi_table, eps=eps)
+                    psi_table = self._maybe_clamp_p99(psi_table)
+                    bias_chunk = bias_chunk + pi[:, q0:q1, i + 1].unsqueeze(-1) * psi_table
+
+            if far_only:
+                q_pos_long = torch.arange(q0, q1, device=device, dtype=torch.long).view(1, q1 - q0, 1)
+                delta_long = q_pos_long - k_pos_long
+                far_mask = (delta_long >= int(self.wavelet_ctxscale_far_min_delta)) & (delta_long >= 0)
+                bias_chunk = bias_chunk * far_mask.to(dtype=torch.float32)
+
+            if enable_film:
+                pi_chunk = pi[:, q0:q1, :]
+                rho_chunk = rho[:, q0:q1]
+                bias_chunk, s_raw, t_raw, scale_m, shift_m = self._ctxscale_apply_bias_film(
+                    bias_chunk=bias_chunk,
+                    pi_chunk=pi_chunk,
+                    rho_chunk=rho_chunk,
+                    g_layer=g_layer,
+                    use_mlp=use_mlp_bias_baseline,
+                )
+                film_nf_flags["s_raw"] |= int((~torch.isfinite(s_raw)).any().item())
+                film_nf_flags["t_raw"] |= int((~torch.isfinite(t_raw)).any().item())
+                film_nf_flags["scale"] |= int((~torch.isfinite(scale_m)).any().item())
+                film_nf_flags["shift"] |= int((~torch.isfinite(shift_m)).any().item())
+                if self.wavelet_logit_bias_debug_assert:
+                    if not torch.isfinite(scale_m).all():
+                        raise FloatingPointError("ctxscale_shift_v0: non-finite film scale")
+                    if not torch.isfinite(shift_m).all():
+                        raise FloatingPointError("ctxscale_shift_v0: non-finite film shift")
+                sat_s_num += int((s_raw.detach().abs() > 7.5).sum().item())
+                sat_t_num += int((t_raw.detach().abs() > 7.5).sum().item())
+                sat_den += int(s_raw.numel())
+
+            g_bias_max = float(getattr(self.config, "wavelet_ctxscale_g_bias_max", self.wavelet_ctxscale_g_bias_max))
+            if use_head_gate and g_head is not None:
+                eff_to_add = bias_chunk.unsqueeze(1) * g_head.view(1, -1, 1, 1)
+                eff_to_add = eff_to_add.clamp(min=-g_bias_max, max=g_bias_max)
+                if not torch.isfinite(eff_to_add).all():
+                    _warn_nonfinite("g_bias_head")
+                    eff_to_add = torch.nan_to_num(
+                        eff_to_add,
+                        nan=0.0,
+                        posinf=g_bias_max,
+                        neginf=-g_bias_max,
+                    )
+                eff_chunk = eff_to_add.mean(dim=1)
+            else:
+                eff_chunk = g_layer * bias_chunk
+                eff_chunk = eff_chunk.clamp(min=-g_bias_max, max=g_bias_max)
+                if not torch.isfinite(eff_chunk).all():
+                    _warn_nonfinite("g_bias")
+                    eff_chunk = torch.nan_to_num(
+                        eff_chunk,
+                        nan=0.0,
+                        posinf=g_bias_max,
+                        neginf=-g_bias_max,
+                    )
+                eff_to_add = eff_chunk.unsqueeze(1)
+            if head_mask is not None:
+                eff_to_add = eff_to_add * head_mask
+            logits_out[:, :, q0:q1, :] = logits_out[:, :, q0:q1, :] + eff_to_add
+
+            if need_log and sample_q_idx is not None and sample_count < sample_budget:
+                local = (sample_q_idx >= q0) & (sample_q_idx < q1)
+                if bool(local.any()):
+                    q_abs = sample_q_idx[local]
+                    q_local = q_abs - q0
+                    b_sel = bias_chunk.index_select(1, q_local).index_select(2, sample_k_idx)
+                    e_sel = eff_chunk.index_select(1, q_local).index_select(2, sample_k_idx)
+                    valid = sample_k_idx.view(1, 1, -1) <= q_abs.view(1, -1, 1)
+                    valid = valid.expand(B, -1, -1)
+                    b_vals = b_sel[valid]
+                    e_vals = e_sel[valid]
+                    if b_vals.numel() > 0:
+                        take = min(sample_budget - sample_count, int(b_vals.numel()))
+                        sample_bias_vals.append(b_vals[:take].detach())
+                        sample_eff_vals.append(e_vals[:take].detach())
+                        if enable_film:
+                            s_sel = scale_m.index_select(1, q_local).reshape(-1)
+                            t_sel = shift_m.index_select(1, q_local).reshape(-1)
+                            sr_sel = s_raw.index_select(1, q_local).reshape(-1)
+                            tr_sel = t_raw.index_select(1, q_local).reshape(-1)
+                            sample_scale_vals.append(s_sel[:take].detach())
+                            sample_shift_vals.append(t_sel[:take].detach())
+                            sample_sraw_vals.append(sr_sel[:take].detach())
+                            sample_traw_vals.append(tr_sel[:take].detach())
+                        sample_count += take
+
+            if self.wavelet_logit_bias_debug_assert:
+                if not torch.isfinite(bias_chunk).all():
+                    raise FloatingPointError("ctxscale_shift_v0: non-finite bias chunk")
+                if not torch.isfinite(eff_chunk).all():
+                    raise FloatingPointError("ctxscale_shift_v0: non-finite effective bias chunk")
+
+        if self.wavelet_logit_bias_debug_assert and not torch.isfinite(logits_out).all():
+            raise FloatingPointError("ctxscale_shift_v0: non-finite logits after bias injection")
+
+        payload = None
+        if need_log:
+            pi_sample = torch.nan_to_num(pi.index_select(1, sample_q_idx).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+            pi_dist = pi_sample.clamp_min(1e-12)
+            pi_entropy = -(pi_dist * pi_dist.log()).sum(dim=-1)
+            pi_top1 = pi_dist.max(dim=-1).values
+            pi_null = pi_dist[..., 0]
+            pi_entropy_q = _quantiles_flat(pi_entropy, qs=(0.5, 0.9))
+            pi_top1_q = _quantiles_flat(pi_top1, qs=(0.9,))
+
+            rho_sample = torch.nan_to_num(rho.index_select(1, sample_q_idx).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+            rho_q = _quantiles_flat(rho_sample, qs=(0.5, 0.9, 0.99))
+
+            beta_sample = torch.nan_to_num(beta_m.index_select(1, sample_q_idx).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+            beta_q = _quantiles_flat(beta_sample, qs=(0.5, 0.9, 0.99))
+            if use_scale_coupled_shift:
+                shift_unit_max = max(float(getattr(self, "wavelet_ctxscale_shift_unit_max", 1.0)), 1e-6)
+                beta_clamped = float((beta_sample.abs() >= 0.99 * shift_unit_max).float().mean().item())
+            else:
+                if use_abs_shift_causal:
+                    q_pos_sample = sample_q_idx.to(device=device, dtype=torch.float32).view(1, -1)
+                    beta_clamped = float((beta_sample >= q_pos_sample).float().mean().item())
+                else:
+                    beta_upper = float(max(1, int(T_used - 1)) if apply_shift_t_scaling else max(1, int(T_test - 1)))
+                    beta_clamped = float((beta_sample >= beta_upper).float().mean().item())
+            q_pos_sample = sample_q_idx.to(device=device, dtype=torch.float32).view(1, -1)
+            beta_over_q = beta_sample / q_pos_sample.clamp_min(1.0)
+            beta_over_q_q = _quantiles_flat(beta_over_q, qs=(0.5, 0.9, 0.99))
+            t_used_den = float(max(1, int(T_used - 1)))
+            t_test_den = float(max(1, int(T_test - 1)))
+            beta_over_tused = beta_sample / t_used_den
+            beta_over_ttest = beta_sample / t_test_den
+            beta_over_tused_q = _quantiles_flat(beta_over_tused, qs=(0.5, 0.9, 0.99))
+            beta_over_ttest_q = _quantiles_flat(beta_over_ttest, qs=(0.5, 0.9, 0.99))
+
+            bias_sample = (
+                torch.cat(sample_bias_vals, dim=0)
+                if len(sample_bias_vals) > 0
+                else torch.empty(0, device=device, dtype=torch.float32)
+            )
+            eff_sample = (
+                torch.cat(sample_eff_vals, dim=0)
+                if len(sample_eff_vals) > 0
+                else torch.empty(0, device=device, dtype=torch.float32)
+            )
+            scale_sample = (
+                torch.cat(sample_scale_vals, dim=0)
+                if len(sample_scale_vals) > 0
+                else torch.empty(0, device=device, dtype=torch.float32)
+            )
+            shift_sample = (
+                torch.cat(sample_shift_vals, dim=0)
+                if len(sample_shift_vals) > 0
+                else torch.empty(0, device=device, dtype=torch.float32)
+            )
+            sraw_sample = (
+                torch.cat(sample_sraw_vals, dim=0)
+                if len(sample_sraw_vals) > 0
+                else torch.empty(0, device=device, dtype=torch.float32)
+            )
+            traw_sample = (
+                torch.cat(sample_traw_vals, dim=0)
+                if len(sample_traw_vals) > 0
+                else torch.empty(0, device=device, dtype=torch.float32)
+            )
+            sat_s = float(sat_s_num / max(1, sat_den))
+            sat_t = float(sat_t_num / max(1, sat_den))
+
+            payload = {
+                "g_layer_raw": g_layer_raw.detach(),
+                "g_layer_raw_used": g_layer_raw_used.detach(),
+                "g_layer": g_layer.detach(),
+                "sig": float(gate_state["sig"]),
+                "sat_low": int(gate_state["sat_low"]),
+                "sat_high": int(gate_state["sat_high"]),
+                "sat_extreme": int(gate_state["sat_extreme"]),
+                "grad_abs": float(gate_state["grad_abs"]),
+                "grad_abs_p50": float(gate_state.get("grad_abs_p50", float("nan"))),
+                "grad_abs_p90": float(gate_state.get("grad_abs_p90", float("nan"))),
+                "grad_abs_max": float(gate_state.get("grad_abs_max", float("nan"))),
+                "grad_zero_ratio": float(gate_state.get("grad_zero_ratio", float("nan"))),
+                "grad_finite_ratio": float(gate_state.get("grad_finite_ratio", float("nan"))),
+                "grad_nonfinite": int(gate_state.get("grad_nonfinite", -1)),
+                "grad_missing": int(gate_state.get("grad_missing", 1)),
+                "grad_zero": int(gate_state["grad_zero"]),
+                "delta_a": float(gate_state["delta_a"]),
+                "update_ratio": float(gate_state["update_ratio"]),
+                "locked": int(gate_state["locked"]),
+                "raw_clamped": int(g_layer_raw_clamped),
+                "raw_clamp_abs": float(clamp_abs),
+                "autofix_active": int(autofix_active),
+                "param_req_grad": int(
+                    bool(
+                        gate_head_param.requires_grad
+                        if (use_head_gate and gate_head_param is not None)
+                        else gate_param.requires_grad
+                    )
+                ),
+                "pi_entropy_mean": float(pi_entropy.mean().item()),
+                "pi_entropy_p50": float(pi_entropy_q["p50"]),
+                "pi_entropy_p90": float(pi_entropy_q["p90"]),
+                "pi_top1_mean": float(pi_top1.mean().item()),
+                "pi_top1_p90": float(pi_top1_q["p90"]),
+                "pi_null_mean": float(pi_null.mean().item()),
+                "rho_p50": float(rho_q["p50"]),
+                "rho_p90": float(rho_q["p90"]),
+                "rho_p99": float(rho_q["p99"]),
+                "beta_p50": float(beta_q["p50"]),
+                "beta_p90": float(beta_q["p90"]),
+                "beta_p99": float(beta_q["p99"]),
+                "beta_clamp_frac": beta_clamped,
+                "far_only": int(far_only),
+                "far_min_delta": int(self.wavelet_ctxscale_far_min_delta),
+                "head_frac": float(head_mask.mean().item()) if head_mask is not None else 1.0,
+                "head_count": int(len(valid_heads)) if valid_heads is not None else int(E_base_raw.shape[1]),
+                "head_gate": int(bool(use_head_gate)),
+                "scale_coupled_shift": int(use_scale_coupled_shift),
+                "abs_shift_causal": int(use_abs_shift_causal),
+                "shift_T_mode": str(shift_t_mode),
+                "shift_T_ref": int(getattr(self, "wavelet_shift_T_ref", T_used)),
+                "shift_T_used": int(T_used),
+                "shift_T_test": int(T_test),
+                "beta_over_Tused_p50": float(beta_over_tused_q["p50"]),
+                "beta_over_Tused_p90": float(beta_over_tused_q["p90"]),
+                "beta_over_Tused_p99": float(beta_over_tused_q["p99"]),
+                "beta_over_Ttest_p50": float(beta_over_ttest_q["p50"]),
+                "beta_over_Ttest_p90": float(beta_over_ttest_q["p90"]),
+                "beta_over_Ttest_p99": float(beta_over_ttest_q["p99"]),
+                "beta_over_q_p50": float(beta_over_q_q["p50"]),
+                "beta_over_q_p90": float(beta_over_q_q["p90"]),
+                "beta_over_q_p99": float(beta_over_q_q["p99"]),
+                "g_head_mean": float(g_head.mean().item()) if (use_head_gate and g_head is not None) else float("nan"),
+                "g_head_p50": float(_quantiles_flat(g_head.detach().float(), qs=(0.5,))["p50"])
+                if (use_head_gate and g_head is not None)
+                else float("nan"),
+                "g_head_p90": float(_quantiles_flat(g_head.detach().float(), qs=(0.9,))["p90"])
+                if (use_head_gate and g_head is not None)
+                else float("nan"),
+                "feat_mode": str(getattr(self, "wavelet_ctx_feat_mode", "q_meanH")),
+                "wavelet_mode": str(wavelet_mode_resolved),
+                "basis_control": str(basis_control),
+                "film_enabled": int(bool(enable_film)),
+                "film_nf_s_raw": int(film_nf_flags["s_raw"]),
+                "film_nf_t_raw": int(film_nf_flags["t_raw"]),
+                "film_nf_scale": int(film_nf_flags["scale"]),
+                "film_nf_shift": int(film_nf_flags["shift"]),
+                "film_sat_s": float(sat_s),
+                "film_sat_t": float(sat_t),
+                "film_sraw_sample": sraw_sample,
+                "film_traw_sample": traw_sample,
+                "film_scale_sample": scale_sample,
+                "film_shift_sample": shift_sample,
+                "bias_sample": bias_sample,
+                "eff_sample": eff_sample,
+            }
+
+        return logits_out.to(dtype=compute_dtype), payload
+
+    def debug_ctxscale_shift_v0_sanity_check(
+        self,
+        *,
+        T: int = 128,
+        B: int = 2,
+        enable_film: bool = True,
+        device: Optional[torch.device] = None,
+    ):
+        dev = device
+        if dev is None:
+            try:
+                dev = self.wavelet_logit_bias_a.device
+            except Exception:
+                dev = torch.device("cpu")
+        T = max(8, int(T))
+        B = max(1, int(B))
+        H = int(self.num_heads)
+        D = int(self.head_dim)
+        compute_dtype = torch.float32
+
+        q = torch.randn(B, T, H, D, device=dev, dtype=torch.float32)
+        w = torch.randn(B, T, H, D, device=dev, dtype=torch.float32)
+        m_raw = torch.randn(B, H, T, T, device=dev, dtype=torch.float32)
+        M_used = torch.tril(m_raw)
+        hidden_states = torch.randn(B, T, self.hidden_size, device=dev, dtype=torch.float32)
+        E_base_raw = torch.randn(B, H, T, T, device=dev, dtype=torch.float32)
+
+        if self.wavelet_logit_bias_a.grad is not None:
+            self.wavelet_logit_bias_a.grad = None
+        for p in self.wavelet_bias_film.parameters():
+            if p.grad is not None:
+                p.grad = None
+
+        logits_out, payload = self._build_ctxscale_shift_logit_bias_v0(
+            q=q,
+            w=w,
+            M_used=M_used,
+            hidden_states=hidden_states,
+            E_base_raw=E_base_raw,
+            T=T,
+            compute_dtype=compute_dtype,
+            need_log=True,
+            layer_idx=self.layer_idx,
+            step=0,
+            enable_film=bool(enable_film),
+        )
+        loss = logits_out.float().mean()
+        loss.backward()
+
+        gate_grad = self.wavelet_logit_bias_a.grad
+        gate_grad_finite_ratio = float("nan")
+        if gate_grad is not None:
+            g = gate_grad.detach().float()
+            gate_grad_finite_ratio = float(torch.isfinite(g).to(dtype=torch.float32).mean().item())
+        film_grad_norm = 0.0
+        for p in self.wavelet_bias_film.parameters():
+            if p.grad is not None:
+                gg = p.grad.detach().float()
+                if torch.isfinite(gg).all():
+                    film_grad_norm += float(gg.norm().item())
+
+        out = {
+            "logits_finite": bool(torch.isfinite(logits_out).all().item()),
+            "bias_finite": bool(torch.isfinite(payload.get("bias_sample")).all().item())
+            if payload is not None and payload.get("bias_sample") is not None and payload.get("bias_sample").numel() > 0
+            else True,
+            "gate_grad_finite_ratio": float(gate_grad_finite_ratio),
+            "film_grad_norm": float(film_grad_norm),
+        }
+        if self.wavelet_logit_bias_debug_assert:
+            if not out["logits_finite"]:
+                raise FloatingPointError("ctxscale_shift_v0 sanity check: non-finite logits_out")
+            if not out["bias_finite"]:
+                raise FloatingPointError("ctxscale_shift_v0 sanity check: non-finite bias sample")
+            if not math.isfinite(out["gate_grad_finite_ratio"]) or out["gate_grad_finite_ratio"] < 0.99:
+                raise FloatingPointError("ctxscale_shift_v0 sanity check: non-finite gate grad")
+            if bool(enable_film) and out["film_grad_norm"] <= 0.0:
+                raise FloatingPointError("ctxscale_shift_v0 sanity check: film grad norm is zero")
+        return out
+
+    def _log_ctxscale_shift_v0_monitor(
+        self,
+        *,
+        layer_idx: Optional[int],
+        step: int,
+        payload: dict,
+        attn_probs: torch.Tensor,
+    ):
+        bias_stats = _monitor_flat_stats(payload.get("bias_sample"))
+        eff_stats = _monitor_flat_stats(payload.get("eff_sample"))
+        attn_stats = _monitor_attn_prob_stats(
+            attn_probs,
+            max_queries=int(self.wavelet_logit_bias_log_sample_tokens),
+            max_heads=int(self.wavelet_logit_bias_log_sample_heads),
+        )
+        lid = int(self.layer_idx if layer_idx is None else layer_idx)
+        g_layer_raw = float(payload["g_layer_raw"].detach().float().item())
+        g_layer_raw_used = float(payload["g_layer_raw_used"].detach().float().item())
+        g_layer = float(payload["g_layer"].detach().float().item())
+        film_sraw_stats = _monitor_scalar_stats(payload.get("film_sraw_sample"))
+        film_traw_stats = _monitor_scalar_stats(payload.get("film_traw_sample"))
+        film_scale_stats = _monitor_scalar_stats(payload.get("film_scale_sample"))
+        film_shift_stats = _monitor_scalar_stats(payload.get("film_shift_sample"))
+        g_bias_std_finite = math.isfinite(float(eff_stats["std"]))
+        msg = (
+            f"[wavelet ctxscale_shift_v0 stats] layer={lid} step={int(step)} "
+            f"g_layer_raw={g_layer_raw:.6e} g_layer_raw_used={g_layer_raw_used:.6e} "
+            f"sig={payload['sig']:.6e} g_layer={g_layer:.6e} "
+            f"sat_low={int(payload['sat_low'])} sat_high={int(payload['sat_high'])} "
+            f"sat_extreme={int(payload['sat_extreme'])} "
+            f"grad_abs={payload['grad_abs']:.6e} grad_p50={payload.get('grad_abs_p50', float('nan')):.6e} "
+            f"grad_p90={payload.get('grad_abs_p90', float('nan')):.6e} grad_max={payload.get('grad_abs_max', float('nan')):.6e} "
+            f"grad_zero_ratio={payload.get('grad_zero_ratio', float('nan')):.6e} "
+            f"grad_finite={payload.get('grad_finite_ratio', float('nan')):.6e} "
+            f"grad_nf={int(payload.get('grad_nonfinite', -1))} grad_missing={int(payload.get('grad_missing', 1))} "
+            f"grad_zero={int(payload['grad_zero'])} req_grad={int(payload.get('param_req_grad', 0))} "
+            f"delta_a={payload['delta_a']:.6e} update_ratio={payload['update_ratio']:.6e} "
+            f"locked={int(payload['locked'])} raw_clamped={int(payload.get('raw_clamped', 0))} "
+            f"raw_clamp_abs={payload.get('raw_clamp_abs', float('nan')):.6e} "
+            f"autofix={int(payload.get('autofix_active', 0))} "
+            f"feat_mode={payload.get('feat_mode', 'na')} "
+            f"wavelet_mode={payload.get('wavelet_mode', 'na')} "
+            f"basis_ctrl={payload.get('basis_control', 'none')} | "
+            f"pi_entropy mean={payload['pi_entropy_mean']:.6e} p50={payload['pi_entropy_p50']:.6e} "
+            f"p90={payload['pi_entropy_p90']:.6e} | "
+            f"pi_top1 mean={payload['pi_top1_mean']:.6e} p90={payload['pi_top1_p90']:.6e} "
+            f"null_mean={payload['pi_null_mean']:.6e} | "
+            f"rho p50={payload['rho_p50']:.6e} p90={payload['rho_p90']:.6e} p99={payload['rho_p99']:.6e} | "
+            f"beta p50={payload['beta_p50']:.6e} p90={payload['beta_p90']:.6e} "
+            f"p99={payload['beta_p99']:.6e} clamp_frac={payload['beta_clamp_frac']:.6e} | "
+            f"far_only={int(payload.get('far_only', 0))} far_min_delta={int(payload.get('far_min_delta', 0))} "
+            f"head_frac={payload.get('head_frac', 1.0):.6e} head_count={int(payload.get('head_count', 0))} | "
+            f"bias mean={bias_stats['mean']:.6e} std={bias_stats['std']:.6e} abs_p99={bias_stats['abs_p99']:.6e} | "
+            f"g_bias mean={eff_stats['mean']:.6e} std={eff_stats['std']:.6e} abs_p99={eff_stats['abs_p99']:.6e} "
+            f"std_finite={int(g_bias_std_finite)} | "
+            f"film_en={int(payload.get('film_enabled', 0))} "
+            f"film_nf={int(payload.get('film_nf_s_raw', 0))},{int(payload.get('film_nf_t_raw', 0))},"
+            f"{int(payload.get('film_nf_scale', 0))},{int(payload.get('film_nf_shift', 0))} "
+            f"film_sat_s={payload.get('film_sat_s', float('nan')):.6e} film_sat_t={payload.get('film_sat_t', float('nan')):.6e} | "
+            f"film_s_raw mean={film_sraw_stats['mean']:.6e} p50={film_sraw_stats['p50']:.6e} p90={film_sraw_stats['p90']:.6e} | "
+            f"film_t_raw mean={film_traw_stats['mean']:.6e} p50={film_traw_stats['p50']:.6e} p90={film_traw_stats['p90']:.6e} | "
+            f"film_scale mean={film_scale_stats['mean']:.6e} p50={film_scale_stats['p50']:.6e} p90={film_scale_stats['p90']:.6e} | "
+            f"film_shift mean={film_shift_stats['mean']:.6e} p50={film_shift_stats['p50']:.6e} p90={film_shift_stats['p90']:.6e} | "
+            f"attn_entropy mean={attn_stats['entropy_mean']:.6e} p50={attn_stats['entropy_p50']:.6e} "
+            f"p90={attn_stats['entropy_p90']:.6e} | "
+            f"attn_top1 mean={attn_stats['top1_mean']:.6e} p50={attn_stats['top1_p50']:.6e} "
+            f"p90={attn_stats['top1_p90']:.6e} | "
+            f"attn_margin mean={attn_stats['margin_mean']:.6e} p50={attn_stats['margin_p50']:.6e} "
+            f"p90={attn_stats['margin_p90']:.6e}"
+        )
+        self._k1_emit_log(msg)
+
+    def _k1_gain_for_heads(self, target_h: int, *, device, dtype):
+        g = self.wavelet_k1_gain.to(device=device, dtype=dtype)
+        if g.numel() != int(target_h):
+            if g.numel() == 1:
+                g = g.expand(target_h)
+            elif target_h % g.numel() == 0:
+                g = g.repeat_interleave(target_h // g.numel())
+            else:
+                reps = (target_h + g.numel() - 1) // g.numel()
+                g = g.repeat(reps)[:target_h]
+        return g.view(1, 1, target_h, 1)
+
+    def _wavelet_key_inject(
+        self,
+        *,
+        k: torch.Tensor,
+        wavelet_dtt: torch.Tensor,
+        compute_dtype: torch.dtype = torch.float32,
+        d_chunk: int = 8,
+    ):
+        B, T, H, D = k.shape
+        assert wavelet_dtt.shape == (D, T, T), (wavelet_dtt.shape, (D, T, T))
+
+        kf = k.to(dtype=compute_dtype)
+        wav = wavelet_dtt.to(dtype=compute_dtype)
+        delta_k = torch.empty_like(kf)
+        for d0 in range(0, D, d_chunk):
+            d1 = min(D, d0 + d_chunk)
+            delta_k[..., d0:d1] = torch.einsum(
+                "b n h c, c t n -> b t h c",
+                kf[..., d0:d1],
+                wav[d0:d1],
+            )
+
+        rms = torch.sqrt(delta_k.pow(2).mean(dim=-1, keepdim=True) + float(self.wavelet_k1_rms_eps))
+        delta_k_hat = delta_k / rms
+        g = self._k1_gain_for_heads(H, device=delta_k_hat.device, dtype=delta_k_hat.dtype)
+        inject = g * delta_k_hat
+        k_injected = kf + inject
+
+        if self.wavelet_k1_debug_assert:
+            assert delta_k.shape == k.shape
+            assert delta_k_hat.shape == k.shape
+            assert inject.shape == k.shape
+            if not torch.isfinite(delta_k_hat).all():
+                raise FloatingPointError("wavelet_k1: delta_k_hat has non-finite values")
+            if not torch.isfinite(k_injected).all():
+                raise FloatingPointError("wavelet_k1: k_injected has non-finite values")
+
+        return k_injected, delta_k, delta_k_hat, inject, g
+
+    def _log_key_inject_monitor(
+        self,
+        *,
+        layer_idx: Optional[int],
+        step: int,
+        delta_k: torch.Tensor,
+        g: torch.Tensor,
+        inject: torch.Tensor,
+        attn_probs: torch.Tensor,
+    ):
+        max_tokens = int(self.wavelet_k1_log_sample_tokens)
+        max_heads = int(self.wavelet_k1_log_sample_heads)
+        delta_stats = _monitor_tensor_stats_bthd(delta_k, max_tokens=max_tokens, max_heads=max_heads)
+        inject_stats = _monitor_tensor_stats_bthd(inject, max_tokens=max_tokens, max_heads=max_heads)
+        g_stats = _monitor_scalar_stats(g)
+        attn_stats = _monitor_attn_prob_stats(attn_probs, max_queries=max_tokens, max_heads=max_heads)
+        lid = int(self.layer_idx if layer_idx is None else layer_idx)
+        msg = (
+            f"[wavelet K1 stats] layer={lid} step={int(step)} "
+            f"delta_k mean={delta_stats['mean']:.6e} std={delta_stats['std']:.6e} "
+            f"abs_p99={delta_stats['abs_p99']:.6e} "
+            f"norm_p50={delta_stats['norm_p50']:.6e} norm_p90={delta_stats['norm_p90']:.6e} "
+            f"norm_p99={delta_stats['norm_p99']:.6e} | "
+            f"g mean={g_stats['mean']:.6e} p50={g_stats['p50']:.6e} p90={g_stats['p90']:.6e} p99={g_stats['p99']:.6e} | "
+            f"inject mean={inject_stats['mean']:.6e} std={inject_stats['std']:.6e} "
+            f"abs_p99={inject_stats['abs_p99']:.6e} "
+            f"norm_p50={inject_stats['norm_p50']:.6e} norm_p90={inject_stats['norm_p90']:.6e} "
+            f"norm_p99={inject_stats['norm_p99']:.6e} | "
+            f"attn_entropy mean={attn_stats['entropy_mean']:.6e} p50={attn_stats['entropy_p50']:.6e} "
+            f"p90={attn_stats['entropy_p90']:.6e} p99={attn_stats['entropy_p99']:.6e} | "
+            f"attn_top1 mean={attn_stats['top1_mean']:.6e} p50={attn_stats['top1_p50']:.6e} "
+            f"p90={attn_stats['top1_p90']:.6e} p99={attn_stats['top1_p99']:.6e} | "
+            f"attn_margin mean={attn_stats['margin_mean']:.6e} p50={attn_stats['margin_p50']:.6e} "
+            f"p90={attn_stats['margin_p90']:.6e} p99={attn_stats['margin_p99']:.6e}"
+        )
+        self._k1_emit_log(msg)
 
     @staticmethod
     def _parse_int_list(v, default=None):
@@ -3489,6 +5759,7 @@ class PaTHAttention(nn.Module):
         rel_selection = None,
         router1=None,
         router2=None,
+        hidden_states=None,
         config=None,
         global_step=None,
         router_log_every=None,
@@ -3506,13 +5777,24 @@ class PaTHAttention(nn.Module):
         B, T, H, d = q.shape
         scale = d ** -0.5
         future = _future_mask(T, q.device)  # [1,1,T,T]
+        wavelet_mode = self._normalize_wavelet_mode(getattr(config, "wavelet_mode", self.wavelet_mode))
+        rel_layer_enabled = self._rel_layer_enabled(layer_idx, config=config)
+        rel_enabled = rel_layer_enabled and (
+            wavelet_mode in ("logit_bias_ctxscale_shift_v0", "logit_bias_ctxscale_shift_v0_film", "mlp_bias_baseline_v0")
+            or wavelet_dtt is not None
+        )
+        k1_log_payload = None
+        k1_log_step = None
+        logit_bias_payload = None
+        logit_bias_step = None
+        ctxscale_shift_payload = None
 
         # --- baseline raw logits and M_base ---
         E_base_raw, M_base, strict_WK, A = path_ut_base_raw(
             q, k, w, beta, compute_dtype=compute_dtype
         )
         # --- pick M_used for defining QH in wavelet branch ---
-        if use_wavelet_fused_H:
+        if use_wavelet_fused_H and wavelet_dtt is not None:
             M_used = path_ut_M_wave_fused(q, w, beta, A, wavelet_dtt, d_chunk=d_chunk, compute_dtype=compute_dtype)
         else:
             M_used = M_base
@@ -3535,12 +5817,91 @@ class PaTHAttention(nn.Module):
         rel_alpha = float(getattr(config, "rel_alpha", getattr(config, "attn_rel_alpha", self.rel_alpha)))
         rel_logits_raw = None
         coe_layer = None
-        if wavelet_dtt is not None and self._rel_layer_enabled(layer_idx, config=config):
-            if router1 is not None and router2 is not None:
-                rel = self.wavelet_rel_from_M_scale_router(q, w, M_used, wavelet_dtt, compute_dtype=compute_dtype, d_chunk=d_chunk, layer_idx=layer_idx,
-                                                    rel_selection=rel_selection, gate1=router1, gate2=router2,config=config, global_step=global_step)
+        if rel_enabled and wavelet_mode == "key_inject":
+            k_injected, delta_k, delta_k_hat, inject, g = self._wavelet_key_inject(
+                k=k,
+                wavelet_dtt=wavelet_dtt,
+                compute_dtype=compute_dtype,
+                d_chunk=d_chunk,
+            )
+            # Key-side wavelet injection:
+            # z = q @ (k + g * RMSNorm(delta_k))^T, so the extra term is <q, g * delta_k_hat>.
+            E_base_raw, M_base, strict_WK, A = path_ut_base_raw(
+                q, k_injected, w, beta, compute_dtype=compute_dtype
+            )
+            if use_wavelet_fused_H:
+                M_used = path_ut_M_wave_fused(q, w, beta, A, wavelet_dtt, d_chunk=d_chunk, compute_dtype=compute_dtype)
             else:
-                raise ValueError("router1 and router2 must be provided when wavelet_dtt is not None")
+                M_used = M_base
+            rel = None
+            E_wav_raw = E_base_raw
+            if self.training:
+                should_log_k1, k1_log_step = self._k1_should_log(global_step=global_step, config=config)
+                if should_log_k1:
+                    k1_log_payload = {
+                        "delta_k": delta_k_hat.detach(),
+                        "inject": inject.detach(),
+                        "g": g.detach(),
+                    }
+        elif rel_enabled and wavelet_mode == "logit_bias":
+            # Exp-A logit-bias:
+            # z = z_path + g_layer * B_hat(delta), delta=(key_pos-query_pos)=(n-m).
+            b_hat, eff_bias, g_layer, causal_2d = self._build_logit_bias_term(
+                wavelet_dtt=wavelet_dtt,
+                T=T,
+                future=future,
+                device=q.device,
+                compute_dtype=compute_dtype,
+            )
+            rel = None
+            E_wav_raw = E_base_raw + eff_bias.view(1, 1, T, T)
+            if self.training:
+                should_log_bias, logit_bias_step = self._logit_bias_should_log(global_step=global_step, config=config)
+                if should_log_bias:
+                    logit_bias_payload = {
+                        "g_layer": g_layer.detach(),
+                        "b_hat": b_hat.detach(),
+                        "eff_bias": eff_bias.detach(),
+                        "causal_2d": causal_2d.detach(),
+                    }
+        elif rel_enabled and wavelet_mode in (
+            "logit_bias_ctxscale_shift_v0",
+            "logit_bias_ctxscale_shift_v0_film",
+            "mlp_bias_baseline_v0",
+        ):
+            should_log_ctx = False
+            if self.training:
+                should_log_ctx, logit_bias_step = self._logit_bias_should_log(global_step=global_step, config=config)
+            step_for_ctx = global_step if global_step is not None else logit_bias_step
+            rel = None
+            E_wav_raw, ctxscale_shift_payload = self._build_ctxscale_shift_logit_bias_v0(
+                q=q,
+                w=w,
+                M_used=M_used,
+                hidden_states=hidden_states,
+                E_base_raw=E_base_raw,
+                T=T,
+                compute_dtype=compute_dtype,
+                need_log=bool(should_log_ctx),
+                layer_idx=layer_idx,
+                step=step_for_ctx,
+                enable_film=bool(wavelet_mode == "logit_bias_ctxscale_shift_v0_film"),
+            )
+        elif rel_enabled and wavelet_mode == "router_rel":
+            if router1 is not None and router2 is not None:
+                rel = self.wavelet_rel_from_M_scale_router(
+                    q, w, M_used, wavelet_dtt,
+                    compute_dtype=compute_dtype,
+                    d_chunk=d_chunk,
+                    layer_idx=layer_idx,
+                    rel_selection=rel_selection,
+                    gate1=router1,
+                    gate2=router2,
+                    config=config,
+                    global_step=global_step,
+                )
+            else:
+                raise ValueError("router1 and router2 must be provided when wavelet_mode='router_rel'")
             # optional ablation on rel
             if ablate is not None and layer_idx in ablate:
                 for h in ablate[layer_idx]:
@@ -3552,28 +5913,16 @@ class PaTHAttention(nn.Module):
             coe_layer = rel_alpha * coe_layer
             # final logits: z = base + alpha * rel
             E_wav_raw = E_base_raw + rel_alpha * rel
-            
-            def _to_int_or_none(x):
-                if x is None:
-                    return None
-                if isinstance(x, torch.Tensor):
-                    if x.numel() != 1:
-                        return None
-                    x = x.detach().item()
-                try:
-                    return int(x)
-                except Exception:
-                    return None
 
             step_val = global_step
             if step_val is None and config is not None:
                 step_val = getattr(config, "router_global_step", None)
-            step_val = _to_int_or_none(step_val)
+            step_val = self._to_int_or_none(step_val)
 
             log_every = router_log_every
             if log_every is None and config is not None:
                 log_every = getattr(config, "router_log_every", 500)
-            log_every = _to_int_or_none(log_every)
+            log_every = self._to_int_or_none(log_every)
 
             should_log = (
                 self.training
@@ -3656,6 +6005,40 @@ class PaTHAttention(nn.Module):
             global_step=global_step,
         )
         P_wav = torch.softmax(E_wav, dim=-1)
+        if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:
+            self._wavelet_condfilm_v2_last_attn_stats = _monitor_attn_prob_stats(
+                P_wav,
+                max_queries=int(self.wavelet_logit_bias_log_sample_tokens),
+                max_heads=int(self.wavelet_logit_bias_log_sample_heads),
+            )
+        else:
+            self._wavelet_condfilm_v2_last_attn_stats = None
+        if k1_log_payload is not None and k1_log_step is not None:
+            self._log_key_inject_monitor(
+                layer_idx=layer_idx,
+                step=int(k1_log_step),
+                delta_k=k1_log_payload["delta_k"],
+                g=k1_log_payload["g"],
+                inject=k1_log_payload["inject"],
+                attn_probs=P_wav,
+            )
+        if logit_bias_payload is not None and logit_bias_step is not None:
+            self._log_logit_bias_monitor(
+                layer_idx=layer_idx,
+                step=int(logit_bias_step),
+                g_layer=logit_bias_payload["g_layer"],
+                b_hat=logit_bias_payload["b_hat"],
+                eff=logit_bias_payload["eff_bias"],
+                causal_mask_2d=logit_bias_payload["causal_2d"],
+                attn_probs=P_wav,
+            )
+        if ctxscale_shift_payload is not None and logit_bias_step is not None:
+            self._log_ctxscale_shift_v0_monitor(
+                layer_idx=layer_idx,
+                step=int(logit_bias_step),
+                payload=ctxscale_shift_payload,
+                attn_probs=P_wav,
+            )
         self._rel_prepare_debug(
             layer_idx=layer_idx,
             global_step=global_step,
@@ -3726,7 +6109,8 @@ class PaTHAttention(nn.Module):
         router1, router2 = None, None
         record_router1, record_router2 = None, None
         rel_use = self._rel_layer_enabled(self.layer_idx, self.config)
-        router_active = bool(self.config.wavelet_router) and bool(rel_use)
+        wavelet_mode = self._normalize_wavelet_mode(getattr(self.config, "wavelet_mode", self.wavelet_mode))
+        router_active = bool(self.config.wavelet_router) and bool(rel_use) and (wavelet_mode == "router_rel")
         if router_active:
             B = w.size(0)
             S=8
@@ -4086,6 +6470,7 @@ class PaTHAttention(nn.Module):
                     rel_selection=self.config.rel_selection,
                     router1=router1 if router_active else None,
                     router2=router2 if router_active else None,
+                    hidden_states=hidden_states,
                     config=self.config,
                     global_step=global_step,
                     router_log_every=getattr(self.config, "router_log_every", 500),
@@ -4191,6 +6576,18 @@ class PaTHAttention(nn.Module):
                 # dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
+            if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:
+                o = self.wavelet_cond_film_v2(
+                    q_in=hidden_states,
+                    attn_out=o,
+                    w_ctx=None,
+                )
+                self.wavelet_cond_film_v2.set_attn_stats(self._wavelet_condfilm_v2_last_attn_stats)
+                self.wavelet_cond_film_v2.log_if_needed(
+                    step=global_step,
+                    layer_idx=self.layer_idx,
+                    logger_obj=getattr(self, "logger", None),
+                )
             # if analyzer is not None:
             return o, None, past_key_values, dis_loss, record_router1, record_router2
             # else:
@@ -4218,6 +6615,18 @@ class PaTHAttention(nn.Module):
         o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
         o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
         o = self.o_proj(o)
+        if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:
+            o = self.wavelet_cond_film_v2(
+                q_in=hidden_states,
+                attn_out=o,
+                w_ctx=None,
+            )
+            self.wavelet_cond_film_v2.set_attn_stats(None)
+            self.wavelet_cond_film_v2.log_if_needed(
+                step=global_step,
+                layer_idx=self.layer_idx,
+                logger_obj=getattr(self, "logger", None),
+            )
         return o, None, past_key_values
 # class PaTHAttention(nn.Module):
 #     def __init__(
