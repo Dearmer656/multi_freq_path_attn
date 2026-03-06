@@ -4,7 +4,8 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional, Tuple
-from collections import deque
+from collections import Counter, deque
+import csv
 import json
 
 import os
@@ -39,6 +40,7 @@ from scipy.signal import find_peaks
 if TYPE_CHECKING:
     from fla.models.utils import Cache
 from rotary_embedding_torch import RotaryEmbedding
+from transformers import AutoTokenizer
 from transformers.activations import NewGELUActivation
 
 import pdb
@@ -2715,6 +2717,24 @@ class PaTHAttention(nn.Module):
         self.wavelet_logit_bias_local_step = 0
         self.wavelet_ctxscale_k = 8
         self.wavelet_ctxscale_tau = float(getattr(config, "wavelet_ctxscale_tau", getattr(config, "tau", 1.0)))
+        self.wavelet_ctxscale_tau_schedule = str(
+            getattr(config, "wavelet_ctxscale_tau_schedule", "none")
+        ).strip().lower()
+        if self.wavelet_ctxscale_tau_schedule not in ("none", "linear"):
+            self.wavelet_ctxscale_tau_schedule = "none"
+        self.wavelet_ctxscale_tau_start = float(
+            getattr(config, "wavelet_ctxscale_tau_start", self.wavelet_ctxscale_tau)
+        )
+        self.wavelet_ctxscale_tau_end = float(
+            getattr(config, "wavelet_ctxscale_tau_end", self.wavelet_ctxscale_tau)
+        )
+        self.wavelet_ctxscale_tau_anneal_steps = int(
+            getattr(config, "wavelet_ctxscale_tau_anneal_steps", 0)
+        )
+        self.wavelet_ctxscale_tau_anneal_warmup = int(
+            getattr(config, "wavelet_ctxscale_tau_anneal_warmup", 0)
+        )
+        self._last_router_jitter_stats = {}
         self.wavelet_ctxscale_router_rms_eps = float(getattr(config, "wavelet_ctxscale_router_rms_eps", 1e-6))
         self.wavelet_ctxscale_chunk_q = max(1, int(getattr(config, "wavelet_ctxscale_chunk_q", 128)))
         self.wavelet_ctxscale_max_log_samples = max(
@@ -2724,11 +2744,17 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctx_feat_rms_eps = float(getattr(config, "wavelet_ctx_feat_rms_eps", 1e-6))
         self.wavelet_ctxscale_g_max = float(getattr(config, "wavelet_ctxscale_g_max", 0.5))
         self.wavelet_ctxscale_g_bias_max = float(getattr(config, "wavelet_ctxscale_g_bias_max", 4.0))
+        self.wavelet_ctxscale_disable_layer_gate = self._as_bool(
+            getattr(config, "wavelet_ctxscale_disable_layer_gate", False), default=False
+        )
         self.wavelet_ctxscale_use_head_gate = self._as_bool(
             getattr(config, "wavelet_ctxscale_use_head_gate", False), default=False
         )
         self.wavelet_ctxscale_scale_dependent_shift = self._as_bool(
             getattr(config, "wavelet_ctxscale_scale_dependent_shift", False), default=False
+        )
+        self.wavelet_ctxscale_use_relative_position = self._as_bool(
+            getattr(config, "wavelet_ctxscale_use_relative_position", False), default=False
         )
         self.wavelet_ctxscale_shift_unit_max = float(getattr(config, "wavelet_ctxscale_shift_unit_max", 1.0))
         self.wavelet_shift_T_mode = str(getattr(config, "wavelet_shift_T_mode", "legacy")).strip().lower()
@@ -2789,6 +2815,130 @@ class PaTHAttention(nn.Module):
         self._wavelet_analysis_layer_counts = {}
         self._wavelet_analysis_layer_steps = {}
         self._wavelet_analysis_warned = set()
+        # Eval-only attention heatmap export (for per-layer/per-head comparison).
+        self.eval_attn_heatmap_enabled = self._as_bool(
+            getattr(config, "eval_attn_heatmap_enabled", False), default=False
+        )
+        self.eval_attn_heatmap_layers = self._parse_rel_layer_set(
+            getattr(config, "eval_attn_heatmap_layers", "all")
+        )
+        self.eval_attn_heatmap_case_limit = max(
+            1, int(getattr(config, "eval_attn_heatmap_case_limit", 1))
+        )
+        self.eval_attn_heatmap_case_index = max(
+            0, int(getattr(config, "eval_attn_heatmap_case_index", 0))
+        )
+        self.eval_attn_heatmap_head_limit = max(
+            0, int(getattr(config, "eval_attn_heatmap_head_limit", 0))
+        )
+        self.eval_attn_heatmap_max_seq = max(
+            0, int(getattr(config, "eval_attn_heatmap_max_seq", 0))
+        )
+        self.eval_attn_heatmap_outdir = str(
+            getattr(config, "eval_attn_heatmap_outdir", getattr(config, "save_root", "analysis"))
+        ).strip() or "analysis"
+        self.eval_attn_heatmap_run_tag = str(
+            getattr(config, "eval_attn_heatmap_run_tag", "default")
+        ).strip() or "default"
+        self.eval_attn_heatmap_separate_step = self._as_bool(
+            getattr(config, "eval_attn_heatmap_separate_step", False), default=False
+        )
+        self.eval_attn_heatmap_dpi = max(
+            40, int(getattr(config, "eval_attn_heatmap_dpi", 80))
+        )
+        self.eval_attn_heatmap_save_png = self._as_bool(
+            getattr(config, "eval_attn_heatmap_save_png", True), default=True
+        )
+        self.eval_attn_heatmap_save_pt = self._as_bool(
+            getattr(config, "eval_attn_heatmap_save_pt", False), default=False
+        )
+        # Keep .pt lightweight by default: save softmax maps only unless explicitly requested.
+        self.eval_attn_heatmap_save_pt_logits = self._as_bool(
+            getattr(config, "eval_attn_heatmap_save_pt_logits", False), default=False
+        )
+        self.eval_attn_heatmap_save_pt_outputs = self._as_bool(
+            getattr(config, "eval_attn_heatmap_save_pt_outputs", False), default=False
+        )
+        self.eval_attn_heatmap_only_rel_layers = self._as_bool(
+            getattr(config, "eval_attn_heatmap_only_rel_layers", False), default=False
+        )
+        self.eval_attn_heatmap_cmap = str(
+            getattr(config, "eval_attn_heatmap_cmap", "viridis")
+        ).strip() or "viridis"
+        self.eval_attn_heatmap_delta_cmap = str(
+            getattr(config, "eval_attn_heatmap_delta_cmap", "coolwarm")
+        ).strip() or "coolwarm"
+        self.eval_attn_heatmap_vmax_quantile = float(
+            getattr(config, "eval_attn_heatmap_vmax_quantile", 0.999)
+        )
+        self.eval_attn_heatmap_delta_quantile = float(
+            getattr(config, "eval_attn_heatmap_delta_quantile", 0.999)
+        )
+        self.eval_attn_heatmap_logit_delta_png = self._as_bool(
+            getattr(config, "eval_attn_heatmap_logit_delta_png", True), default=True
+        )
+        self.eval_attn_heatmap_logit_delta_cmap = str(
+            getattr(config, "eval_attn_heatmap_logit_delta_cmap", "coolwarm")
+        ).strip() or "coolwarm"
+        self.eval_attn_heatmap_logit_delta_quantile = float(
+            getattr(config, "eval_attn_heatmap_logit_delta_quantile", self.eval_attn_heatmap_delta_quantile)
+        )
+        self.eval_attn_heatmap_show_colorbar = self._as_bool(
+            getattr(config, "eval_attn_heatmap_show_colorbar", True), default=True
+        )
+        self.eval_attn_heatmap_min_valid_keys = max(
+            1, int(getattr(config, "eval_attn_heatmap_min_valid_keys", 64))
+        )
+        self.eval_attn_heatmap_xtick_stride = max(
+            0, int(getattr(config, "eval_attn_heatmap_xtick_stride", 512))
+        )
+        self.eval_attn_heatmap_stop_after_case = self._as_bool(
+            getattr(config, "eval_attn_heatmap_stop_after_case", False), default=False
+        )
+        self.eval_attn_heatmap_stop_layer = self._to_int_or_none(
+            getattr(config, "eval_attn_heatmap_stop_layer", None)
+        )
+        # Optional top-k token table export for each attention row (eval-only).
+        self.eval_attn_topk_enabled = self._as_bool(
+            getattr(config, "eval_attn_topk_enabled", True), default=True
+        )
+        self.eval_attn_topk_k = max(
+            1, int(getattr(config, "eval_attn_topk_k", 5))
+        )
+        self.eval_attn_topk_row_stride = max(
+            1, int(getattr(config, "eval_attn_topk_row_stride", 1))
+        )
+        self.eval_attn_topk_max_rows = max(
+            0, int(getattr(config, "eval_attn_topk_max_rows", 0))
+        )
+        self.eval_attn_topk_include_base = self._as_bool(
+            getattr(config, "eval_attn_topk_include_base", True), default=True
+        )
+        self.eval_attn_topk_decode_tokens = self._as_bool(
+            getattr(config, "eval_attn_topk_decode_tokens", True), default=True
+        )
+        self.eval_attn_topk_token_max_chars = max(
+            8, int(getattr(config, "eval_attn_topk_token_max_chars", 64))
+        )
+        self.eval_attn_topk_export_full_matrix = self._as_bool(
+            getattr(config, "eval_attn_topk_export_full_matrix", False), default=False
+        )
+        self.eval_attn_topk_full_matrix_head_limit = max(
+            1, int(getattr(config, "eval_attn_topk_full_matrix_head_limit", 1))
+        )
+        self.eval_attn_topk_export_qa_text = self._as_bool(
+            getattr(config, "eval_attn_topk_export_qa_text", True), default=True
+        )
+        self._eval_attn_tokenizer = None
+        self._eval_attn_tokenizer_ready = False
+        self._eval_attn_tokenizer_name = None
+        self._eval_attn_heatmap_export_count = 0
+        self.eval_attn_mech_enabled = self._as_bool(
+            getattr(config, "eval_attn_mech_enabled", getattr(config, "eval_attn_heatmap_enabled", False)),
+            default=False,
+        )
+        self.eval_attn_mech_eps = float(getattr(config, "eval_attn_mech_eps", 1e-12))
+        self._eval_attn_mech_last = None
         self.wavelet_ctxscale_abs_shift_causal = self._as_bool(
             getattr(config, "wavelet_ctxscale_abs_shift_causal", False), default=False
         )
@@ -2800,6 +2950,14 @@ class PaTHAttention(nn.Module):
             getattr(config, "wavelet_ctxscale_far_only", False), default=False
         )
         self.wavelet_ctxscale_far_min_delta = max(0, int(getattr(config, "wavelet_ctxscale_far_min_delta", 0)))
+        # Eval-time controllable attenuation for very long distances:
+        # if delta > wavelet_ctxscale_far_over_delta, multiply wavelet bias by wavelet_ctxscale_far_over_alpha.
+        self.wavelet_ctxscale_far_over_delta = max(
+            0, int(getattr(config, "wavelet_ctxscale_far_over_delta", 0))
+        )
+        self.wavelet_ctxscale_far_over_alpha = float(
+            getattr(config, "wavelet_ctxscale_far_over_alpha", 1.0)
+        )
         head_cfg = getattr(config, "wavelet_ctxscale_head_indices", "all")
         if isinstance(head_cfg, str) and head_cfg.strip().lower() in ("", "all", "*", "none"):
             self.wavelet_ctxscale_head_indices = None
@@ -3301,6 +3459,936 @@ class PaTHAttention(nn.Module):
             pass
         return True
 
+    def _eval_attn_heatmap_rank0(self) -> bool:
+        return self._wavelet_analysis_rank0()
+
+    def _eval_attn_heatmap_layer_enabled(self, layer_idx: Optional[int]) -> bool:
+        layers = getattr(self, "eval_attn_heatmap_layers", None)
+        if layers is None:
+            return True
+        lid = int(self.layer_idx if layer_idx is None else layer_idx)
+        return int(lid) in layers
+
+    def _eval_attn_heatmap_emit(self, msg: str):
+        logger_obj = getattr(self, "logger", None)
+        if logger_obj is not None:
+            try:
+                logger_obj.info(msg)
+                return
+            except Exception:
+                pass
+        print(msg)
+
+    @staticmethod
+    def _infer_total_layers_from_config(cfg) -> Optional[int]:
+        if cfg is None:
+            return None
+        for key in ("num_hidden_layers", "n_layer", "num_layers", "n_layers"):
+            try:
+                v = int(getattr(cfg, key))
+                if v > 0:
+                    return v
+            except Exception:
+                continue
+        return None
+
+    def _eval_attn_heatmap_block_tag(self) -> str:
+        cfg = getattr(self, "config", None)
+        block_size = None
+        for key in ("block_size", "seq_len", "max_position_embeddings"):
+            try:
+                v = int(getattr(cfg, key))
+                if v > 0:
+                    block_size = v
+                    break
+            except Exception:
+                continue
+        if block_size is None:
+            return "block_unknown"
+        return f"block_{int(block_size)}"
+
+    @staticmethod
+    def _heatmap_quantile_or_max(
+        x: torch.Tensor,
+        *,
+        quantile: float,
+        min_value: float = 1e-8,
+    ) -> float:
+        xf = x.detach().reshape(-1)
+        if xf.numel() <= 0:
+            return float(min_value)
+        xf = xf[torch.isfinite(xf)]
+        if xf.numel() <= 0:
+            return float(min_value)
+        q = float(max(0.0, min(1.0, quantile)))
+        if q >= 1.0:
+            v = float(xf.max().item())
+        else:
+            v = float(torch.quantile(xf, q).item())
+        if not math.isfinite(v):
+            v = float(min_value)
+        return float(max(v, min_value))
+
+    @torch.no_grad()
+    def _compute_output_delta_stats(
+        self,
+        *,
+        out_base_bt_hd: torch.Tensor,
+        out_wave_bt_hd: torch.Tensor,
+    ) -> Optional[dict]:
+        if out_base_bt_hd is None or out_wave_bt_hd is None:
+            return None
+        if out_base_bt_hd.dim() != 3 or out_wave_bt_hd.dim() != 3:
+            return None
+        if out_base_bt_hd.shape != out_wave_bt_hd.shape:
+            return None
+
+        eps = float(max(1e-12, float(getattr(self, "eval_attn_mech_eps", 1e-12))))
+        ob = torch.nan_to_num(out_base_bt_hd.detach().to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        ow = torch.nan_to_num(out_wave_bt_hd.detach().to(dtype=torch.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        delta = ow - ob
+
+        base_tok = torch.linalg.vector_norm(ob, ord=2, dim=-1)      # [T,H]
+        delta_tok = torch.linalg.vector_norm(delta, ord=2, dim=-1)  # [T,H]
+        rel_tok = delta_tok / base_tok.clamp_min(eps)
+        rel_tok_head = rel_tok.mean(dim=0) if rel_tok.numel() > 0 else torch.zeros((ob.shape[1],), dtype=torch.float32)
+
+        base_flat = ob.reshape(-1)
+        wave_flat = ow.reshape(-1)
+        delta_flat = delta.reshape(-1)
+        base_l2 = torch.linalg.vector_norm(base_flat, ord=2)
+        wave_l2 = torch.linalg.vector_norm(wave_flat, ord=2)
+        delta_l2 = torch.linalg.vector_norm(delta_flat, ord=2)
+        dot = torch.dot(base_flat, wave_flat)
+        cos = dot / (base_l2 * wave_l2).clamp_min(eps)
+
+        rel_q = _quantiles_flat(rel_tok.reshape(-1), qs=(0.5, 0.9, 0.99))
+        return {
+            "delta_o_l2_over_base_l2": float((delta_l2 / base_l2.clamp_min(eps)).item()),
+            "delta_o_mean_token_l2": float(delta_tok.mean().item()),
+            "base_o_mean_token_l2": float(base_tok.mean().item()),
+            "delta_o_mean_token_l2_over_base": float((delta_tok.mean() / base_tok.mean().clamp_min(eps)).item()),
+            "delta_o_rel_token_mean": float(rel_tok.mean().item()),
+            "delta_o_rel_token_p50": float(rel_q["p50"]),
+            "delta_o_rel_token_p90": float(rel_q["p90"]),
+            "delta_o_rel_token_p99": float(rel_q["p99"]),
+            "delta_o_cosine_flat": float(cos.item()),
+            "delta_o_rel_token_head_mean": [float(x.item()) for x in rel_tok_head],
+        }
+
+    @torch.no_grad()
+    def _record_eval_attn_mech_stats(
+        self,
+        *,
+        layer_idx: Optional[int],
+        out_base: Optional[torch.Tensor],  # [B,T,H,d]
+        out_wav: Optional[torch.Tensor],   # [B,T,H,d]
+        global_step=None,
+        rel_applied: bool = False,
+        has_wavelet: bool = False,
+        wavelet_mode: Optional[str] = None,
+    ):
+        if not bool(getattr(self, "eval_attn_mech_enabled", False)):
+            return
+        if self.training:
+            return
+        if out_base is None or out_wav is None:
+            return
+        if out_base.dim() != 4 or out_wav.dim() != 4:
+            return
+        if out_base.shape != out_wav.shape:
+            return
+
+        lid = int(self.layer_idx if layer_idx is None else layer_idx)
+        B, T, H, _ = out_wav.shape
+        if B <= 0 or T <= 0 or H <= 0:
+            return
+        bidx = min(int(self.eval_attn_heatmap_case_index), B - 1)
+        t_take = int(T)
+        if int(getattr(self, "eval_attn_heatmap_max_seq", 0)) > 0:
+            t_take = min(t_take, int(getattr(self, "eval_attn_heatmap_max_seq", 0)))
+        h_take = H if int(self.eval_attn_heatmap_head_limit) <= 0 else min(H, int(self.eval_attn_heatmap_head_limit))
+
+        out_base_b = out_base[bidx, :t_take, :h_take, :]
+        out_wav_b = out_wav[bidx, :t_take, :h_take, :]
+        stats = self._compute_output_delta_stats(out_base_bt_hd=out_base_b, out_wave_bt_hd=out_wav_b)
+        if stats is None:
+            return
+        step_val = self._to_int_or_none(global_step)
+        if step_val is None:
+            step_val = -1
+        stats.update(
+            {
+                "layer": int(lid),
+                "step": int(step_val),
+                "batch_index": int(bidx),
+                "q_len": int(t_take),
+                "num_heads_saved": int(h_take),
+                "num_heads_total": int(H),
+                "wavelet_mode": str(
+                    wavelet_mode if wavelet_mode is not None else getattr(self, "wavelet_mode_resolved", "unknown")
+                ),
+                "rel_applied": bool(rel_applied),
+                "has_wavelet": bool(has_wavelet),
+            }
+        )
+        self._eval_attn_mech_last = stats
+
+    @torch.no_grad()
+    def _eval_attn_get_tokenizer(self):
+        if bool(getattr(self, "_eval_attn_tokenizer_ready", False)):
+            return getattr(self, "_eval_attn_tokenizer", None)
+        self._eval_attn_tokenizer_ready = True
+        cfg = getattr(self, "config", None)
+        cands = []
+        for key in ("tokenizer_name", "model_name_or_path", "_name_or_path"):
+            if cfg is None:
+                continue
+            val = str(getattr(cfg, key, "") or "").strip()
+            if len(val) > 0 and val not in cands:
+                cands.append(val)
+        if "gpt2" not in cands:
+            cands.append("gpt2")
+        for name in cands:
+            try:
+                tok = AutoTokenizer.from_pretrained(name, use_fast=True, local_files_only=True)
+                self._eval_attn_tokenizer = tok
+                self._eval_attn_tokenizer_name = name
+                return tok
+            except Exception:
+                continue
+        self._eval_attn_tokenizer = None
+        self._eval_attn_tokenizer_name = None
+        return None
+
+    @staticmethod
+    def _eval_attn_clean_token_text(token_text: str, max_chars: int) -> str:
+        s = str(token_text)
+        s = s.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+        # GPT-2 BPE visible-space marker.
+        s = s.replace("Ġ", "▁")
+        if len(s) > int(max_chars):
+            s = s[: int(max_chars) - 3] + "..."
+        return s
+
+    @torch.no_grad()
+    def _eval_attn_extract_token_view(
+        self,
+        *,
+        input_ids: Optional[torch.Tensor],
+        batch_index: int,
+        need_len: int,
+    ) -> tuple[list[int], list[str]]:
+        need_len = max(0, int(need_len))
+        if need_len <= 0:
+            return [], []
+        tok_ids = [-1 for _ in range(need_len)]
+        tok_txt = ["" for _ in range(need_len)]
+        if input_ids is None or (not torch.is_tensor(input_ids)) or input_ids.dim() != 2:
+            for i in range(need_len):
+                tok_txt[i] = f"pos:{i}"
+            return tok_ids, tok_txt
+        B, T = int(input_ids.shape[0]), int(input_ids.shape[1])
+        if B <= 0 or T <= 0:
+            for i in range(need_len):
+                tok_txt[i] = f"pos:{i}"
+            return tok_ids, tok_txt
+        bidx = min(max(0, int(batch_index)), B - 1)
+        take = min(int(need_len), int(T))
+        ids_cpu = input_ids[bidx, :take].detach().to(device="cpu", dtype=torch.long).tolist()
+        tok = self._eval_attn_get_tokenizer() if bool(getattr(self, "eval_attn_topk_decode_tokens", True)) else None
+        max_chars = int(getattr(self, "eval_attn_topk_token_max_chars", 64))
+        for i in range(take):
+            tid = int(ids_cpu[i])
+            tok_ids[i] = tid
+            if tok is None:
+                tok_txt[i] = f"id:{tid}"
+                continue
+            text = None
+            try:
+                text = tok.convert_ids_to_tokens(tid)
+            except Exception:
+                text = None
+            if text is None:
+                try:
+                    text = tok.decode([tid], clean_up_tokenization_spaces=False)
+                except Exception:
+                    text = None
+            if text is None:
+                text = f"id:{tid}"
+            tok_txt[i] = self._eval_attn_clean_token_text(text, max_chars=max_chars)
+        for i in range(take, need_len):
+            tok_txt[i] = f"pos:{i}"
+        return tok_ids, tok_txt
+
+    @torch.no_grad()
+    def _eval_attn_extract_qa_text(self, decoded_text: str) -> dict:
+        text = str(decoded_text or "")
+        q_text = ""
+        a_text = ""
+        q_span = re.search(
+            r"Question\s*:\s*(.*?)(?:\n+\s*Answer\s*:|Answer\s*:)",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if q_span is not None:
+            q_text = q_span.group(1).strip()
+        a_span = re.search(
+            r"Answer\s*:\s*(.*)",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if a_span is not None:
+            a_text = a_span.group(1).strip()
+            # Trim common LM special token tails.
+            a_text = re.split(r"<\|endoftext\|>|<\|eot_id\|>", a_text, maxsplit=1)[0].strip()
+        return {
+            "question": q_text,
+            "answer": a_text,
+        }
+
+    @torch.no_grad()
+    def _export_eval_attn_topk_table(
+        self,
+        *,
+        out_root: Path,
+        layer_idx: int,
+        case_id: int,
+        step_val: int,
+        head_limit: int,
+        q_take: int,
+        k_take: int,
+        p_base_cpu: torch.Tensor,   # [H,Q,K]
+        p_wav_cpu: torch.Tensor,    # [H,Q,K]
+        logit_delta_cpu: Optional[torch.Tensor] = None,  # [H,Q,K]
+        input_ids: Optional[torch.Tensor] = None,        # [B,T]
+        batch_index: int = 0,
+    ):
+        if int(head_limit) <= 0 or int(q_take) <= 0 or int(k_take) <= 0:
+            return
+        topk_k = max(1, int(getattr(self, "eval_attn_topk_k", 5)))
+        row_stride = max(1, int(getattr(self, "eval_attn_topk_row_stride", 1)))
+        max_rows = max(0, int(getattr(self, "eval_attn_topk_max_rows", 0)))
+        include_base = bool(getattr(self, "eval_attn_topk_include_base", True))
+        sources = ["wavelet", "base"] if include_base else ["wavelet"]
+
+        need_len = max(int(q_take), int(k_take))
+        tok_ids, tok_txt = self._eval_attn_extract_token_view(
+            input_ids=input_ids,
+            batch_index=int(batch_index),
+            need_len=int(need_len),
+        )
+        tok = self._eval_attn_get_tokenizer() if bool(getattr(self, "eval_attn_topk_decode_tokens", True)) else None
+        decoded_text = ""
+        if tok is not None:
+            valid_ids = [int(x) for x in tok_ids if int(x) >= 0]
+            if len(valid_ids) > 0:
+                try:
+                    decoded_text = tok.decode(valid_ids, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                except Exception:
+                    decoded_text = ""
+        if bool(getattr(self, "eval_attn_topk_export_qa_text", True)):
+            qa_payload = self._eval_attn_extract_qa_text(decoded_text=decoded_text)
+            with (out_root / "qa_content.json").open("w", encoding="utf-8") as fout:
+                json.dump(
+                    {
+                        "layer": int(layer_idx),
+                        "case_id": int(case_id),
+                        "step": int(step_val),
+                        "question": str(qa_payload.get("question", "")),
+                        "answer": str(qa_payload.get("answer", "")),
+                        "decoded_text": str(decoded_text),
+                    },
+                    fout,
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+        out_csv = out_root / "topk_tokens.csv"
+        out_rowmax = out_root / "rowmax_tokens.csv"
+        out_freq = out_root / "top1_token_freq.csv"
+        out_sum = out_root / "topk_summary_by_head.csv"
+        out_tokens = out_root / "token_table.csv"
+
+        top1_dist = {}
+        top1_tok_counter = {}
+        rowmax_records = []
+
+        with out_tokens.open("w", encoding="utf-8", newline="") as fout:
+            writer = csv.writer(fout)
+            writer.writerow(["pos", "token_id", "token"])
+            for pos in range(int(need_len)):
+                tid = int(tok_ids[pos]) if pos < len(tok_ids) else -1
+                ttxt = tok_txt[pos] if pos < len(tok_txt) else f"pos:{pos}"
+                writer.writerow([int(pos), int(tid), str(ttxt)])
+
+        with out_csv.open("w", encoding="utf-8", newline="") as fout:
+            writer = csv.writer(fout)
+            writer.writerow(
+                [
+                    "layer",
+                    "case_id",
+                    "step",
+                    "head",
+                    "score_source",
+                    "q_pos",
+                    "q_token_id",
+                    "q_token",
+                    "rank",
+                    "k_pos",
+                    "k_token_id",
+                    "k_token",
+                    "key_distance",
+                    "score_value",
+                    "p_base",
+                    "p_wavelet",
+                    "p_delta",
+                    "logit_delta",
+                ]
+            )
+            for hid in range(int(head_limit)):
+                pb = p_base_cpu[hid]
+                pw = p_wav_cpu[hid]
+                row_seen = 0
+                for qpos in range(0, int(q_take), int(row_stride)):
+                    if int(max_rows) > 0 and row_seen >= int(max_rows):
+                        break
+                    row_seen += 1
+                    valid_k = min(int(k_take), int(qpos) + 1)  # causal valid range
+                    if valid_k <= 0:
+                        continue
+                    q_tid = int(tok_ids[qpos]) if qpos < len(tok_ids) else -1
+                    q_tok = tok_txt[qpos] if qpos < len(tok_txt) else f"pos:{qpos}"
+                    for source in sources:
+                        ref = pw if source == "wavelet" else pb
+                        vec = ref[qpos, :valid_k]
+                        cur_k = min(int(topk_k), int(valid_k))
+                        vals, idxs = torch.topk(vec, k=cur_k, largest=True, sorted=True)
+                        for ridx in range(int(cur_k)):
+                            kpos = int(idxs[ridx].item())
+                            score = float(vals[ridx].item())
+                            p_b = float(pb[qpos, kpos].item())
+                            p_w = float(pw[qpos, kpos].item())
+                            p_d = float(p_w - p_b)
+                            l_d = (
+                                float(logit_delta_cpu[hid, qpos, kpos].item())
+                                if logit_delta_cpu is not None
+                                else 0.0
+                            )
+                            k_tid = int(tok_ids[kpos]) if kpos < len(tok_ids) else -1
+                            k_tok = tok_txt[kpos] if kpos < len(tok_txt) else f"pos:{kpos}"
+                            writer.writerow(
+                                [
+                                    int(layer_idx),
+                                    int(case_id),
+                                    int(step_val),
+                                    int(hid),
+                                    str(source),
+                                    int(qpos),
+                                    int(q_tid),
+                                    str(q_tok),
+                                    int(ridx + 1),
+                                    int(kpos),
+                                    int(k_tid),
+                                    str(k_tok),
+                                    int(qpos - kpos),
+                                    score,
+                                    p_b,
+                                    p_w,
+                                    p_d,
+                                    l_d,
+                                ]
+                            )
+                        if int(cur_k) > 0:
+                            k0 = int(idxs[0].item())
+                            key = (int(hid), str(source))
+                            if key not in top1_dist:
+                                top1_dist[key] = []
+                                top1_tok_counter[key] = Counter()
+                            top1_dist[key].append(int(qpos - k0))
+                            tok0 = tok_txt[k0] if k0 < len(tok_txt) else f"pos:{k0}"
+                            top1_tok_counter[key][str(tok0)] += 1
+                            rowmax_records.append(
+                                {
+                                    "layer": int(layer_idx),
+                                    "case_id": int(case_id),
+                                    "step": int(step_val),
+                                    "head": int(hid),
+                                    "score_source": str(source),
+                                    "q_pos": int(qpos),
+                                    "q_token_id": int(q_tid),
+                                    "q_token": str(q_tok),
+                                    "max_k_pos": int(k0),
+                                    "max_k_token_id": int(tok_ids[k0]) if k0 < len(tok_ids) else -1,
+                                    "max_k_token": str(tok0),
+                                    "key_distance": int(qpos - k0),
+                                    "max_score": float(vec[k0].item()),
+                                    "p_base": float(pb[qpos, k0].item()),
+                                    "p_wavelet": float(pw[qpos, k0].item()),
+                                    "p_delta": float((pw[qpos, k0] - pb[qpos, k0]).item()),
+                                    "logit_delta": (
+                                        float(logit_delta_cpu[hid, qpos, k0].item())
+                                        if logit_delta_cpu is not None
+                                        else 0.0
+                                    ),
+                                }
+                            )
+
+        with out_rowmax.open("w", encoding="utf-8", newline="") as fout:
+            writer = csv.writer(fout)
+            writer.writerow(
+                [
+                    "layer",
+                    "case_id",
+                    "step",
+                    "head",
+                    "score_source",
+                    "q_pos",
+                    "q_token_id",
+                    "q_token",
+                    "max_k_pos",
+                    "max_k_token_id",
+                    "max_k_token",
+                    "key_distance",
+                    "max_score",
+                    "p_base",
+                    "p_wavelet",
+                    "p_delta",
+                    "logit_delta",
+                ]
+            )
+            for rec in rowmax_records:
+                writer.writerow(
+                    [
+                        rec["layer"],
+                        rec["case_id"],
+                        rec["step"],
+                        rec["head"],
+                        rec["score_source"],
+                        rec["q_pos"],
+                        rec["q_token_id"],
+                        rec["q_token"],
+                        rec["max_k_pos"],
+                        rec["max_k_token_id"],
+                        rec["max_k_token"],
+                        rec["key_distance"],
+                        rec["max_score"],
+                        rec["p_base"],
+                        rec["p_wavelet"],
+                        rec["p_delta"],
+                        rec["logit_delta"],
+                    ]
+                )
+
+        if bool(getattr(self, "eval_attn_topk_export_full_matrix", False)):
+            mat_head_limit = min(
+                int(head_limit),
+                max(1, int(getattr(self, "eval_attn_topk_full_matrix_head_limit", 1))),
+            )
+            for hid in range(int(mat_head_limit)):
+                pb = p_base_cpu[hid]
+                pw = p_wav_cpu[hid]
+                for source in sources:
+                    ref = pw if source == "wavelet" else pb
+                    out_mat = out_root / f"head{hid:02d}_{source}_matrix.csv"
+                    with out_mat.open("w", encoding="utf-8", newline="") as fout:
+                        writer = csv.writer(fout)
+                        header = ["q_pos", "q_token_id", "q_token"]
+                        for kpos in range(int(k_take)):
+                            ktid = int(tok_ids[kpos]) if kpos < len(tok_ids) else -1
+                            ktok = tok_txt[kpos] if kpos < len(tok_txt) else f"pos:{kpos}"
+                            header.append(f"k{int(kpos)}|id:{int(ktid)}|{ktok}")
+                        writer.writerow(header)
+                        for qpos in range(int(q_take)):
+                            qtid = int(tok_ids[qpos]) if qpos < len(tok_ids) else -1
+                            qtok = tok_txt[qpos] if qpos < len(tok_txt) else f"pos:{qpos}"
+                            row = [int(qpos), int(qtid), str(qtok)]
+                            vals = ref[qpos, :int(k_take)].tolist()
+                            row.extend([float(v) for v in vals])
+                            writer.writerow(row)
+
+        with out_sum.open("w", encoding="utf-8", newline="") as fout:
+            writer = csv.writer(fout)
+            writer.writerow(
+                [
+                    "layer",
+                    "case_id",
+                    "step",
+                    "head",
+                    "score_source",
+                    "rows",
+                    "top1_dist_mean",
+                    "top1_dist_p50",
+                    "top1_dist_p90",
+                    "top1_dist_p99",
+                    "top1_self_ratio",
+                ]
+            )
+            for key in sorted(top1_dist.keys()):
+                hid, source = key
+                arr = torch.tensor(top1_dist[key], dtype=torch.float32)
+                if arr.numel() <= 0:
+                    continue
+                p50 = float(torch.quantile(arr, 0.5).item())
+                p90 = float(torch.quantile(arr, 0.9).item())
+                p99 = float(torch.quantile(arr, 0.99).item())
+                self_ratio = float((arr == 0).to(torch.float32).mean().item())
+                writer.writerow(
+                    [
+                        int(layer_idx),
+                        int(case_id),
+                        int(step_val),
+                        int(hid),
+                        str(source),
+                        int(arr.numel()),
+                        float(arr.mean().item()),
+                        p50,
+                        p90,
+                        p99,
+                        self_ratio,
+                    ]
+                )
+
+        with out_freq.open("w", encoding="utf-8", newline="") as fout:
+            writer = csv.writer(fout)
+            writer.writerow(
+                [
+                    "layer",
+                    "case_id",
+                    "step",
+                    "head",
+                    "score_source",
+                    "rank",
+                    "token",
+                    "count",
+                    "ratio",
+                ]
+            )
+            for key in sorted(top1_tok_counter.keys()):
+                hid, source = key
+                counter = top1_tok_counter[key]
+                total = max(1, int(sum(counter.values())))
+                for ridx, (tok, cnt) in enumerate(counter.most_common(50), start=1):
+                    writer.writerow(
+                        [
+                            int(layer_idx),
+                            int(case_id),
+                            int(step_val),
+                            int(hid),
+                            str(source),
+                            int(ridx),
+                            str(tok),
+                            int(cnt),
+                            float(cnt / total),
+                        ]
+                    )
+
+    @torch.no_grad()
+    def _export_eval_attn_heatmaps(
+        self,
+        *,
+        layer_idx: Optional[int],
+        p_base: Optional[torch.Tensor],  # [B,H,T,T], softmaxed
+        p_wav: Optional[torch.Tensor],   # [B,H,T,T], softmaxed
+        logits_base: Optional[torch.Tensor] = None,  # [B,H,T,T], masked logits before softmax
+        logits_wav: Optional[torch.Tensor] = None,   # [B,H,T,T], masked logits before softmax
+        global_step=None,
+        wavelet_mode: Optional[str] = None,
+        has_wavelet: bool = False,
+        rel_applied: bool = False,
+        out_base: Optional[torch.Tensor] = None,  # [B,T,H,d]
+        out_wav: Optional[torch.Tensor] = None,   # [B,T,H,d]
+        input_ids: Optional[torch.Tensor] = None, # [B,T]
+    ):
+        heatmap_enabled = bool(getattr(self, "eval_attn_heatmap_enabled", False)) or bool(getattr(self, "_debug_enabled", False))
+        if not heatmap_enabled:
+            return
+        if self.training:
+            return
+        if not self._eval_attn_heatmap_rank0():
+            return
+        if p_base is None or p_wav is None:
+            return
+        if p_base.dim() != 4 or p_wav.dim() != 4:
+            return
+        if int(getattr(self, "_eval_attn_heatmap_export_count", 0)) >= int(self.eval_attn_heatmap_case_limit):
+            return
+        if not self._eval_attn_heatmap_layer_enabled(layer_idx):
+            return
+
+        lid = int(self.layer_idx if layer_idx is None else layer_idx)
+        B, H, Tq, Tk = p_wav.shape
+        if B <= 0 or H <= 0 or Tq <= 0 or Tk <= 0:
+            return
+        bidx = min(int(self.eval_attn_heatmap_case_index), B - 1)
+
+        p_base_cpu = p_base[bidx].detach().to(dtype=torch.float32, device="cpu")
+        p_wav_cpu = p_wav[bidx].detach().to(dtype=torch.float32, device="cpu")
+        q_take = min(int(p_base_cpu.shape[-2]), int(p_wav_cpu.shape[-2]))
+        k_take = min(int(p_base_cpu.shape[-1]), int(p_wav_cpu.shape[-1]))
+        if self.eval_attn_heatmap_max_seq > 0:
+            q_take = min(q_take, int(self.eval_attn_heatmap_max_seq))
+            k_take = min(k_take, int(self.eval_attn_heatmap_max_seq))
+        p_base_cpu = p_base_cpu[:, :q_take, :k_take]
+        p_wav_cpu = p_wav_cpu[:, :q_take, :k_take]
+        p_delta_cpu = p_wav_cpu - p_base_cpu
+        logit_delta_cpu = None
+        if logits_base is not None and logits_wav is not None and logits_base.dim() == 4 and logits_wav.dim() == 4:
+            zb_cpu = logits_base[bidx].detach().to(dtype=torch.float32, device="cpu")[:, :q_take, :k_take]
+            zw_cpu = logits_wav[bidx].detach().to(dtype=torch.float32, device="cpu")[:, :q_take, :k_take]
+            logit_delta_cpu = torch.nan_to_num(zw_cpu - zb_cpu, nan=0.0, posinf=0.0, neginf=0.0)
+        output_delta_stats = None
+        ob_cpu = None
+        ow_cpu = None
+        od_cpu = None
+        if out_base is not None and out_wav is not None and out_base.dim() == 4 and out_wav.dim() == 4:
+            if out_base.shape == out_wav.shape:
+                t_take_o = min(int(out_base.shape[1]), q_take)
+                h_take_o = min(int(out_base.shape[2]), int(out_wav.shape[2]))
+                ob_cpu = out_base[bidx].detach().to(dtype=torch.float32, device="cpu")[:t_take_o, :h_take_o, :]
+                ow_cpu = out_wav[bidx].detach().to(dtype=torch.float32, device="cpu")[:t_take_o, :h_take_o, :]
+                od_cpu = torch.nan_to_num(ow_cpu - ob_cpu, nan=0.0, posinf=0.0, neginf=0.0)
+                output_delta_stats = self._compute_output_delta_stats(
+                    out_base_bt_hd=ob_cpu,
+                    out_wave_bt_hd=ow_cpu,
+                )
+
+        head_limit = H if int(self.eval_attn_heatmap_head_limit) <= 0 else min(H, int(self.eval_attn_heatmap_head_limit))
+        case_id = int(self._eval_attn_heatmap_export_count)
+        step_val = self._to_int_or_none(global_step)
+        if step_val is None:
+            step_val = -1
+        mode_name = str(wavelet_mode if wavelet_mode is not None else getattr(self, "wavelet_mode_resolved", "unknown"))
+        block_tag = self._eval_attn_heatmap_block_tag()
+        out_root = (
+            Path(str(self.eval_attn_heatmap_outdir))
+            / block_tag
+            / str(self.eval_attn_heatmap_run_tag)
+        )
+        if bool(getattr(self, "eval_attn_heatmap_separate_step", False)):
+            out_root = out_root / f"step{int(step_val):07d}"
+        out_root = out_root / f"layer{lid:02d}" / f"case{case_id:03d}"
+
+        try:
+            out_root.mkdir(parents=True, exist_ok=True)
+            delta_abs = p_delta_cpu[:head_limit].abs()
+            delta_head_l1 = delta_abs.mean(dim=(-2, -1))
+            logit_delta_abs = None
+            logit_delta_head_l1 = None
+            if logit_delta_cpu is not None:
+                logit_delta_abs = logit_delta_cpu[:head_limit].abs()
+                logit_delta_head_l1 = logit_delta_abs.mean(dim=(-2, -1))
+            meta = {
+                "layer": int(lid),
+                "case_id": int(case_id),
+                "step": int(step_val),
+                "batch_index": int(bidx),
+                "num_heads_total": int(H),
+                "num_heads_saved": int(head_limit),
+                "q_len": int(q_take),
+                "k_len": int(k_take),
+                "block_tag": str(block_tag),
+                "wavelet_mode": mode_name,
+                "has_wavelet": bool(has_wavelet),
+                "rel_applied": bool(rel_applied),
+                "delta_l1_mean": float(delta_abs.mean().item()) if int(head_limit) > 0 else 0.0,
+                "delta_linf": float(delta_abs.max().item()) if int(head_limit) > 0 else 0.0,
+                "delta_head_l1_mean": [float(x.item()) for x in delta_head_l1],
+                "has_logit_delta": bool(logit_delta_cpu is not None),
+                "has_output_delta": bool(output_delta_stats is not None),
+                "topk_enabled": bool(getattr(self, "eval_attn_topk_enabled", True)),
+                "topk_k": int(getattr(self, "eval_attn_topk_k", 5)),
+                "topk_row_stride": int(getattr(self, "eval_attn_topk_row_stride", 1)),
+                "topk_max_rows": int(getattr(self, "eval_attn_topk_max_rows", 0)),
+                "topk_export_full_matrix": bool(getattr(self, "eval_attn_topk_export_full_matrix", False)),
+                "topk_full_matrix_head_limit": int(getattr(self, "eval_attn_topk_full_matrix_head_limit", 1)),
+                "topk_export_qa_text": bool(getattr(self, "eval_attn_topk_export_qa_text", True)),
+            }
+            do_val = getattr(self, "_last_ctxscale_do_validation", None)
+            if isinstance(do_val, dict) and int(do_val.get("layer", -1)) == int(lid):
+                meta["ctxscale_do_validation"] = do_val
+            do_stat = getattr(self, "_last_ctxscale_do_stat", None)
+            if isinstance(do_stat, dict) and int(do_stat.get("layer", -1)) == int(lid):
+                meta["ctxscale_do_stat"] = do_stat
+            if logit_delta_abs is not None and logit_delta_head_l1 is not None and int(head_limit) > 0:
+                meta["logit_delta_l1_mean"] = float(logit_delta_abs.mean().item())
+                meta["logit_delta_linf"] = float(logit_delta_abs.max().item())
+                meta["logit_delta_head_l1_mean"] = [float(x.item()) for x in logit_delta_head_l1]
+            if output_delta_stats is not None:
+                meta.update(output_delta_stats)
+            with (out_root / "meta.json").open("w", encoding="utf-8") as fout:
+                json.dump(meta, fout, ensure_ascii=False, indent=2)
+
+            if bool(getattr(self, "eval_attn_topk_enabled", True)):
+                self._export_eval_attn_topk_table(
+                    out_root=out_root,
+                    layer_idx=int(lid),
+                    case_id=int(case_id),
+                    step_val=int(step_val),
+                    head_limit=int(head_limit),
+                    q_take=int(q_take),
+                    k_take=int(k_take),
+                    p_base_cpu=p_base_cpu[:head_limit],
+                    p_wav_cpu=p_wav_cpu[:head_limit],
+                    logit_delta_cpu=(logit_delta_cpu[:head_limit] if logit_delta_cpu is not None else None),
+                    input_ids=input_ids,
+                    batch_index=int(bidx),
+                )
+
+            if bool(self.eval_attn_heatmap_save_pt):
+                payload = {
+                    "meta": meta,
+                    "p_base": p_base_cpu[:head_limit],
+                    "p_wavelet": p_wav_cpu[:head_limit],
+                    "p_delta": p_delta_cpu[:head_limit],
+                }
+                if bool(getattr(self, "eval_attn_heatmap_save_pt_logits", False)) and (logit_delta_cpu is not None):
+                    payload["logit_base"] = zb_cpu[:head_limit]
+                    payload["logit_wavelet"] = zw_cpu[:head_limit]
+                    payload["logit_delta"] = logit_delta_cpu[:head_limit]
+                if (
+                    bool(getattr(self, "eval_attn_heatmap_save_pt_outputs", False))
+                    and (ob_cpu is not None)
+                    and (ow_cpu is not None)
+                    and (od_cpu is not None)
+                ):
+                    h_take = min(int(head_limit), int(ob_cpu.shape[1]))
+                    payload["out_base"] = ob_cpu[:, :h_take, :]
+                    payload["out_wavelet"] = ow_cpu[:, :h_take, :]
+                    payload["out_delta"] = od_cpu[:, :h_take, :]
+                torch.save(payload, out_root / "attn_probs.pt")
+
+            if bool(self.eval_attn_heatmap_save_png):
+                q_vis_start = min(max(int(self.eval_attn_heatmap_min_valid_keys) - 1, 0), max(q_take - 1, 0))
+                vmax_q = float(max(0.0, min(1.0, float(self.eval_attn_heatmap_vmax_quantile))))
+                d_q = float(max(0.0, min(1.0, float(self.eval_attn_heatmap_delta_quantile))))
+                ld_q = float(max(0.0, min(1.0, float(self.eval_attn_heatmap_logit_delta_quantile))))
+                show_logit_delta = bool(self.eval_attn_heatmap_logit_delta_png) and (logit_delta_cpu is not None)
+                for hid in range(int(head_limit)):
+                    pb = p_base_cpu[hid]
+                    pw = p_wav_cpu[hid]
+                    pd = p_delta_cpu[hid]
+                    pb_ref = pb[q_vis_start:, :]
+                    pw_ref = pw[q_vis_start:, :]
+                    pd_ref = pd[q_vis_start:, :].abs()
+                    vmax = max(
+                        self._heatmap_quantile_or_max(pb_ref, quantile=vmax_q, min_value=1e-8),
+                        self._heatmap_quantile_or_max(pw_ref, quantile=vmax_q, min_value=1e-8),
+                        1e-8,
+                    )
+                    dabs = self._heatmap_quantile_or_max(pd_ref, quantile=d_q, min_value=1e-8)
+                    if show_logit_delta:
+                        ld = logit_delta_cpu[hid]
+                        ld_ref = ld[q_vis_start:, :].abs()
+                        ldabs = self._heatmap_quantile_or_max(ld_ref, quantile=ld_q, min_value=1e-8)
+                        fig, axes = plt.subplots(1, 4, figsize=(12, 3), constrained_layout=True)
+                    else:
+                        ld = None
+                        ldabs = None
+                        fig, axes = plt.subplots(1, 3, figsize=(9, 3), constrained_layout=True)
+                    im0 = axes[0].imshow(
+                        pb.numpy(),
+                        cmap=self.eval_attn_heatmap_cmap,
+                        vmin=0.0,
+                        vmax=vmax,
+                        aspect="auto",
+                        interpolation="nearest",
+                    )
+                    im1 = axes[1].imshow(
+                        pw.numpy(),
+                        cmap=self.eval_attn_heatmap_cmap,
+                        vmin=0.0,
+                        vmax=vmax,
+                        aspect="auto",
+                        interpolation="nearest",
+                    )
+                    im2 = axes[2].imshow(
+                        pd.numpy(),
+                        cmap=self.eval_attn_heatmap_delta_cmap,
+                        vmin=-dabs,
+                        vmax=dabs,
+                        aspect="auto",
+                        interpolation="nearest",
+                    )
+                    im3 = None
+                    if show_logit_delta and ld is not None and ldabs is not None:
+                        im3 = axes[3].imshow(
+                            ld.numpy(),
+                            cmap=self.eval_attn_heatmap_logit_delta_cmap,
+                            vmin=-ldabs,
+                            vmax=ldabs,
+                            aspect="auto",
+                            interpolation="nearest",
+                        )
+                    if bool(getattr(self, "eval_attn_heatmap_show_colorbar", True)):
+                        fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+                        fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+                        fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+                        if im3 is not None:
+                            fig.colorbar(im3, ax=axes[3], fraction=0.046, pad=0.04)
+                    axes[0].set_title("base_softmax")
+                    axes[1].set_title("wavelet_softmax")
+                    axes[2].set_title("wavelet-base")
+                    if show_logit_delta:
+                        axes[3].set_title("logit_delta")
+                    xtick_stride = int(getattr(self, "eval_attn_heatmap_xtick_stride", 512))
+                    xticks = []
+                    if xtick_stride > 0:
+                        xticks = list(range(0, int(k_take), xtick_stride))
+                    if int(k_take) > 1:
+                        last_x = int(k_take) - 1
+                        if last_x not in xticks:
+                            xticks.append(last_x)
+                    for ax in axes:
+                        if len(xticks) > 0:
+                            ax.set_xticks(xticks)
+                            ax.set_xticklabels([str(x) for x in xticks], fontsize=7)
+                            ax.set_xlabel("key position", fontsize=8)
+                        else:
+                            ax.set_xticks([])
+                        ax.set_yticks([])
+                    fig.suptitle(
+                        (
+                            f"layer={lid} head={hid} step={step_val} "
+                            f"wavelet={int(bool(has_wavelet))} rel={int(bool(rel_applied))} "
+                            f"q_len={int(q_take)} k_len={int(k_take)}"
+                        ),
+                        fontsize=9,
+                    )
+                    fig.savefig(out_root / f"head{hid:02d}.png", dpi=int(self.eval_attn_heatmap_dpi))
+                    plt.close(fig)
+
+            self._eval_attn_heatmap_export_count += 1
+            self._eval_attn_heatmap_emit(
+                (
+                    f"[EvalAttnHeatmap] layer={lid} case={case_id} heads={head_limit}/{H} "
+                    f"q={q_take} k={k_take} rel={int(bool(rel_applied))} "
+                    f"delta_l1={meta['delta_l1_mean']:.3e} delta_linf={meta['delta_linf']:.3e} "
+                    f"logit_l1={float(meta.get('logit_delta_l1_mean', 0.0)):.3e} "
+                    f"out={str(out_root)}"
+                )
+            )
+
+            if bool(getattr(self, "eval_attn_heatmap_stop_after_case", False)) and (
+                int(self._eval_attn_heatmap_export_count) >= int(self.eval_attn_heatmap_case_limit)
+            ):
+                cfg = getattr(self, "config", None)
+                stop_layer = self.eval_attn_heatmap_stop_layer
+                if stop_layer is None:
+                    total_layers = self._infer_total_layers_from_config(cfg)
+                    if total_layers is not None:
+                        stop_layer = int(total_layers) - 1
+                should_stop = False if stop_layer is None else (int(lid) == int(stop_layer))
+                if should_stop:
+                    self._eval_attn_heatmap_emit(
+                        f"[EvalAttnHeatmap] stop_after_case=1 case_limit={int(self.eval_attn_heatmap_case_limit)} reached at layer={lid}; exiting."
+                    )
+                    os._exit(0)
+        except Exception as exc:
+            self._eval_attn_heatmap_emit(
+                f"[EvalAttnHeatmap][warn] layer={lid} case={case_id} export_failed=1 err={str(exc)}"
+            )
+
     def _wavelet_export_kind(self) -> str:
         if bool(getattr(self, "wavelet_viz_export", False)):
             return "viz"
@@ -3438,8 +4526,14 @@ class PaTHAttention(nn.Module):
                 "pi_entropy_p90": 0.0,
                 "pi_top1_mean": 1.0,
                 "pi_top1_p90": 1.0,
+                "pi_margin_mean": 1.0,
+                "pi_margin_p50": 1.0,
+                "pi_margin_p90": 1.0,
                 "pi_null_mean": 1.0,
                 "null_mean": 1.0,
+                "sigma_mean": 0.0,
+                "sigma_std": 0.0,
+                "flip_probability_estimate": 0.0,
                 "beta_over_T_p50": 0.0,
                 "beta_over_T_p90": 0.0,
                 "beta_over_T_p99": 0.0,
@@ -3914,6 +5008,81 @@ class PaTHAttention(nn.Module):
         )
         return x32.clamp(min=-clamp_v, max=clamp_v)
 
+    def _resolve_router_jitter_std(
+        self,
+        base_std: float,
+        *,
+        global_step: Optional[int] = None,
+        max_steps: Optional[int] = None,
+    ) -> float:
+        """
+        Resolve router jitter std with optional two-stage schedule and annealing.
+
+        Precedence:
+        1) `router_jitter_switch_step` (absolute step switch, if provided)
+        2) legacy 30% split by `max_steps`
+        3) optional linear anneal by `jitter_anneal_*`
+        """
+        jitter_std = float(base_std)
+        jitter_std_early = float(getattr(self.config, "router_jitter_std_early", jitter_std))
+        jitter_std_late = float(getattr(self.config, "router_jitter_std_late", jitter_std))
+        step_i = self._to_int_or_none(global_step)
+        max_steps_i = self._to_int_or_none(max_steps)
+        switch_step_i = self._to_int_or_none(getattr(self.config, "router_jitter_switch_step", None))
+
+        if step_i is not None:
+            if switch_step_i is not None:
+                jitter_std = jitter_std_early if step_i < switch_step_i else jitter_std_late
+            elif (max_steps_i is not None) and (max_steps_i > 0):
+                pct = float(step_i) / float(max_steps_i)
+                jitter_std = jitter_std_early if pct < 0.3 else jitter_std_late
+
+        jitter_std_end_ratio = float(getattr(self.config, "jitter_std_end_ratio", 0.0))
+        jitter_anneal_span = int(getattr(self.config, "jitter_anneal_span", 1000))
+        jitter_anneal_start_step = int(getattr(self.config, "jitter_anneal_start_step", 10000))
+        if (jitter_anneal_span > 0) and (step_i is not None) and (step_i >= jitter_anneal_start_step):
+            slope = (jitter_std_end_ratio - 1.0) / float(jitter_anneal_span)
+            coeff = 1.0 + slope * float(step_i - jitter_anneal_start_step)
+            jitter_std = max(jitter_std_end_ratio, min(coeff, 1.0)) * jitter_std
+
+        return float(max(jitter_std, 0.0))
+
+    def _resolve_wavelet_ctxscale_tau(self, *, global_step: Optional[int] = None) -> float:
+        """
+        Resolve router temperature for ctxscale branch.
+
+        Supported schedule:
+          - `none`: fixed `wavelet_ctxscale_tau`
+          - `linear`: `tau_start -> tau_end` over `tau_anneal_steps` after `tau_anneal_warmup`
+        """
+        base_tau = max(float(getattr(self, "wavelet_ctxscale_tau", 1.0)), 1e-6)
+        schedule = str(getattr(self, "wavelet_ctxscale_tau_schedule", "none")).strip().lower()
+        if schedule != "linear":
+            return base_tau
+
+        tau_start = max(float(getattr(self, "wavelet_ctxscale_tau_start", base_tau)), 1e-6)
+        tau_end = max(float(getattr(self, "wavelet_ctxscale_tau_end", base_tau)), 1e-6)
+        step_i = self._to_int_or_none(global_step)
+        if step_i is None:
+            return tau_start
+
+        warmup = max(0, int(getattr(self, "wavelet_ctxscale_tau_anneal_warmup", 0)))
+        anneal_steps = int(getattr(self, "wavelet_ctxscale_tau_anneal_steps", 0))
+        if anneal_steps <= 0:
+            anneal_steps = max(1, int(getattr(self.config, "router_max_steps", 15900)))
+
+        if step_i <= warmup:
+            return tau_start
+
+        frac = (float(step_i - warmup) / float(max(1, anneal_steps)))
+        frac = min(max(frac, 0.0), 1.0)
+        tau = tau_start + (tau_end - tau_start) * frac
+        return max(float(tau), 1e-6)
+
+    @staticmethod
+    def _normal_cdf(x: torch.Tensor) -> torch.Tensor:
+        return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+
     def _add_gaussian_jitter(
         self,
         logits: torch.Tensor,
@@ -3925,12 +5094,36 @@ class PaTHAttention(nn.Module):
     ) -> torch.Tensor:
         """
         Add gaussian jitter to router logits.
-        std is always interpreted as gaussian noise scale.
+        `std` meaning depends on `noise_adapt_style`:
+          - `logit_std` / `const`: gaussian sigma scale.
+          - `fliprate_head` / `fliprate_token`: target top1-top2 flip ratio rho0.
         """
+        router_name_s = str(router_name) if router_name is not None else "unknown"
+        noise_adapt_style_raw = str(getattr(self.config, "noise_adapt_style", "logit_std")).strip().lower()
+        style_alias = {
+            "margin_aware_token": "fliprate_token",
+            "margin_adaptive_token": "fliprate_token",
+            "adaptive_margin_token": "fliprate_token",
+            "margin_aware_head": "fliprate_head",
+            "margin_adaptive_head": "fliprate_head",
+            "adaptive_margin_head": "fliprate_head",
+        }
+        noise_adapt_style = style_alias.get(noise_adapt_style_raw, noise_adapt_style_raw)
+
         if std <= 0:
+            self._last_router_jitter_stats = {
+                "router_name": router_name_s,
+                "style_raw": noise_adapt_style_raw,
+                "style_resolved": noise_adapt_style,
+                "sigma_mean": 0.0,
+                "sigma_std": 0.0,
+                "flip_probability_estimate": 0.0,
+                "margin_mean": float("nan"),
+                "target_flip_probability": float("nan"),
+                "injected": 0,
+            }
             return logits
 
-        noise_adapt_style = getattr(self.config, "noise_adapt_style", "logit_std")
         sigma_max_cfg = getattr(self.config, "router_jitter_sigma_max", None)
         sigma_max = float("inf") if sigma_max_cfg is None else float(sigma_max_cfg)
         sigma_min_cfg = getattr(self.config, "router_jitter_sigma_min", None)
@@ -3950,12 +5143,49 @@ class PaTHAttention(nn.Module):
         logits_det = logits_work.detach()
         _, _, H, S = logits_det.shape
         if S < 2:
+            self._last_router_jitter_stats = {
+                "router_name": router_name_s,
+                "style_raw": noise_adapt_style_raw,
+                "style_resolved": noise_adapt_style,
+                "sigma_mean": 0.0,
+                "sigma_std": 0.0,
+                "flip_probability_estimate": 0.0,
+                "margin_mean": float("nan"),
+                "target_flip_probability": float("nan"),
+                "injected": 0,
+            }
             return logits
 
         sigma_raw = None
         sigma_eff = None
+        rho0 = float("nan")
+        top2 = torch.topk(logits_det, k=2, dim=-1).values
+        margin = (top2[..., 0] - top2[..., 1]).clamp_min(1e-6)  # [B,T,H]
 
-        if noise_adapt_style == "logit_std":
+        if noise_adapt_style in ("fliprate_head", "fliprate_token"):
+            # Interpret std as target flip probability rho0 in a Gaussian perturbation approximation.
+            rho0 = min(max(float(std), 1e-6), 0.499999)
+            normal = torch.distributions.Normal(
+                loc=logits_det.new_tensor(0.0),
+                scale=logits_det.new_tensor(1.0),
+            )
+            z = normal.icdf(logits_det.new_tensor(rho0)).abs().clamp_min(1e-6)
+            denom = math.sqrt(2.0) * z
+
+            if noise_adapt_style == "fliprate_head":
+                margin_bt = margin.reshape(-1, H)
+                margin_head = margin_bt.median(dim=0).values
+                sigma_head_raw = margin_head / denom
+                sigma_head_eff = sigma_head_raw.clamp(min=sigma_min, max=sigma_max)
+                sigma_raw = sigma_head_raw.view(1, 1, H, 1)
+                sigma_eff = sigma_head_eff.view(1, 1, H, 1)
+            else:
+                sigma_tok_raw = margin / denom
+                sigma_tok_eff = sigma_tok_raw.clamp(min=sigma_min, max=sigma_max)
+                sigma_raw = sigma_tok_raw.unsqueeze(-1)
+                sigma_eff = sigma_tok_eff.unsqueeze(-1)
+
+        elif noise_adapt_style == "logit_std":
             scale = logits_det.std(dim=-1, keepdim=True).clamp_min(1e-6)
             sigma_raw = float(std) * scale
             sigma_eff = sigma_raw.clamp(min=sigma_min, max=sigma_max)
@@ -3966,6 +5196,36 @@ class PaTHAttention(nn.Module):
 
         else:
             raise ValueError(f"Unknown noise_adapt_style: {noise_adapt_style}")
+
+        sigma_eff_no_last = sigma_eff
+        if sigma_eff_no_last.dim() > 0 and sigma_eff_no_last.shape[-1] == 1:
+            sigma_eff_no_last = sigma_eff_no_last.squeeze(-1)
+        sigma_eval = torch.nan_to_num(
+            sigma_eff_no_last.detach().float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).clamp_min(1e-12)
+        margin_eval = torch.nan_to_num(margin.detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+        flip_prob_est = self._normal_cdf(-(margin_eval / (math.sqrt(2.0) * sigma_eval)))
+        sigma_flat = sigma_eval.reshape(-1)
+        flip_flat = torch.nan_to_num(flip_prob_est, nan=0.0, posinf=0.0, neginf=0.0).reshape(-1)
+        margin_flat = margin_eval.reshape(-1)
+        sigma_mean = float(sigma_flat.mean().item()) if sigma_flat.numel() > 0 else float("nan")
+        sigma_std = float(sigma_flat.std(unbiased=False).item()) if sigma_flat.numel() > 0 else float("nan")
+        flip_est_mean = float(flip_flat.mean().item()) if flip_flat.numel() > 0 else float("nan")
+        margin_mean = float(margin_flat.mean().item()) if margin_flat.numel() > 0 else float("nan")
+        self._last_router_jitter_stats = {
+            "router_name": router_name_s,
+            "style_raw": noise_adapt_style_raw,
+            "style_resolved": noise_adapt_style,
+            "sigma_mean": sigma_mean,
+            "sigma_std": sigma_std,
+            "flip_probability_estimate": flip_est_mean,
+            "margin_mean": margin_mean,
+            "target_flip_probability": float(rho0) if math.isfinite(float(rho0)) else float("nan"),
+            "injected": int(self.training),
+        }
 
         def _should_log() -> bool:
             try:
@@ -3997,8 +5257,11 @@ class PaTHAttention(nn.Module):
                 msg = (
                     f"router_name={router_name} "
                     f"[router {'train' if self.training else 'eval'} stats] "
-                    f"layer={self.layer_idx} step={global_step}/{max_steps} style={noise_adapt_style} "
+                    f"layer={self.layer_idx} step={global_step}/{max_steps} "
+                    f"style={noise_adapt_style_raw}->{noise_adapt_style} "
                     f"std={std} sigmax={sigma_max_cfg} sigmin={sigma_min_cfg} "
+                    f"sigma_mean={sigma_mean:.6e} sigma_std={sigma_std:.6e} "
+                    f"flip_prob_est={flip_est_mean:.6e} margin_mean={margin_mean:.6e} "
                     f"raw_p50={_fmt_vec(raw_q[0], 6)} raw_p90={_fmt_vec(raw_q[1], 6)} raw_p95={_fmt_vec(raw_q[2], 6)} "
                     f"eff_p50={_fmt_vec(eff_q[0], 6)} eff_p90={_fmt_vec(eff_q[1], 6)} eff_p95={_fmt_vec(eff_q[2], 6)} "
                     f"clip_rate_raw={_fmt_vec(clip_rate_raw, 4)} comp_mean={_fmt_vec(comp, 4)}"
@@ -4015,12 +5278,16 @@ class PaTHAttention(nn.Module):
                 pass
 
         if not self.training:
+            if isinstance(self._last_router_jitter_stats, dict):
+                self._last_router_jitter_stats["injected"] = 0
             return logits
 
         noise = torch.randn_like(logits_work) * sigma_eff
         out = logits_work + noise
         if squeeze_head:
             out = out.squeeze(-2)
+        if isinstance(self._last_router_jitter_stats, dict):
+            self._last_router_jitter_stats["injected"] = 1
         return out
 
     def _ctxscale_router_feature(self, qf: torch.Tensor, q_corr: torch.Tensor, *, use_mlp: bool = False):
@@ -4028,6 +5295,10 @@ class PaTHAttention(nn.Module):
         feat_ln = self.mlp_bias_ctx_feat_ln if use_mlp else self.wavelet_ctx_feat_ln
         path_ln = self.mlp_bias_ctx_path_ln if use_mlp else self.wavelet_ctx_path_ln
         path_proj = self.mlp_bias_ctx_path_proj if use_mlp else self.wavelet_ctx_path_proj
+        if mode in ("q_perh", "q_headwise", "q_hw"):
+            return feat_ln(qf)
+        if mode in ("q_minus_qcorr_perh", "q_minus_qcorr_headwise", "dq_perh"):
+            return feat_ln(qf - q_corr)
         q_mean = qf.mean(dim=2)
         d_mean = (qf - q_corr).mean(dim=2)
         if mode == "q_minus_qcorr_meanh":
@@ -4156,6 +5427,192 @@ class PaTHAttention(nn.Module):
         bias_mod = scale * bias_chunk + shift
         return bias_mod, s_raw, t_raw, scale, shift
 
+    def _apply_ctxscale_do_intervention(
+        self,
+        *,
+        pi: torch.Tensor,
+        layer_idx: int,
+    ) -> torch.Tensor:
+        """
+        Forward-only intervention hook for ctxscale router probabilities.
+        spec format (attached to module as `_ctxscale_do_spec`):
+          {
+            "enabled": bool,
+            "mode": "null" | "small" | "large" | "uniform",
+            "target_layer": int,
+            "target_heads": [int, ...]
+          }
+        """
+        self._last_ctxscale_do_stat = None
+        spec = getattr(self, "_ctxscale_do_spec", None)
+        if not isinstance(spec, dict) or (not bool(spec.get("enabled", False))):
+            return pi
+        if int(spec.get("target_layer", -1)) != int(layer_idx):
+            return pi
+        mode = str(spec.get("mode", "")).strip().lower()
+        if mode not in ("null", "small", "large", "uniform"):
+            return pi
+        if pi.dim() not in (3, 4):
+            return pi
+        Kp1 = int(pi.shape[-1])
+        if Kp1 <= 1:
+            return pi
+        K = Kp1 - 1
+
+        strict = bool(spec.get("strict", True))
+        scale_idx_spec = spec.get("scale_idx", None)
+        if scale_idx_spec is None:
+            if mode == "small":
+                scale_idx = 0
+            elif mode == "large":
+                scale_idx = K - 1
+            else:
+                scale_idx = 0
+        else:
+            scale_idx = max(0, min(K - 1, int(scale_idx_spec)))
+        expected_argmax = 0 if mode == "null" else int(scale_idx + 1)
+
+        head_idx_list = []
+        if "target_head" in spec:
+            try:
+                head_idx_list.append(int(spec.get("target_head")))
+            except Exception:
+                pass
+        th = spec.get("target_heads", [])
+        if isinstance(th, (list, tuple, set)):
+            for x in th:
+                try:
+                    head_idx_list.append(int(x))
+                except Exception:
+                    continue
+
+        if pi.dim() == 4:
+            H = int(pi.shape[2])
+            head_idx = sorted(set(h for h in head_idx_list if 0 <= int(h) < H))
+            pi_old = pi
+            pi_work = pi.clone()
+            scope = "headwise"
+        else:
+            H = int(getattr(self, "num_heads", 0))
+            if H <= 0:
+                H = 1
+            head_idx = sorted(set(h for h in head_idx_list if 0 <= int(h) < H))
+            # Scheme A: keep router params shared, but expand to head-wise probs in forward.
+            # This enables single-head intervention while preserving non-target heads.
+            pi_old = pi.unsqueeze(2).expand(-1, -1, H, -1).clone()
+            pi_work = pi_old.clone()
+            scope = "broadcast_headwise_mask"
+
+        if len(head_idx) == 0:
+            head_idx = [0]
+
+        forced = torch.zeros_like(pi_work)
+        if mode == "null":
+            forced[..., 0] = 1.0
+        elif mode in ("small", "large"):
+            forced[..., int(scale_idx + 1)] = 1.0
+        elif mode == "uniform":
+            forced[..., 1:] = 1.0 / float(K)
+
+        pi_new = pi_work
+        for h in head_idx:
+            if 0 <= int(h) < int(pi_new.shape[2]):
+                pi_new[:, :, int(h), :] = forced[:, :, int(h), :]
+
+        # validation payload for downstream logging / hard checks.
+        try:
+            v = pi_new.detach().float()
+            target_h = int(head_idx[0])
+            target_pi = v[:, :, target_h, :]  # [B,T,K+1]
+            sum_prob = target_pi.sum(dim=-1)
+            pi0 = target_pi[..., 0]
+            argmax_idx = target_pi.argmax(dim=-1)
+            nnz = (target_pi > 1e-8).sum(dim=-1).float()
+            target_scale = target_pi[..., 1:] if K > 0 else target_pi[..., :0]
+            uniform_dev = 0.0
+            if mode == "uniform" and K > 0 and int(target_scale.numel()) > 0:
+                uniform_ref = torch.full_like(target_scale, 1.0 / float(K))
+                uniform_dev = float((target_scale - uniform_ref).abs().max().item())
+
+            non_target_heads = [h for h in range(int(v.shape[2])) if h not in set(head_idx)]
+            non_target_pi_change_maxabs = 0.0
+            non_target_pi_change_meanabs = 0.0
+            if len(non_target_heads) > 0:
+                d_non = (v[:, :, non_target_heads, :] - pi_old[:, :, non_target_heads, :]).abs()
+                non_target_pi_change_maxabs = float(d_non.max().item())
+                non_target_pi_change_meanabs = float(d_non.mean().item())
+
+            stat = {
+                "enabled": True,
+                "mode": mode,
+                "layer": int(layer_idx),
+                "scope": scope,
+                "strict": int(strict),
+                "num_scales": int(K),
+                "target_heads": [int(x) for x in head_idx],
+                "target_head_for_check": int(target_h),
+                "scale_idx": int(scale_idx),
+                "expected_argmax": int(expected_argmax),
+                "pi_dim_in": int(pi.dim()),
+                "pi_dim_out": int(pi_new.dim()),
+                "target_pi_min": float(target_pi.min().item()),
+                "target_pi_max": float(target_pi.max().item()),
+                "target_pi0_mean": float(pi0.mean().item()),
+                "target_sum_prob_mean": float(sum_prob.mean().item()),
+                "target_sum_prob_min": float(sum_prob.min().item()),
+                "target_sum_prob_max": float(sum_prob.max().item()),
+                "target_argmax_expected_frac": float((argmax_idx == int(expected_argmax)).float().mean().item()),
+                "target_nonzero_count_mean": float(nnz.mean().item()),
+                "target_nonzero_count_max": float(nnz.max().item()),
+                "target_uniform_scale_maxdev": float(uniform_dev),
+                "non_target_pi_change_maxabs": float(non_target_pi_change_maxabs),
+                "non_target_pi_change_meanabs": float(non_target_pi_change_meanabs),
+            }
+
+            tol = 1e-6
+            if strict:
+                if abs(stat["target_sum_prob_mean"] - 1.0) > 1e-6:
+                    raise AssertionError(f"do({mode}) failed: target pi sum mean != 1, got {stat['target_sum_prob_mean']:.6e}")
+                if abs(stat["target_sum_prob_min"] - 1.0) > 1e-5 or abs(stat["target_sum_prob_max"] - 1.0) > 1e-5:
+                    raise AssertionError(
+                        f"do({mode}) failed: target pi sum range not ~1 "
+                        f"[{stat['target_sum_prob_min']:.6e},{stat['target_sum_prob_max']:.6e}]"
+                    )
+                if mode == "null":
+                    if abs(stat["target_pi0_mean"] - 1.0) > 1e-6:
+                        raise AssertionError(f"do(null) failed: pi0 mean={stat['target_pi0_mean']:.6e}")
+                    if stat["target_nonzero_count_max"] > 1.0 + tol:
+                        raise AssertionError(f"do(null) failed: nonzero_count_max={stat['target_nonzero_count_max']:.6e}")
+                elif mode in ("small", "large"):
+                    if abs(stat["target_pi0_mean"]) > 1e-6:
+                        raise AssertionError(f"do({mode}) failed: pi0 mean={stat['target_pi0_mean']:.6e}")
+                    if stat["target_argmax_expected_frac"] < 0.999999:
+                        raise AssertionError(
+                            f"do({mode}) failed: argmax expected frac={stat['target_argmax_expected_frac']:.6e}, "
+                            f"expected_argmax={int(expected_argmax)}"
+                        )
+                    if stat["target_nonzero_count_max"] > 1.0 + tol:
+                        raise AssertionError(f"do({mode}) failed: nonzero_count_max={stat['target_nonzero_count_max']:.6e}")
+                elif mode == "uniform":
+                    if abs(stat["target_pi0_mean"]) > 1e-6:
+                        raise AssertionError(f"do(uniform) failed: pi0 mean={stat['target_pi0_mean']:.6e}")
+                    if stat["target_uniform_scale_maxdev"] > 1e-6:
+                        raise AssertionError(
+                            f"do(uniform) failed: uniform maxdev={stat['target_uniform_scale_maxdev']:.6e}"
+                        )
+
+            self._last_ctxscale_do_stat = stat
+        except Exception:
+            if strict:
+                raise
+            self._last_ctxscale_do_stat = {
+                "enabled": True,
+                "mode": mode,
+                "layer": int(layer_idx),
+                "scope": "validation_failed_non_strict",
+            }
+        return pi_new
+
     def _build_ctxscale_shift_logit_bias_v0(
         self,
         *,
@@ -4178,6 +5635,7 @@ class PaTHAttention(nn.Module):
         device = E_base_raw.device
         eps = float(self.wavelet_logit_bias_eps)
         lid = int(self.layer_idx if layer_idx is None else layer_idx)
+        self._last_ctxscale_do_validation = None
         step_val = self._to_int_or_none(step)
         if step_val is None:
             step_val = self._resolve_wavelet_gate_step(None)
@@ -4203,6 +5661,9 @@ class PaTHAttention(nn.Module):
         mf = M_used.to(device=device, dtype=torch.float32)
         scales = self.wavelet_ctxscale_scales.to(device=device, dtype=torch.float32)
         K = int(scales.numel())
+        # Expose per-token scale mixture for external analysis (same forward pass).
+        self._last_ctxscale_router_prob = None
+        self._last_ctxscale_num_scales = int(K)
         wavelet_mode_resolved = self._normalize_wavelet_mode(getattr(self.config, "wavelet_mode", self.wavelet_mode))
         use_mlp_bias_baseline = bool(wavelet_mode_resolved == "mlp_bias_baseline_v0")
         basis_control = str(getattr(self, "wavelet_basis_control", "none")).strip().lower()
@@ -4230,27 +5691,26 @@ class PaTHAttention(nn.Module):
 
         q_corr = torch.einsum("b h t j, b j h d -> b t h d", mf, wf)
         x_feat = self._ctxscale_router_feature(qf, q_corr, use_mlp=use_mlp_bias_baseline)
+        router_headwise = bool(x_feat.dim() == 4)
         router_mod = self.mlp_bias_router if use_mlp_bias_baseline else self.wavelet_ctx_router
         router_logits = router_mod(x_feat)
         router_logits = self._rms_norm_last_dim(router_logits, eps=float(self.wavelet_ctxscale_router_rms_eps))
-        tau = max(float(self.wavelet_ctxscale_tau), 1e-6)
-        router_jitter_std = getattr(self.config, "router_jitter_std", 0.0)
+        tau = self._resolve_wavelet_ctxscale_tau(global_step=step_val)
+        router_jitter_std_base = getattr(self.config, "router_jitter_std", 0.0)
         router_jitter_max_steps = getattr(self.config, "router_max_steps", 15900)
-        router_jitter_std_early = getattr(self.config, "router_jitter_std_early", router_jitter_std)
-        router_jitter_std_late = getattr(self.config, "router_jitter_std_late", router_jitter_std)
-        if (step_val is not None) and (router_jitter_max_steps not in (None, 0)):
-            pct = float(step_val) / float(router_jitter_max_steps)
-            router_jitter_std = router_jitter_std_early if pct < 0.3 else router_jitter_std_late
-        jitter_std_end_ratio = getattr(self.config, "jitter_std_end_ratio", 0.0)
-        jitter_anneal_span = getattr(self.config, "jitter_anneal_span", 1000)
-        jitter_anneal_start_step = getattr(self.config, "jitter_anneal_start_step", 10000)
-        if jitter_anneal_span > 0:
-            if step_val is not None and step_val >= jitter_anneal_start_step:
-                slope = (jitter_std_end_ratio - 1.0) / jitter_anneal_span
-                coeff = 1.0 + slope * (step_val - jitter_anneal_start_step)
-                router_jitter_std = max(jitter_std_end_ratio, min(coeff, 1.0)) * router_jitter_std
+        router_jitter_std = self._resolve_router_jitter_std(
+            router_jitter_std_base,
+            global_step=step_val,
+            max_steps=router_jitter_max_steps,
+        )
         router_jitter_style = str(getattr(self.config, "noise_adapt_style", "logit_std"))
         router_jitter_enabled = bool(router_jitter_std > 0.0)
+        router_jitter_style_resolved = str(router_jitter_style)
+        router_jitter_target_flip_probability = float("nan")
+        default_jitter_stat = float("nan") if router_jitter_enabled else 0.0
+        router_jitter_sigma_mean = default_jitter_stat
+        router_jitter_sigma_std = default_jitter_stat
+        router_jitter_flip_probability_estimate = default_jitter_stat
         if router_jitter_enabled:
             router_logits = self._add_gaussian_jitter(
                 router_logits,
@@ -4259,6 +5719,17 @@ class PaTHAttention(nn.Module):
                 global_step=step_val,
                 max_steps=router_jitter_max_steps,
             )
+            jitter_stat = getattr(self, "_last_router_jitter_stats", None)
+            if isinstance(jitter_stat, dict) and str(jitter_stat.get("router_name", "")) == "ctxscale_router":
+                router_jitter_style_resolved = str(jitter_stat.get("style_resolved", router_jitter_style))
+                router_jitter_target_flip_probability = float(
+                    jitter_stat.get("target_flip_probability", float("nan"))
+                )
+                router_jitter_sigma_mean = float(jitter_stat.get("sigma_mean", default_jitter_stat))
+                router_jitter_sigma_std = float(jitter_stat.get("sigma_std", default_jitter_stat))
+                router_jitter_flip_probability_estimate = float(
+                    jitter_stat.get("flip_probability_estimate", default_jitter_stat)
+                )
         router_jitter_injected = int(router_jitter_enabled and self.training)
         router_sigmoid_mode = str(getattr(self, "wavelet_router_sigmoid_mode", "softmax")).strip().lower()
         if router_sigmoid_mode not in ("softmax", "with_null", "no_null"):
@@ -4285,6 +5756,50 @@ class PaTHAttention(nn.Module):
                 pi_null = (1.0 - alpha_gate).clamp(min=0.0, max=1.0)
                 router_mode = "sigmoid_no_null"
             pi = torch.cat([pi_null, pi_scale], dim=-1)
+
+        # Optional forward-only do(.) intervention for causal analysis.
+        pi = self._apply_ctxscale_do_intervention(
+            pi=pi,
+            layer_idx=lid,
+        )
+        # IMPORTANT: pi_scale must be derived from post-intervention pi.
+        # Otherwise do(scale) has no effect on the final bias path.
+        pi_scale = pi[..., 1:]
+        router_headwise = bool(pi.dim() == 4)
+
+        do_stat = getattr(self, "_last_ctxscale_do_stat", None)
+        do_active = bool(
+            isinstance(do_stat, dict)
+            and bool(do_stat.get("enabled", False))
+            and int(do_stat.get("layer", -1)) == int(lid)
+        )
+        do_mode = str(do_stat.get("mode", "")) if do_active else ""
+        do_scope = str(do_stat.get("scope", "none")) if do_active else "none"
+        do_target_heads = []
+        do_target_head_for_check = -1
+        if do_active:
+            try:
+                do_target_heads = [int(x) for x in list(do_stat.get("target_heads", []))]
+            except Exception:
+                do_target_heads = []
+            do_target_head_for_check = int(do_stat.get("target_head_for_check", -1))
+            if do_target_head_for_check >= 0 and do_target_head_for_check not in do_target_heads:
+                do_target_heads = [do_target_head_for_check] + do_target_heads
+            H_for_do = int(E_base_raw.shape[1])
+            do_target_heads = sorted(set(h for h in do_target_heads if 0 <= int(h) < H_for_do))
+
+        # Save scale-only probabilities (exclude null channel) for case-level scale analysis.
+        if K > 0:
+            pi_scale_full = pi[..., 1 : (K + 1)]
+            if pi_scale_full.dim() == 3:
+                # [B,T,K] -> expand to [B,T,H,K] for head-wise tooling compatibility.
+                pi_scale_full = pi_scale_full.unsqueeze(2).expand(-1, -1, int(self.num_heads), -1)
+            elif pi_scale_full.dim() == 4:
+                pass
+            else:
+                pi_scale_full = None
+            if pi_scale_full is not None:
+                self._last_ctxscale_router_prob = pi_scale_full.detach().to(dtype=torch.float32)
 
         shift_ln = self.mlp_bias_shift_ln if use_mlp_bias_baseline else self.wavelet_shift_ln
         shift_proj = self.mlp_bias_shift_proj if use_mlp_bias_baseline else self.wavelet_shift_proj
@@ -4345,6 +5860,34 @@ class PaTHAttention(nn.Module):
         gate_param = self.mlp_bias_logit_bias_a if use_mlp_bias_baseline else self.wavelet_logit_bias_a
         gate_head_param = self.mlp_bias_logit_bias_a_head if use_mlp_bias_baseline else self.wavelet_logit_bias_a_head
         use_head_gate = bool(getattr(self, "wavelet_ctxscale_use_head_gate", False)) and (gate_head_param is not None)
+        disable_layer_gate = bool(getattr(self, "wavelet_ctxscale_disable_layer_gate", False)) and (not use_head_gate)
+        gate_branch = "layer_gate_active"
+        if use_head_gate:
+            gate_branch = "head_gate_active"
+        elif disable_layer_gate:
+            gate_branch = "layer_gate_disabled"
+        # One-time per-layer branch/config log for both train/eval debugging.
+        # This makes it explicit whether "disable_layer_gate" is actually taking effect.
+        gate_log_seen = getattr(self, "_ctxscale_gate_branch_log_seen", None)
+        if gate_log_seen is None:
+            gate_log_seen = set()
+            self._ctxscale_gate_branch_log_seen = gate_log_seen
+        gate_log_key = (
+            int(lid),
+            str(wavelet_mode_resolved),
+            str(gate_branch),
+            int(bool(getattr(self, "wavelet_ctxscale_disable_layer_gate", False))),
+            int(bool(getattr(self, "wavelet_ctxscale_use_head_gate", False))),
+        )
+        if gate_log_key not in gate_log_seen:
+            self._k1_emit_log(
+                f"[path_attn gate check] layer={int(lid)} step={int(step_val)} "
+                f"wavelet_mode={wavelet_mode_resolved} gate_branch={gate_branch} "
+                f"cfg_disable_layer_gate={int(bool(getattr(self, 'wavelet_ctxscale_disable_layer_gate', False)))} "
+                f"cfg_use_head_gate={int(bool(getattr(self, 'wavelet_ctxscale_use_head_gate', False)))} "
+                f"param_has_head_gate={int(gate_head_param is not None)}"
+            )
+            gate_log_seen.add(gate_log_key)
         g_head = None
         if use_head_gate:
             g_head_raw = gate_head_param.to(device=device, dtype=torch.float32)
@@ -4385,6 +5928,31 @@ class PaTHAttention(nn.Module):
             }
             autofix_active = 0
             g_layer_raw_clamped = int(g_head_raw_clamped)
+        elif disable_layer_gate:
+            # Ablation: remove learnable layer-wise gate and keep full bias strength.
+            g_layer_raw = gate_param.to(device=device, dtype=torch.float32)
+            g_layer_raw_used = g_layer_raw
+            g_layer_raw_clamped = 0
+            g_layer = torch.ones((), device=device, dtype=torch.float32)
+            gate_state = {
+                "sig": 1.0,
+                "sat_low": 0,
+                "sat_high": 0,
+                "sat_extreme": 0,
+                "grad_abs": float("nan"),
+                "grad_abs_p50": float("nan"),
+                "grad_abs_p90": float("nan"),
+                "grad_abs_max": float("nan"),
+                "grad_zero_ratio": float("nan"),
+                "grad_finite_ratio": float("nan"),
+                "grad_nonfinite": -1,
+                "grad_missing": 0,
+                "grad_zero": 0,
+                "delta_a": float("nan"),
+                "update_ratio": float("nan"),
+                "locked": 0,
+            }
+            autofix_active = 0
         else:
             g_layer_raw = gate_param.to(device=device, dtype=torch.float32)
             gate_state = self._ctxscale_gate_state(step=step_val, g_max=g_max, g_layer_raw=g_layer_raw)
@@ -4420,7 +5988,10 @@ class PaTHAttention(nn.Module):
         diff = torch.arange(T, device=device, dtype=torch.float32)
         q_chunk = max(1, min(int(self.wavelet_ctxscale_chunk_q), T))
         far_only = bool(self.wavelet_ctxscale_far_only) and int(self.wavelet_ctxscale_far_min_delta) > 0
-        k_pos_long = torch.arange(T, device=device, dtype=torch.long).view(1, 1, T) if far_only else None
+        far_over_delta = int(getattr(self, "wavelet_ctxscale_far_over_delta", 0))
+        far_over_alpha = float(getattr(self, "wavelet_ctxscale_far_over_alpha", 1.0))
+        apply_far_over = (far_over_delta > 0) and (far_over_alpha < 0.999999)
+        k_pos_long = torch.arange(T, device=device, dtype=torch.long).view(1, 1, T) if (far_only or apply_far_over) else None
         head_mask = None
         valid_heads = None
         if self.wavelet_ctxscale_head_indices is not None:
@@ -4430,8 +6001,25 @@ class PaTHAttention(nn.Module):
             if len(valid_heads) > 0:
                 head_mask[:, valid_heads, :, :] = 1.0
 
+        do_target_head = int(do_target_head_for_check if do_target_head_for_check >= 0 else -1)
+        if do_target_head < 0 and len(do_target_heads) > 0:
+            do_target_head = int(do_target_heads[0])
+        do_non_target_heads_sample = []
+        if do_active:
+            H_full = int(E_base_raw.shape[1])
+            do_non_target_heads_sample = [h for h in range(H_full) if h not in set(do_target_heads)][:2]
+        do_target_sum_sq = 0.0
+        do_target_sum = 0.0
+        do_target_count = 0
+        do_target_maxabs = 0.0
+        do_non_target_acc = {
+            int(h): {"sum_sq": 0.0, "sum": 0.0, "count": 0, "maxabs": 0.0}
+            for h in do_non_target_heads_sample
+        }
+
         sample_bias_vals = []
         sample_eff_vals = []
+        sample_base_vals = []
         sample_scale_vals = []
         sample_shift_vals = []
         sample_sraw_vals = []
@@ -4549,10 +6137,14 @@ class PaTHAttention(nn.Module):
             q1 = min(T, q0 + q_chunk)
             q_len = int(q1 - q0)
             far_mask = None
-            if far_only:
+            far_over_mask = None
+            if far_only or apply_far_over:
                 q_pos_long = torch.arange(q0, q1, device=device, dtype=torch.long).view(1, q_len, 1)
                 delta_long = q_pos_long - k_pos_long
+            if far_only:
                 far_mask = (delta_long >= int(self.wavelet_ctxscale_far_min_delta)) & (delta_long >= 0)
+            if apply_far_over:
+                far_over_mask = (delta_long > int(far_over_delta)) & (delta_long >= 0)
 
             analysis_q_local = None
             analysis_q_abs = None
@@ -4565,11 +6157,15 @@ class PaTHAttention(nn.Module):
                     analysis_q_count += int(B * int(q_abs_a.numel()))
 
             bias_chunk = torch.zeros((B, q1 - q0, T), device=device, dtype=torch.float32)
+            bias_chunk_head = None
             if self.wavelet_logit_bias_debug_assert:
                 assert bias_chunk.shape == (B, q1 - q0, T)
             if use_mlp_bias_baseline:
                 # Param-matched non-wavelet baseline: low-rank U@V^T without pi-mixture.
                 u_q = torch.tanh(router_logits[:, q0:q1, 1:] / tau)
+                if u_q.dim() == 4:
+                    # Keep compatibility for mlp_bias_baseline_v0 by reducing head-wise router to shared router.
+                    u_q = u_q.mean(dim=2)
                 beta_ref = beta_m[:, q0:q1]
                 if use_scale_coupled_shift:
                     beta_scale = torch.tanh(beta_ref)
@@ -4599,6 +6195,14 @@ class PaTHAttention(nn.Module):
                 perm = None
                 if basis_control == "permute_scales":
                     perm = self._wavelet_basis_perm(K=K, layer_idx=lid, device=device)
+                if router_headwise:
+                    H_router = int(pi_scale.shape[2])
+                    bias_chunk_head = torch.zeros((B, H_router, q1 - q0, T), device=device, dtype=torch.float32)
+                use_relative_position = bool(getattr(self, "wavelet_ctxscale_use_relative_position", False))
+                if use_relative_position:
+                    # Relative coordinate per query row: delta(q,k) = q_abs - k_abs.
+                    # This keeps wavelet basis aligned to query-centric distance instead of absolute key index.
+                    q_abs_chunk = torch.arange(q0, q1, device=device, dtype=torch.float32).view(1, q1 - q0, 1)
                 for i in range(K):
                     scale_idx = int(perm[i].item()) if perm is not None else int(i)
                     s_i = scales[scale_idx]
@@ -4615,14 +6219,26 @@ class PaTHAttention(nn.Module):
                             device=device,
                         ).unsqueeze(0).expand(B, -1, -1)
                     else:
-                        u_i = (diff.view(1, 1, T) - beta_i.unsqueeze(-1)) / s_i
+                        if use_relative_position:
+                            rel_delta = q_abs_chunk - diff.view(1, 1, T)
+                            u_i = (rel_delta - beta_i.unsqueeze(-1)) / s_i
+                        else:
+                            u_i = (diff.view(1, 1, T) - beta_i.unsqueeze(-1)) / s_i
                         psi_table = self._ricker_wavelet(u_i)
                     psi_table = self._rms_norm_last_dim(psi_table, eps=eps)
                     psi_table = self._maybe_clamp_p99(psi_table)
-                    contrib_i = pi_scale[:, q0:q1, i].unsqueeze(-1) * psi_table
-                    if far_mask is not None:
-                        contrib_i = contrib_i * far_mask.to(dtype=torch.float32)
-                    bias_chunk = bias_chunk + contrib_i
+                    if router_headwise:
+                        weight_h = pi_scale[:, q0:q1, :, i].permute(0, 2, 1).unsqueeze(-1)
+                        contrib_i_head = weight_h * psi_table.unsqueeze(1)
+                        if far_mask is not None:
+                            contrib_i_head = contrib_i_head * far_mask.to(dtype=torch.float32).unsqueeze(1)
+                        bias_chunk_head = bias_chunk_head + contrib_i_head
+                        contrib_i = contrib_i_head.mean(dim=1)
+                    else:
+                        contrib_i = pi_scale[:, q0:q1, i].unsqueeze(-1) * psi_table
+                        if far_mask is not None:
+                            contrib_i = contrib_i * far_mask.to(dtype=torch.float32)
+                        bias_chunk = bias_chunk + contrib_i
                     if analysis_enabled and analysis_q_local is not None and analysis_q_abs is not None:
                         _analysis_accumulate_component(
                             int(scale_idx),
@@ -4631,12 +6247,29 @@ class PaTHAttention(nn.Module):
                             analysis_q_local,
                             analysis_q_abs,
                         )
+                if router_headwise and bias_chunk_head is not None:
+                    bias_chunk = bias_chunk_head.mean(dim=1)
 
             if far_mask is not None:
                 bias_chunk = bias_chunk * far_mask.to(dtype=torch.float32)
+                if bias_chunk_head is not None:
+                    bias_chunk_head = bias_chunk_head * far_mask.to(dtype=torch.float32).unsqueeze(1)
+            if far_over_mask is not None:
+                over_m = far_over_mask.to(dtype=torch.float32)
+                keep_m = 1.0 - over_m
+                bias_chunk = bias_chunk * keep_m + bias_chunk * over_m * float(far_over_alpha)
+                if bias_chunk_head is not None:
+                    over_mh = over_m.unsqueeze(1)
+                    keep_mh = 1.0 - over_mh
+                    bias_chunk_head = (
+                        bias_chunk_head * keep_mh
+                        + bias_chunk_head * over_mh * float(far_over_alpha)
+                    )
 
             if enable_film:
                 pi_chunk = pi[:, q0:q1, :]
+                if pi_chunk.dim() == 4:
+                    pi_chunk = pi_chunk.mean(dim=2)
                 rho_chunk = rho[:, q0:q1]
                 bias_chunk, s_raw, t_raw, scale_m, shift_m = self._ctxscale_apply_bias_film(
                     bias_chunk=bias_chunk,
@@ -4657,9 +6290,27 @@ class PaTHAttention(nn.Module):
                 sat_s_num += int((s_raw.detach().abs() > 7.5).sum().item())
                 sat_t_num += int((t_raw.detach().abs() > 7.5).sum().item())
                 sat_den += int(s_raw.numel())
+                if bias_chunk_head is not None:
+                    bias_chunk_head = scale_m.unsqueeze(1) * bias_chunk_head + shift_m.unsqueeze(1)
+                    bias_chunk = bias_chunk_head.mean(dim=1)
 
             g_bias_max = float(getattr(self.config, "wavelet_ctxscale_g_bias_max", self.wavelet_ctxscale_g_bias_max))
-            if use_head_gate and g_head is not None:
+            if bias_chunk_head is not None:
+                if use_head_gate and g_head is not None:
+                    eff_to_add = bias_chunk_head * g_head.view(1, -1, 1, 1)
+                else:
+                    eff_to_add = g_layer * bias_chunk_head
+                eff_to_add = eff_to_add.clamp(min=-g_bias_max, max=g_bias_max)
+                if not torch.isfinite(eff_to_add).all():
+                    _warn_nonfinite("g_bias_headwise")
+                    eff_to_add = torch.nan_to_num(
+                        eff_to_add,
+                        nan=0.0,
+                        posinf=g_bias_max,
+                        neginf=-g_bias_max,
+                    )
+                eff_chunk = eff_to_add.mean(dim=1)
+            elif use_head_gate and g_head is not None:
                 eff_to_add = bias_chunk.unsqueeze(1) * g_head.view(1, -1, 1, 1)
                 eff_to_add = eff_to_add.clamp(min=-g_bias_max, max=g_bias_max)
                 if not torch.isfinite(eff_to_add).all():
@@ -4685,6 +6336,23 @@ class PaTHAttention(nn.Module):
                 eff_to_add = eff_chunk.unsqueeze(1)
             if head_mask is not None:
                 eff_to_add = eff_to_add * head_mask
+
+            if do_active and (0 <= int(do_target_head) < int(eff_to_add.shape[1])):
+                do_t = eff_to_add[:, int(do_target_head), :, :].detach().float()
+                if int(do_t.numel()) > 0:
+                    do_target_sum_sq += float(do_t.square().sum().item())
+                    do_target_sum += float(do_t.sum().item())
+                    do_target_count += int(do_t.numel())
+                    do_target_maxabs = max(do_target_maxabs, float(do_t.abs().max().item()))
+                for nh, acc in do_non_target_acc.items():
+                    if 0 <= int(nh) < int(eff_to_add.shape[1]):
+                        do_n = eff_to_add[:, int(nh), :, :].detach().float()
+                        if int(do_n.numel()) > 0:
+                            acc["sum_sq"] += float(do_n.square().sum().item())
+                            acc["sum"] += float(do_n.sum().item())
+                            acc["count"] += int(do_n.numel())
+                            acc["maxabs"] = max(float(acc["maxabs"]), float(do_n.abs().max().item()))
+
             logits_out[:, :, q0:q1, :] = logits_out[:, :, q0:q1, :] + eff_to_add
 
             if analysis_enabled and analysis_q_local is not None and analysis_q_abs is not None and analysis_eff_abs_vals is not None:
@@ -4705,14 +6373,18 @@ class PaTHAttention(nn.Module):
                     q_local = q_abs - q0
                     b_sel = bias_chunk.index_select(1, q_local).index_select(2, sample_k_idx)
                     e_sel = eff_chunk.index_select(1, q_local).index_select(2, sample_k_idx)
+                    base_chunk = E_base_raw[:, :, q0:q1, :].mean(dim=1)
+                    base_sel = base_chunk.index_select(1, q_local).index_select(2, sample_k_idx)
                     valid = sample_k_idx.view(1, 1, -1) <= q_abs.view(1, -1, 1)
                     valid = valid.expand(B, -1, -1)
                     b_vals = b_sel[valid]
                     e_vals = e_sel[valid]
+                    base_vals = base_sel[valid]
                     if b_vals.numel() > 0:
                         take = min(sample_budget - sample_count, int(b_vals.numel()))
                         sample_bias_vals.append(b_vals[:take].detach())
                         sample_eff_vals.append(e_vals[:take].detach())
+                        sample_base_vals.append(base_vals[:take].detach())
                         if enable_film:
                             s_sel = scale_m.index_select(1, q_local).reshape(-1)
                             t_sel = shift_m.index_select(1, q_local).reshape(-1)
@@ -4733,6 +6405,73 @@ class PaTHAttention(nn.Module):
         if self.wavelet_logit_bias_debug_assert and not torch.isfinite(logits_out).all():
             raise FloatingPointError("ctxscale_shift_v0: non-finite logits after bias injection")
 
+        if do_active:
+            target_rms = 0.0
+            target_mean = 0.0
+            if do_target_count > 0:
+                target_rms = float((do_target_sum_sq / float(do_target_count)) ** 0.5)
+                target_mean = float(do_target_sum / float(do_target_count))
+            non_target_delta = {}
+            for nh, acc in do_non_target_acc.items():
+                c = int(acc.get("count", 0))
+                if c > 0:
+                    rms_n = float((float(acc["sum_sq"]) / float(c)) ** 0.5)
+                    mean_n = float(float(acc["sum"]) / float(c))
+                else:
+                    rms_n = 0.0
+                    mean_n = 0.0
+                non_target_delta[str(int(nh))] = {
+                    "rms": float(rms_n),
+                    "maxabs": float(acc.get("maxabs", 0.0)),
+                    "mean": float(mean_n),
+                    "count": int(c),
+                }
+
+            do_validation = {
+                "enabled": True,
+                "layer": int(lid),
+                "mode": str(do_mode),
+                "scope": str(do_scope),
+                "router_headwise": int(bool(router_headwise)),
+                "num_scales": int(K),
+                "target_heads": [int(x) for x in do_target_heads],
+                "target_head_for_check": int(do_target_head),
+                "target_pi": {
+                    "min": float(do_stat.get("target_pi_min", 0.0)),
+                    "max": float(do_stat.get("target_pi_max", 0.0)),
+                    "pi0_mean": float(do_stat.get("target_pi0_mean", 0.0)),
+                    "sum_mean": float(do_stat.get("target_sum_prob_mean", 0.0)),
+                    "sum_min": float(do_stat.get("target_sum_prob_min", 0.0)),
+                    "sum_max": float(do_stat.get("target_sum_prob_max", 0.0)),
+                    "argmax_expected_frac": float(do_stat.get("target_argmax_expected_frac", 0.0)),
+                    "nonzero_count_mean": float(do_stat.get("target_nonzero_count_mean", 0.0)),
+                    "nonzero_count_max": float(do_stat.get("target_nonzero_count_max", 0.0)),
+                    "uniform_scale_maxdev": float(do_stat.get("target_uniform_scale_maxdev", 0.0)),
+                    "expected_argmax": int(do_stat.get("expected_argmax", -1)),
+                    "scale_idx": int(do_stat.get("scale_idx", -1)),
+                },
+                "target_delta_wavelet": {
+                    "rms": float(target_rms),
+                    "maxabs": float(do_target_maxabs),
+                    "mean": float(target_mean),
+                    "count": int(do_target_count),
+                },
+                "non_target_pi_change": {
+                    "maxabs": float(do_stat.get("non_target_pi_change_maxabs", 0.0)),
+                    "meanabs": float(do_stat.get("non_target_pi_change_meanabs", 0.0)),
+                },
+                "non_target_delta_wavelet": non_target_delta,
+            }
+            strict_check = bool(int(do_stat.get("strict", 0)))
+            if strict_check and str(do_mode) == "null":
+                # For do(null), wavelet branch must be effectively disabled for target head.
+                if float(target_rms) > 1e-8 or float(do_target_maxabs) > 1e-8:
+                    raise AssertionError(
+                        f"do(null) ΔE validation failed at layer={int(lid)} head={int(do_target_head)}: "
+                        f"rms={float(target_rms):.6e}, maxabs={float(do_target_maxabs):.6e}"
+                    )
+            self._last_ctxscale_do_validation = do_validation
+
         if analysis_enabled and analysis_sample_q_idx is not None:
             pi_sample_a = torch.nan_to_num(
                 pi.index_select(1, analysis_sample_q_idx).detach().float(),
@@ -4743,10 +6482,13 @@ class PaTHAttention(nn.Module):
             pi_dist_a = pi_sample_a.clamp_min(1e-12)
             pi_entropy_a = -(pi_dist_a * pi_dist_a.log()).sum(dim=-1)
             pi_top1_a = pi_dist_a.max(dim=-1).values
+            pi_top2_a = torch.topk(pi_dist_a, k=2, dim=-1).values
+            pi_margin_a = (pi_top2_a[..., 0] - pi_top2_a[..., 1]).clamp_min(0.0)
             pi_null_a = pi_dist_a[..., 0]
             pi_entropy_q_a = _quantiles_flat(pi_entropy_a, qs=(0.5, 0.9))
             pi_top1_q_a = _quantiles_flat(pi_top1_a, qs=(0.9,))
-            pi_mean = pi_dist_a.mean(dim=(0, 1))
+            pi_margin_q_a = _quantiles_flat(pi_margin_a, qs=(0.5, 0.9))
+            pi_mean = pi_dist_a.mean(dim=tuple(range(pi_dist_a.ndim - 1)))
 
             beta_sample_a = torch.nan_to_num(
                 beta_m.index_select(1, analysis_sample_q_idx).detach().float(),
@@ -4768,17 +6510,21 @@ class PaTHAttention(nn.Module):
                     beta_clamped_a = float((beta_sample_a >= beta_upper_a).float().mean().item())
             if K > 0:
                 pi_scale_a = pi_dist_a[..., 1 : (K + 1)]
-                scale_vec = scales.view(1, 1, K)
+                scale_shape = [1] * (pi_scale_a.dim() - 1) + [K]
+                scale_vec = scales.view(*scale_shape)
                 scale_denom = pi_scale_a.sum(dim=-1).clamp_min(1e-12)
                 exp_scale = (pi_scale_a * scale_vec).sum(dim=-1) / scale_denom
                 top1_idx = pi_scale_a.argmax(dim=-1)
                 top1_scale = scales.index_select(0, top1_idx.reshape(-1)).view_as(top1_idx)
+                beta_sample_expand = beta_sample_a
+                while beta_sample_expand.dim() < top1_scale.dim():
+                    beta_sample_expand = beta_sample_expand.unsqueeze(-1)
                 if use_scale_coupled_shift:
-                    beta_token_top1 = beta_sample_a * top1_scale
-                    beta_token_exp = beta_sample_a * exp_scale
+                    beta_token_top1 = beta_sample_expand * top1_scale
+                    beta_token_exp = beta_sample_expand * exp_scale
                 else:
-                    beta_token_top1 = beta_sample_a
-                    beta_token_exp = beta_sample_a
+                    beta_token_top1 = beta_sample_expand
+                    beta_token_exp = beta_sample_expand
                 beta_over_s_top1 = beta_token_top1 / top1_scale.clamp_min(1e-6)
                 beta_over_s_exp = beta_token_exp / exp_scale.clamp_min(1e-6)
                 beta_over_s_top1_q = _quantiles_flat(beta_over_s_top1, qs=(0.5, 0.9, 0.99))
@@ -4826,9 +6572,12 @@ class PaTHAttention(nn.Module):
                     "basis_control": str(basis_control),
                     "router_mode": str(router_mode),
                     "router_jitter_style": str(router_jitter_style),
+                    "router_jitter_style_resolved": str(router_jitter_style_resolved),
                     "router_jitter_std": float(router_jitter_std),
                     "router_jitter_enabled": int(router_jitter_enabled),
                     "router_jitter_injected": int(router_jitter_injected),
+                    "router_jitter_target_flip_probability": float(router_jitter_target_flip_probability),
+                    "use_relative_position": int(bool(getattr(self, "wavelet_ctxscale_use_relative_position", False))),
                     "scale_values": [float(scales[i].item()) for i in range(K)],
                     "scales": [float(scales[i].item()) for i in range(K)],
                     "K": int(K),
@@ -4848,8 +6597,14 @@ class PaTHAttention(nn.Module):
                     "pi_entropy_p90": float(pi_entropy_q_a["p90"]),
                     "pi_top1_mean": float(pi_top1_a.mean().item()),
                     "pi_top1_p90": float(pi_top1_q_a["p90"]),
+                    "pi_margin_mean": float(pi_margin_a.mean().item()),
+                    "pi_margin_p50": float(pi_margin_q_a["p50"]),
+                    "pi_margin_p90": float(pi_margin_q_a["p90"]),
                     "pi_null_mean": float(pi_null_a.mean().item()),
                     "null_mean": float(pi_null_a.mean().item()),
+                    "sigma_mean": float(router_jitter_sigma_mean),
+                    "sigma_std": float(router_jitter_sigma_std),
+                    "flip_probability_estimate": float(router_jitter_flip_probability_estimate),
                     "beta_over_T_p50": float(beta_over_t_q_a["p50"]),
                     "beta_over_T_p90": float(beta_over_t_q_a["p90"]),
                     "beta_over_T_p99": float(beta_over_t_q_a["p99"]),
@@ -4887,9 +6642,12 @@ class PaTHAttention(nn.Module):
             pi_dist = pi_sample.clamp_min(1e-12)
             pi_entropy = -(pi_dist * pi_dist.log()).sum(dim=-1)
             pi_top1 = pi_dist.max(dim=-1).values
+            pi_top2 = torch.topk(pi_dist, k=2, dim=-1).values
+            pi_margin = (pi_top2[..., 0] - pi_top2[..., 1]).clamp_min(0.0)
             pi_null = pi_dist[..., 0]
             pi_entropy_q = _quantiles_flat(pi_entropy, qs=(0.5, 0.9))
             pi_top1_q = _quantiles_flat(pi_top1, qs=(0.9,))
+            pi_margin_q = _quantiles_flat(pi_margin, qs=(0.5, 0.9))
             if sum_g is not None:
                 sum_g_sample = torch.nan_to_num(
                     sum_g.squeeze(-1).index_select(1, sample_q_idx).detach().float(),
@@ -4956,6 +6714,11 @@ class PaTHAttention(nn.Module):
                 if len(sample_eff_vals) > 0
                 else torch.empty(0, device=device, dtype=torch.float32)
             )
+            base_sample = (
+                torch.cat(sample_base_vals, dim=0)
+                if len(sample_base_vals) > 0
+                else torch.empty(0, device=device, dtype=torch.float32)
+            )
             scale_sample = (
                 torch.cat(sample_scale_vals, dim=0)
                 if len(sample_scale_vals) > 0
@@ -5014,6 +6777,9 @@ class PaTHAttention(nn.Module):
                 "pi_entropy_p90": float(pi_entropy_q["p90"]),
                 "pi_top1_mean": float(pi_top1.mean().item()),
                 "pi_top1_p90": float(pi_top1_q["p90"]),
+                "pi_margin_mean": float(pi_margin.mean().item()),
+                "pi_margin_p50": float(pi_margin_q["p50"]),
+                "pi_margin_p90": float(pi_margin_q["p90"]),
                 "pi_null_mean": float(pi_null.mean().item()),
                 "rho_p50": float(rho_q["p50"]),
                 "rho_p90": float(rho_q["p90"]),
@@ -5027,6 +6793,11 @@ class PaTHAttention(nn.Module):
                 "head_frac": float(head_mask.mean().item()) if head_mask is not None else 1.0,
                 "head_count": int(len(valid_heads)) if valid_heads is not None else int(E_base_raw.shape[1]),
                 "head_gate": int(bool(use_head_gate)),
+                "disable_layer_gate": int(bool(disable_layer_gate)),
+                "gate_branch": str(gate_branch),
+                "cfg_disable_layer_gate": int(bool(getattr(self, "wavelet_ctxscale_disable_layer_gate", False))),
+                "cfg_use_head_gate": int(bool(getattr(self, "wavelet_ctxscale_use_head_gate", False))),
+                "use_relative_position": int(bool(getattr(self, "wavelet_ctxscale_use_relative_position", False))),
                 "scale_coupled_shift": int(use_scale_coupled_shift),
                 "abs_shift_causal": int(use_abs_shift_causal),
                 "shift_T_mode": str(shift_t_mode),
@@ -5054,9 +6825,14 @@ class PaTHAttention(nn.Module):
                 "basis_control": str(basis_control),
                 "router_mode": str(router_mode),
                 "router_jitter_style": str(router_jitter_style),
+                "router_jitter_style_resolved": str(router_jitter_style_resolved),
                 "router_jitter_std": float(router_jitter_std),
                 "router_jitter_enabled": int(router_jitter_enabled),
                 "router_jitter_injected": int(router_jitter_injected),
+                "router_jitter_target_flip_probability": float(router_jitter_target_flip_probability),
+                "sigma_mean": float(router_jitter_sigma_mean),
+                "sigma_std": float(router_jitter_sigma_std),
+                "flip_probability_estimate": float(router_jitter_flip_probability_estimate),
                 "sum_g_mean": float(sum_g_mean),
                 "sum_g_p90": float(sum_g_p90),
                 "g0_mean": float(g0_mean),
@@ -5076,6 +6852,7 @@ class PaTHAttention(nn.Module):
                 "film_shift_sample": shift_sample,
                 "bias_sample": bias_sample,
                 "eff_sample": eff_sample,
+                "base_sample": base_sample,
             }
 
         return logits_out.to(dtype=compute_dtype), payload
@@ -5160,6 +6937,92 @@ class PaTHAttention(nn.Module):
                 raise FloatingPointError("ctxscale_shift_v0 sanity check: film grad norm is zero")
         return out
 
+    @staticmethod
+    def _finite_float_stats(values) -> tuple[float, float]:
+        vals = []
+        for v in values:
+            try:
+                fv = float(v)
+            except Exception:
+                continue
+            if math.isfinite(fv):
+                vals.append(fv)
+        if len(vals) == 0:
+            return float("nan"), float("nan")
+        t = torch.tensor(vals, dtype=torch.float32)
+        mean_v = float(t.mean().item())
+        std_v = float(t.std(unbiased=False).item()) if t.numel() > 1 else 0.0
+        return mean_v, std_v
+
+    def _update_router_global_stats(self, *, step: int, layer_idx: int, payload: dict):
+        if not self.training:
+            return
+        cfg = getattr(self, "config", None)
+        if cfg is None or payload is None:
+            return
+        try:
+            step_i = int(step)
+            layer_i = int(layer_idx)
+        except Exception:
+            return
+        cache = getattr(cfg, "_router_issue3_global_stats_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            setattr(cfg, "_router_issue3_global_stats_cache", cache)
+        rec = cache.get(step_i)
+        if rec is None:
+            rec = {
+                "seen_layers": set(),
+                "pi_entropy": [],
+                "pi_top1": [],
+                "pi_margin": [],
+                "sigma": [],
+                "flip_prob": [],
+                "emitted": False,
+            }
+            cache[step_i] = rec
+        if layer_i in rec["seen_layers"]:
+            return
+        rec["seen_layers"].add(layer_i)
+        for key, dst in (
+            ("pi_entropy_mean", "pi_entropy"),
+            ("pi_top1_mean", "pi_top1"),
+            ("pi_margin_mean", "pi_margin"),
+            ("sigma_mean", "sigma"),
+            ("flip_probability_estimate", "flip_prob"),
+        ):
+            try:
+                v = float(payload.get(key, float("nan")))
+            except Exception:
+                v = float("nan")
+            if math.isfinite(v):
+                rec[dst].append(v)
+
+        total_layers = self._infer_total_layers_from_config(cfg)
+        if total_layers is not None and total_layers > 0:
+            should_emit = (len(rec["seen_layers"]) >= int(total_layers)) or (layer_i == int(total_layers) - 1)
+        else:
+            should_emit = len(rec["seen_layers"]) >= 1
+        if rec.get("emitted", False) or (not should_emit):
+            return
+
+        pi_entropy_mean, pi_entropy_std = self._finite_float_stats(rec["pi_entropy"])
+        pi_top1_mean, _ = self._finite_float_stats(rec["pi_top1"])
+        pi_margin_mean, _ = self._finite_float_stats(rec["pi_margin"])
+        sigma_mean, sigma_std = self._finite_float_stats(rec["sigma"])
+        flip_prob_est, _ = self._finite_float_stats(rec["flip_prob"])
+        self._k1_emit_log(
+            f"[wavelet router global stats] step={step_i} "
+            f"pi_entropy_mean={pi_entropy_mean:.6e} pi_entropy_std={pi_entropy_std:.6e} "
+            f"pi_top1_mean={pi_top1_mean:.6e} pi_margin_mean={pi_margin_mean:.6e} "
+            f"sigma_mean={sigma_mean:.6e} sigma_std={sigma_std:.6e} "
+            f"flip_probability_estimate={flip_prob_est:.6e} "
+            f"layers_seen={len(rec['seen_layers'])} total_layers={int(total_layers) if total_layers is not None else -1}"
+        )
+        rec["emitted"] = True
+        for old_step in [k for k in cache.keys() if int(k) < step_i - 4]:
+            cache.pop(old_step, None)
+
     def _log_ctxscale_shift_v0_monitor(
         self,
         *,
@@ -5170,6 +7033,7 @@ class PaTHAttention(nn.Module):
     ):
         bias_stats = _monitor_flat_stats(payload.get("bias_sample"))
         eff_stats = _monitor_flat_stats(payload.get("eff_sample"))
+        base_stats = _monitor_flat_stats(payload.get("base_sample"))
         attn_stats = _monitor_attn_prob_stats(
             attn_probs,
             max_queries=int(self.wavelet_logit_bias_log_sample_tokens),
@@ -5179,6 +7043,22 @@ class PaTHAttention(nn.Module):
         g_layer_raw = float(payload["g_layer_raw"].detach().float().item())
         g_layer_raw_used = float(payload["g_layer_raw_used"].detach().float().item())
         g_layer = float(payload["g_layer"].detach().float().item())
+        eff_t = payload.get("eff_sample")
+        base_t = payload.get("base_sample")
+        if torch.is_tensor(eff_t) and torch.is_tensor(base_t) and eff_t.numel() > 0 and base_t.numel() > 0:
+            eff_abs_mean = float(eff_t.detach().float().abs().mean().item())
+            base_abs_mean = float(base_t.detach().float().abs().mean().item())
+            denom_floor = max(base_abs_mean * 1e-2, 1e-6)
+            n_take = int(min(eff_t.numel(), base_t.numel()))
+            eff_flat = eff_t.detach().float().reshape(-1)[:n_take].abs()
+            base_flat = base_t.detach().float().reshape(-1)[:n_take].abs()
+            eff_over_base_absmean = eff_abs_mean / max(base_abs_mean, 1e-12)
+            eff_over_base_elem_mean = float((eff_flat / base_flat.clamp_min(denom_floor)).mean().item())
+        else:
+            eff_abs_mean = float("nan")
+            base_abs_mean = float("nan")
+            eff_over_base_absmean = float("nan")
+            eff_over_base_elem_mean = float("nan")
         film_sraw_stats = _monitor_scalar_stats(payload.get("film_sraw_sample"))
         film_traw_stats = _monitor_scalar_stats(payload.get("film_traw_sample"))
         film_scale_stats = _monitor_scalar_stats(payload.get("film_scale_sample"))
@@ -5205,9 +7085,14 @@ class PaTHAttention(nn.Module):
             f"basis_ctrl={payload.get('basis_control', 'none')} "
             f"router_mode={payload.get('router_mode', 'softmax')} "
             f"router_jitter_style={payload.get('router_jitter_style', 'na')} "
+            f"router_jitter_style_resolved={payload.get('router_jitter_style_resolved', 'na')} "
             f"router_jitter_std={payload.get('router_jitter_std', float('nan')):.6e} "
             f"router_jitter_enabled={int(payload.get('router_jitter_enabled', 0))} "
             f"router_jitter_inj={int(payload.get('router_jitter_injected', 0))} "
+            f"router_jitter_target_flip_prob={payload.get('router_jitter_target_flip_probability', float('nan')):.6e} "
+            f"sigma_mean={payload.get('sigma_mean', float('nan')):.6e} "
+            f"sigma_std={payload.get('sigma_std', float('nan')):.6e} "
+            f"flip_prob_est={payload.get('flip_probability_estimate', float('nan')):.6e} "
             f"sum_g_mean={payload.get('sum_g_mean', float('nan')):.6e} "
             f"sum_g_p90={payload.get('sum_g_p90', float('nan')):.6e} "
             f"g0_mean={payload.get('g0_mean', float('nan')):.6e} "
@@ -5217,15 +7102,27 @@ class PaTHAttention(nn.Module):
             f"pi_entropy mean={payload['pi_entropy_mean']:.6e} p50={payload['pi_entropy_p50']:.6e} "
             f"p90={payload['pi_entropy_p90']:.6e} | "
             f"pi_top1 mean={payload['pi_top1_mean']:.6e} p90={payload['pi_top1_p90']:.6e} "
+            f"| pi_margin mean={payload.get('pi_margin_mean', float('nan')):.6e} "
+            f"p50={payload.get('pi_margin_p50', float('nan')):.6e} "
+            f"p90={payload.get('pi_margin_p90', float('nan')):.6e} "
             f"null_mean={payload['pi_null_mean']:.6e} | "
             f"rho p50={payload['rho_p50']:.6e} p90={payload['rho_p90']:.6e} p99={payload['rho_p99']:.6e} | "
             f"beta p50={payload['beta_p50']:.6e} p90={payload['beta_p90']:.6e} "
             f"p99={payload['beta_p99']:.6e} clamp_frac={payload['beta_clamp_frac']:.6e} | "
             f"far_only={int(payload.get('far_only', 0))} far_min_delta={int(payload.get('far_min_delta', 0))} "
             f"head_frac={payload.get('head_frac', 1.0):.6e} head_count={int(payload.get('head_count', 0))} | "
+            f"gate_branch={payload.get('gate_branch', 'na')} "
+            f"cfg_disable_layer_gate={int(payload.get('cfg_disable_layer_gate', 0))} "
+            f"cfg_use_head_gate={int(payload.get('cfg_use_head_gate', 0))} "
+            f"head_gate={int(payload.get('head_gate', 0))} "
+            f"disable_layer_gate={int(payload.get('disable_layer_gate', 0))} | "
             f"bias mean={bias_stats['mean']:.6e} std={bias_stats['std']:.6e} abs_p99={bias_stats['abs_p99']:.6e} | "
             f"g_bias mean={eff_stats['mean']:.6e} std={eff_stats['std']:.6e} abs_p99={eff_stats['abs_p99']:.6e} "
             f"std_finite={int(g_bias_std_finite)} | "
+            f"base mean={base_stats['mean']:.6e} std={base_stats['std']:.6e} abs_p99={base_stats['abs_p99']:.6e} | "
+            f"delta_over_base_absmean={eff_over_base_absmean:.6e} "
+            f"delta_over_base_elem_mean={eff_over_base_elem_mean:.6e} "
+            f"delta_abs_mean={eff_abs_mean:.6e} base_abs_mean={base_abs_mean:.6e} | "
             f"film_en={int(payload.get('film_enabled', 0))} "
             f"film_nf={int(payload.get('film_nf_s_raw', 0))},{int(payload.get('film_nf_t_raw', 0))},"
             f"{int(payload.get('film_nf_scale', 0))},{int(payload.get('film_nf_shift', 0))} "
@@ -5242,6 +7139,7 @@ class PaTHAttention(nn.Module):
             f"p90={attn_stats['margin_p90']:.6e}"
         )
         self._k1_emit_log(msg)
+        self._update_router_global_stats(step=int(step), layer_idx=lid, payload=payload)
 
     def _k1_gain_for_heads(self, target_h: int, *, device, dtype):
         g = self.wavelet_k1_gain.to(device=device, dtype=dtype)
@@ -5992,6 +7890,8 @@ class PaTHAttention(nn.Module):
         self._eval_bin_stats = {}
         self._eval_batch_step = 0
         self._eval_stats_logged_once = False
+        self._eval_attn_heatmap_export_count = 0
+        self._eval_attn_mech_last = None
 
     @torch.no_grad()
     def update_stats(self, z_base: torch.Tensor, rel: torch.Tensor, layer_idx: int, rel_alpha: float = 1.0):
@@ -6483,6 +8383,7 @@ class PaTHAttention(nn.Module):
         router1=None,
         router2=None,
         hidden_states=None,
+        input_ids=None,
         config=None,
         global_step=None,
         router_log_every=None,
@@ -6727,6 +8628,16 @@ class PaTHAttention(nn.Module):
         #     os._exit(0)
         # Persist attention scores for later analysis when enabled
 
+        P_base = None
+        heatmap_enabled = bool(getattr(self, "eval_attn_heatmap_enabled", False)) or bool(getattr(self, "_debug_enabled", False))
+        mech_enabled = bool((not self.training) and getattr(self, "eval_attn_mech_enabled", False))
+        need_base_softmax = bool((analyzer is not None and rel is not None) or ((not self.training) and heatmap_enabled) or mech_enabled)
+        if need_base_softmax:
+            E_base = E_base_raw * scale
+            base_fill = causal_mask_fill_value(E_base.dtype)
+            E_base = E_base.masked_fill(future, base_fill)
+            P_base = torch.softmax(E_base, dim=-1)
+
         E_wav = E_wav_raw * scale
         wave_fill = causal_mask_fill_value(E_wav.dtype)
         E_wav = E_wav.masked_fill(future, wave_fill)
@@ -6736,6 +8647,7 @@ class PaTHAttention(nn.Module):
             global_step=global_step,
         )
         P_wav = torch.softmax(E_wav, dim=-1)
+        only_rel_layers = bool(getattr(self, "eval_attn_heatmap_only_rel_layers", False))
         if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:
             self._wavelet_condfilm_v2_last_attn_stats = _monitor_attn_prob_stats(
                 P_wav,
@@ -6781,9 +8693,37 @@ class PaTHAttention(nn.Module):
         )
         self._debug_update_eval_stats(layer_idx, E_base_raw, rel, attn_weights=P_wav)
         self.update_stats(E_base_raw, rel, layer_idx, rel_alpha=rel_alpha)
+        out_base = None
+        if P_base is not None and (mech_enabled or (analyzer is not None and rel is not None)):
+            out_base = torch.einsum("b h i j, b j h d -> b i h d", P_base, v.to(compute_dtype))
         out_wav = torch.einsum("b h i j, b j h d -> b i h d", P_wav, v.to(compute_dtype))
+        if out_base is not None:
+            self._record_eval_attn_mech_stats(
+                layer_idx=layer_idx,
+                out_base=out_base,
+                out_wav=out_wav,
+                global_step=global_step,
+                rel_applied=bool(rel_enabled),
+                has_wavelet=bool(wavelet_dtt is not None),
+                wavelet_mode=wavelet_mode,
+            )
+        if P_base is not None and (not only_rel_layers or bool(rel_enabled)):
+            self._export_eval_attn_heatmaps(
+                layer_idx=layer_idx,
+                p_base=P_base,
+                p_wav=P_wav,
+                logits_base=E_base,
+                logits_wav=E_wav,
+                global_step=global_step,
+                wavelet_mode=wavelet_mode,
+                has_wavelet=bool(wavelet_dtt is not None),
+                rel_applied=bool(rel_enabled),
+                out_base=out_base,
+                out_wav=out_wav,
+                input_ids=input_ids,
+            )
 
-        if analyzer is not None and rel is not None:
+        if analyzer is not None and rel is not None and P_base is not None:
             w0 = w.to(compute_dtype)
             deltaQ = torch.einsum("b h i j, b j h d -> b i h d", M_used, w0)
             analyzer['layer_attention_analyzer'].update(layer_idx, E_base_raw, rel, P_base, P_wav, q, deltaQ)
@@ -6873,7 +8813,7 @@ class PaTHAttention(nn.Module):
                     router1_logits = self.router1(hidden_states)          # [B,T,H*S]
                     router1_logits = router1_logits.view(B, T, H, S)      # [B,T,H,S]
                     # jitter hyperparams
-                    jitter_std = getattr(self.config, "router_jitter_std", 0.0)   # e.g. 0.01
+                    jitter_std_base = getattr(self.config, "router_jitter_std", 0.0)   # e.g. 0.01
 
                     # 进度感知：前 30%/后 70% 使用不同 std（如未提供则退回默认）
                     # 优先用外部传入的 global_step（通常是优化步）；否则用 config 预设；再否则用本地计数，
@@ -6892,21 +8832,11 @@ class PaTHAttention(nn.Module):
                     else:
                         global_step = global_step_ext
                         max_steps = kwargs.get("max_steps", getattr(self.config, "router_max_steps", 15900))
-                    jitter_std_early = getattr(self.config, "router_jitter_std_early", jitter_std)
-                    jitter_std_late = getattr(self.config, "router_jitter_std_late", jitter_std)
-                    if (global_step is not None) and (max_steps not in (None, 0)):
-                        pct = float(global_step) / float(max_steps)
-                        jitter_std = jitter_std_early if pct < 0.3 else jitter_std_late
-
-                    # After step 10000, anneal jitter_std from 1 -> 0 over 1000 steps.
-                    jitter_std_end_ratio = getattr(self.config, "jitter_std_end_ratio", 0.0)
-                    jitter_anneal_span = getattr(self.config, "jitter_anneal_span", 1000)
-                    jitter_anneal_start_step = getattr(self.config, "jitter_anneal_start_step", 10000)
-                    if jitter_anneal_span > 0:
-                        if global_step is not None and global_step >= jitter_anneal_start_step:
-                            slope = (jitter_std_end_ratio - 1.0) / jitter_anneal_span
-                            coeff = 1.0 + slope * (global_step - jitter_anneal_start_step)
-                            jitter_std = max(jitter_std_end_ratio, min(coeff, 1.0)) * jitter_std
+                    jitter_std = self._resolve_router_jitter_std(
+                        jitter_std_base,
+                        global_step=global_step,
+                        max_steps=max_steps,
+                    )
                     tau_change_step = getattr(self.config, "tau_change_step", 0)
                     tau_change = getattr(self.config, "tau_change", 2.0)
                     log_every = int(getattr(self.config, "router_log_every", 500))
@@ -7056,6 +8986,7 @@ class PaTHAttention(nn.Module):
                     router1=router1 if router_active else None,
                     router2=router2 if router_active else None,
                     hidden_states=hidden_states,
+                    input_ids=input_ids,
                     config=self.config,
                     global_step=global_step,
                     router_log_every=getattr(self.config, "router_log_every", 500),
@@ -7173,6 +9104,13 @@ class PaTHAttention(nn.Module):
                     layer_idx=self.layer_idx,
                     logger_obj=getattr(self, "logger", None),
                 )
+            # In ctxscale modes there is no explicit router branch, but we still expose
+            # scale-mixture probabilities as router-like tensors for downstream analysis.
+            if record_router1 is None:
+                ctx_prob = getattr(self, "_last_ctxscale_router_prob", None)
+                if torch.is_tensor(ctx_prob) and ctx_prob.dim() == 4:
+                    record_router1 = ctx_prob
+                    record_router2 = ctx_prob
             # if analyzer is not None:
             return o, None, past_key_values, dis_loss, record_router1, record_router2
             # else:

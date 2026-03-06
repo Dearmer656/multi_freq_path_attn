@@ -268,6 +268,13 @@ def l2norm(
     eps: float = 1e-6,
     output_dtype: Optional[torch.dtype] = None
 ) -> torch.Tensor:
+    # CPU fallback: Triton kernels are GPU-oriented. Use a differentiable PyTorch path.
+    if x.device.type == "cpu":
+        out_dtype = x.dtype if output_dtype is None else output_dtype
+        x_fp = x.float()
+        denom = torch.linalg.vector_norm(x_fp, dim=-1, keepdim=True).clamp_min(eps)
+        y = x_fp / denom
+        return y.to(out_dtype)
     return L2NormFunction.apply(x, eps, output_dtype)
 
 

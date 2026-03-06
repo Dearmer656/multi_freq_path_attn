@@ -457,6 +457,8 @@ if check_pytorch_version('2.4'):
     autocast_custom_bwd = functools.partial(torch.amp.custom_bwd, device_type=device)
 
     def custom_device_ctx(index: int):
+        if device_name == 'cpu':
+            return contextlib.nullcontext()
         return device_torch_lib.device(index)
 else:
     assert device == 'cuda', 'Only cuda device is supported for PyTorch version < 2.4.0.'
