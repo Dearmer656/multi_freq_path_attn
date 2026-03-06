@@ -2735,6 +2735,8 @@ class PaTHAttention(nn.Module):
             getattr(config, "wavelet_ctxscale_tau_anneal_warmup", 0)
         )
         self._last_router_jitter_stats = {}
+        self._last_router_entropy_reg_loss = torch.tensor(0.0)
+        self._last_router_entropy_reg_active_frac = torch.tensor(0.0)
         self.wavelet_ctxscale_router_rms_eps = float(getattr(config, "wavelet_ctxscale_router_rms_eps", 1e-6))
         self.wavelet_ctxscale_chunk_q = max(1, int(getattr(config, "wavelet_ctxscale_chunk_q", 128)))
         self.wavelet_ctxscale_max_log_samples = max(
@@ -5634,6 +5636,9 @@ class PaTHAttention(nn.Module):
         B = int(E_base_raw.shape[0])
         device = E_base_raw.device
         eps = float(self.wavelet_logit_bias_eps)
+        reg_zero = E_base_raw.new_zeros([])
+        self._last_router_entropy_reg_loss = reg_zero
+        self._last_router_entropy_reg_active_frac = reg_zero.detach()
         lid = int(self.layer_idx if layer_idx is None else layer_idx)
         self._last_ctxscale_do_validation = None
         step_val = self._to_int_or_none(step)
@@ -5766,6 +5771,22 @@ class PaTHAttention(nn.Module):
         # Otherwise do(scale) has no effect on the final bias path.
         pi_scale = pi[..., 1:]
         router_headwise = bool(pi.dim() == 4)
+
+        # Weak selective entropy-floor regularization (training only).
+        router_entropy_reg_enable = bool(getattr(self.config, "router_entropy_reg_enable", False))
+        router_entropy_reg_lambda = float(getattr(self.config, "router_entropy_reg_lambda", 0.0))
+        router_entropy_floor = float(getattr(self.config, "router_entropy_floor", 1.72))
+        router_entropy_reg_loss = reg_zero
+        router_entropy_reg_active_frac = reg_zero.detach()
+        if self.training and router_entropy_reg_enable and router_entropy_reg_lambda > 0.0:
+            pi_reg = pi.to(device=device, dtype=torch.float32)
+            pi_reg = pi_reg / pi_reg.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            pi_entropy_reg = -(pi_reg * (pi_reg + 1e-8).log()).sum(dim=-1)
+            reg_penalty = F.relu(router_entropy_floor - pi_entropy_reg)
+            router_entropy_reg_loss = reg_penalty.mean() * router_entropy_reg_lambda
+            router_entropy_reg_active_frac = (reg_penalty > 0).to(torch.float32).mean().detach()
+        self._last_router_entropy_reg_loss = router_entropy_reg_loss
+        self._last_router_entropy_reg_active_frac = router_entropy_reg_active_frac
 
         do_stat = getattr(self, "_last_ctxscale_do_stat", None)
         do_active = bool(
@@ -6605,6 +6626,8 @@ class PaTHAttention(nn.Module):
                     "sigma_mean": float(router_jitter_sigma_mean),
                     "sigma_std": float(router_jitter_sigma_std),
                     "flip_probability_estimate": float(router_jitter_flip_probability_estimate),
+                    "router_entropy_reg_loss": float(router_entropy_reg_loss.detach().item()),
+                    "router_entropy_reg_active_frac": float(router_entropy_reg_active_frac.item()),
                     "beta_over_T_p50": float(beta_over_t_q_a["p50"]),
                     "beta_over_T_p90": float(beta_over_t_q_a["p90"]),
                     "beta_over_T_p99": float(beta_over_t_q_a["p99"]),
@@ -6833,6 +6856,8 @@ class PaTHAttention(nn.Module):
                 "sigma_mean": float(router_jitter_sigma_mean),
                 "sigma_std": float(router_jitter_sigma_std),
                 "flip_probability_estimate": float(router_jitter_flip_probability_estimate),
+                "router_entropy_reg_loss": float(router_entropy_reg_loss.detach().item()),
+                "router_entropy_reg_active_frac": float(router_entropy_reg_active_frac.item()),
                 "sum_g_mean": float(sum_g_mean),
                 "sum_g_p90": float(sum_g_p90),
                 "g0_mean": float(g0_mean),
@@ -6978,6 +7003,8 @@ class PaTHAttention(nn.Module):
                 "pi_margin": [],
                 "sigma": [],
                 "flip_prob": [],
+                "reg_loss": [],
+                "reg_active_frac": [],
                 "emitted": False,
             }
             cache[step_i] = rec
@@ -6990,6 +7017,8 @@ class PaTHAttention(nn.Module):
             ("pi_margin_mean", "pi_margin"),
             ("sigma_mean", "sigma"),
             ("flip_probability_estimate", "flip_prob"),
+            ("router_entropy_reg_loss", "reg_loss"),
+            ("router_entropy_reg_active_frac", "reg_active_frac"),
         ):
             try:
                 v = float(payload.get(key, float("nan")))
@@ -7011,12 +7040,16 @@ class PaTHAttention(nn.Module):
         pi_margin_mean, _ = self._finite_float_stats(rec["pi_margin"])
         sigma_mean, sigma_std = self._finite_float_stats(rec["sigma"])
         flip_prob_est, _ = self._finite_float_stats(rec["flip_prob"])
+        reg_loss_mean, _ = self._finite_float_stats(rec["reg_loss"])
+        reg_active_frac_mean, _ = self._finite_float_stats(rec["reg_active_frac"])
         self._k1_emit_log(
             f"[wavelet router global stats] step={step_i} "
             f"pi_entropy_mean={pi_entropy_mean:.6e} pi_entropy_std={pi_entropy_std:.6e} "
             f"pi_top1_mean={pi_top1_mean:.6e} pi_margin_mean={pi_margin_mean:.6e} "
             f"sigma_mean={sigma_mean:.6e} sigma_std={sigma_std:.6e} "
             f"flip_probability_estimate={flip_prob_est:.6e} "
+            f"router_entropy_reg_loss={reg_loss_mean:.6e} "
+            f"router_entropy_reg_active_frac={reg_active_frac_mean:.6e} "
             f"layers_seen={len(rec['seen_layers'])} total_layers={int(total_layers) if total_layers is not None else -1}"
         )
         rec["emitted"] = True
@@ -7105,6 +7138,8 @@ class PaTHAttention(nn.Module):
             f"| pi_margin mean={payload.get('pi_margin_mean', float('nan')):.6e} "
             f"p50={payload.get('pi_margin_p50', float('nan')):.6e} "
             f"p90={payload.get('pi_margin_p90', float('nan')):.6e} "
+            f"| router_entropy_reg_loss={payload.get('router_entropy_reg_loss', float('nan')):.6e} "
+            f"router_entropy_reg_active_frac={payload.get('router_entropy_reg_active_frac', float('nan')):.6e} "
             f"null_mean={payload['pi_null_mean']:.6e} | "
             f"rho p50={payload['rho_p50']:.6e} p90={payload['rho_p90']:.6e} p99={payload['rho_p99']:.6e} | "
             f"beta p50={payload['beta_p50']:.6e} p90={payload['beta_p90']:.6e} "
@@ -8776,6 +8811,8 @@ class PaTHAttention(nn.Module):
         k = self.k_proj(hidden_states)           # [B,T,H*d]
         v = self.v_proj(hidden_states)           # [B,T,H*d]
         w = self.w_proj(hidden_states)           # [B,T,H*R*d]
+        self._last_router_entropy_reg_loss = hidden_states.new_zeros([])
+        self._last_router_entropy_reg_active_frac = hidden_states.new_zeros([])
         global_step = kwargs.get("global_step", getattr(self.config, "router_global_step", None))
         router1, router2 = None, None
         record_router1, record_router2 = None, None
@@ -9090,6 +9127,12 @@ class PaTHAttention(nn.Module):
             else:
                 dis_loss = q.sum() * 0.0
                 # dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
+            # Keep the regularizer path minimal and easy to rollback: add weak entropy-floor
+            # term directly into auxiliary loss used by the existing training objective.
+            if self.training:
+                reg_loss = getattr(self, "_last_router_entropy_reg_loss", None)
+                if torch.is_tensor(reg_loss):
+                    dis_loss = dis_loss + reg_loss.to(dtype=dis_loss.dtype, device=dis_loss.device)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
             if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:
