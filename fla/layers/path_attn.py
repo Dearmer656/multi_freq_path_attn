@@ -6990,10 +6990,12 @@ class PaTHAttention(nn.Module):
             layer_i = int(layer_idx)
         except Exception:
             return
-        cache = getattr(cfg, "_router_issue3_global_stats_cache", None)
+        # Keep runtime cache on the module (not config) to avoid JSON serialization
+        # failures when Trainer saves config at checkpoints.
+        cache = getattr(self, "_router_issue3_global_stats_cache", None)
         if not isinstance(cache, dict):
             cache = {}
-            setattr(cfg, "_router_issue3_global_stats_cache", cache)
+            setattr(self, "_router_issue3_global_stats_cache", cache)
         rec = cache.get(step_i)
         if rec is None:
             rec = {
