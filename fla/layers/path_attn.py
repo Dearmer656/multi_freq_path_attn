@@ -2769,6 +2769,21 @@ class PaTHAttention(nn.Module):
         self.wavelet_router_sigmoid_mode = str(getattr(config, "wavelet_router_sigmoid_mode", "softmax")).strip().lower()
         if self.wavelet_router_sigmoid_mode not in ("softmax", "with_null", "no_null"):
             self.wavelet_router_sigmoid_mode = "softmax"
+        # Optional eval-time wavelet intervention hook (default off).
+        self.wavelet_intervention_enable = self._as_bool(
+            getattr(config, "wavelet_intervention_enable", False), default=False
+        )
+        self.wavelet_intervention_strict = self._as_bool(
+            getattr(config, "wavelet_intervention_strict", True), default=True
+        )
+        self.wavelet_intervention_mode = str(
+            getattr(config, "wavelet_intervention_mode", "ctxscale_null")
+        ).strip().lower()
+        self._wavelet_intervention_targets = self._parse_wavelet_intervention_targets(
+            getattr(config, "wavelet_intervention_targets", None),
+            default_layer=getattr(config, "wavelet_intervention_layer", None),
+            default_heads=getattr(config, "wavelet_intervention_heads", None),
+        )
         self._wavelet_basis_seed_warned = False
         self._wavelet_basis_perm_cache = {}
         self._wavelet_basis_random_cache = {}
@@ -5481,7 +5496,9 @@ class PaTHAttention(nn.Module):
             except Exception:
                 pass
         th = spec.get("target_heads", [])
-        if isinstance(th, (list, tuple, set)):
+        if isinstance(th, str) and th.strip().lower() == "all":
+            head_idx_list = list(range(max(0, int(getattr(self, "num_heads", 0)))))
+        elif isinstance(th, (list, tuple, set)):
             for x in th:
                 try:
                     head_idx_list.append(int(x))
@@ -5615,6 +5632,92 @@ class PaTHAttention(nn.Module):
             }
         return pi_new
 
+    def _parse_wavelet_intervention_targets(
+        self,
+        targets_obj,
+        *,
+        default_layer=None,
+        default_heads=None,
+    ):
+        """Normalize intervention targets into {layer_idx: heads_or_all}."""
+        targets = {}
+
+        obj = targets_obj
+        if isinstance(obj, str):
+            s = obj.strip()
+            if s:
+                try:
+                    obj = json.loads(s)
+                except Exception:
+                    obj = None
+
+        if isinstance(obj, dict):
+            for lk, hv in obj.items():
+                try:
+                    layer_i = int(lk)
+                except Exception:
+                    continue
+                if isinstance(hv, str) and hv.strip().lower() == "all":
+                    targets[layer_i] = "all"
+                elif isinstance(hv, int):
+                    targets[layer_i] = [int(hv)]
+                elif isinstance(hv, (list, tuple, set)):
+                    h_list = []
+                    for h in hv:
+                        try:
+                            h_list.append(int(h))
+                        except Exception:
+                            continue
+                    if h_list:
+                        targets[layer_i] = sorted(set(h_list))
+
+        if not targets and default_layer is not None:
+            try:
+                layer_i = int(default_layer)
+            except Exception:
+                layer_i = None
+            if layer_i is not None:
+                hv = default_heads
+                if isinstance(hv, str):
+                    hs = hv.strip().lower()
+                    if hs == "all":
+                        targets[layer_i] = "all"
+                    else:
+                        h_list = self._parse_int_list(hv, default=[])
+                        if h_list:
+                            targets[layer_i] = sorted(set(int(x) for x in h_list))
+                elif isinstance(hv, int):
+                    targets[layer_i] = [int(hv)]
+                elif isinstance(hv, (list, tuple, set)):
+                    h_list = []
+                    for h in hv:
+                        try:
+                            h_list.append(int(h))
+                        except Exception:
+                            continue
+                    if h_list:
+                        targets[layer_i] = sorted(set(h_list))
+        return targets
+
+    def _get_ctxscale_do_spec_for_layer(self, layer_idx: int):
+        if not bool(getattr(self, "wavelet_intervention_enable", False)):
+            return None
+        if str(getattr(self, "wavelet_intervention_mode", "")).strip().lower() != "ctxscale_null":
+            return None
+        targets = getattr(self, "_wavelet_intervention_targets", None)
+        if not isinstance(targets, dict) or not targets:
+            return None
+        lid = int(layer_idx)
+        if lid not in targets:
+            return None
+        return {
+            "enabled": True,
+            "mode": "null",
+            "target_layer": int(lid),
+            "target_heads": targets[lid],
+            "strict": bool(getattr(self, "wavelet_intervention_strict", True)),
+        }
+
     def _build_ctxscale_shift_logit_bias_v0(
         self,
         *,
@@ -5640,6 +5743,7 @@ class PaTHAttention(nn.Module):
         self._last_router_entropy_reg_loss = reg_zero
         self._last_router_entropy_reg_active_frac = reg_zero.detach()
         lid = int(self.layer_idx if layer_idx is None else layer_idx)
+        self._ctxscale_do_spec = self._get_ctxscale_do_spec_for_layer(lid)
         self._last_ctxscale_do_validation = None
         step_val = self._to_int_or_none(step)
         if step_val is None:
