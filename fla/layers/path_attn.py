@@ -2737,6 +2737,10 @@ class PaTHAttention(nn.Module):
         self._last_router_jitter_stats = {}
         self._last_router_entropy_reg_loss = torch.tensor(0.0)
         self._last_router_entropy_reg_active_frac = torch.tensor(0.0)
+        self._last_lw_residual_hw_l2_loss = torch.tensor(0.0)
+        self._last_lw_residual_hw_delta_l2 = torch.tensor(0.0)
+        self._last_lw_residual_hw_delta_abs_mean = torch.tensor(0.0)
+        self._last_lw_residual_hw_divergence = torch.tensor(0.0)
         self.wavelet_ctxscale_router_rms_eps = float(getattr(config, "wavelet_ctxscale_router_rms_eps", 1e-6))
         self.wavelet_ctxscale_chunk_q = max(1, int(getattr(config, "wavelet_ctxscale_chunk_q", 128)))
         self.wavelet_ctxscale_max_log_samples = max(
@@ -2755,6 +2759,14 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctxscale_scale_dependent_shift = self._as_bool(
             getattr(config, "wavelet_ctxscale_scale_dependent_shift", False), default=False
         )
+        self.lw_residual_hw_enable = self._as_bool(
+            getattr(config, "lw_residual_hw_enable", False), default=False
+        )
+        self.lw_residual_hw_alpha = float(getattr(config, "lw_residual_hw_alpha", 0.1))
+        self.lw_residual_hw_l2 = float(getattr(config, "lw_residual_hw_l2", 1e-4))
+        self.lw_residual_hw_freeze_steps = max(0, int(getattr(config, "lw_residual_hw_freeze_steps", 1500)))
+        self._lw_residual_hw_phase = "disabled"
+        self._lw_residual_hw_switch_logged = False
         self.wavelet_ctxscale_use_relative_position = self._as_bool(
             getattr(config, "wavelet_ctxscale_use_relative_position", False), default=False
         )
@@ -3067,6 +3079,19 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctx_path_ln = nn.LayerNorm(3 * self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
         self.wavelet_ctx_path_proj = nn.Linear(3 * self.head_dim, self.head_dim, bias=True)
         self.wavelet_ctx_router = nn.Linear(self.head_dim, self.wavelet_ctxscale_k + 1, bias=True)
+        if self.lw_residual_hw_enable:
+            self.lw_residual_hw_delta_router = nn.Linear(
+                self.head_dim,
+                self.num_heads * (self.wavelet_ctxscale_k + 1),
+                bias=True,
+            )
+            nn.init.zeros_(self.lw_residual_hw_delta_router.weight)
+            nn.init.zeros_(self.lw_residual_hw_delta_router.bias)
+            self._lw_residual_hw_phase = "frozen" if self.lw_residual_hw_freeze_steps > 0 else "trainable"
+            for p in self.lw_residual_hw_delta_router.parameters():
+                p.requires_grad = bool(self._lw_residual_hw_phase == "trainable")
+        else:
+            self.lw_residual_hw_delta_router = None
         self.wavelet_shift_ln = nn.LayerNorm(self.hidden_size, eps=getattr(config, "layer_norm_epsilon", 1e-5))
         self.wavelet_shift_proj = nn.Linear(self.hidden_size, 1, bias=True)
         film_in_dim = self.wavelet_ctxscale_k + 2
@@ -4259,7 +4284,9 @@ class PaTHAttention(nn.Module):
                     "p_wavelet": p_wav_cpu[:head_limit],
                     "p_delta": p_delta_cpu[:head_limit],
                 }
-                if bool(getattr(self, "eval_attn_heatmap_save_pt_logits", False)) and (logit_delta_cpu is not None):
+                # Save logits whenever they are available so downstream analysis can
+                # compare probability-space and logit-space behavior from one .pt.
+                if logit_delta_cpu is not None:
                     payload["logit_base"] = zb_cpu[:head_limit]
                     payload["logit_wavelet"] = zw_cpu[:head_limit]
                     payload["logit_delta"] = logit_delta_cpu[:head_limit]
@@ -5839,6 +5866,49 @@ class PaTHAttention(nn.Module):
                 router_jitter_flip_probability_estimate = float(
                     jitter_stat.get("flip_probability_estimate", default_jitter_stat)
                 )
+
+        lw_residual_hw_phase = "disabled"
+        residual_delta_l2 = reg_zero
+        residual_delta_abs_mean = reg_zero
+        residual_router_divergence = reg_zero
+        residual_l2_loss = reg_zero
+        pi_lw_shared = None
+        if bool(getattr(self, "lw_residual_hw_enable", False)) and (self.lw_residual_hw_delta_router is not None):
+            freeze_steps = int(getattr(self, "lw_residual_hw_freeze_steps", 1500))
+            lw_residual_hw_phase = "frozen" if int(step_val) < freeze_steps else "trainable"
+            phase_should_train = bool(lw_residual_hw_phase == "trainable")
+            if self._lw_residual_hw_phase != lw_residual_hw_phase:
+                if phase_should_train:
+                    self._k1_emit_log(
+                        f"[LWResidualHW] switching residual from frozen to trainable at step {int(step_val)}"
+                    )
+                self._lw_residual_hw_phase = lw_residual_hw_phase
+            for p in self.lw_residual_hw_delta_router.parameters():
+                p.requires_grad = phase_should_train
+
+            # Shared LW feature -> small head-specific residual delta.
+            x_feat_lw = x_feat if x_feat.dim() == 3 else x_feat.mean(dim=2)
+            delta_logits = self.lw_residual_hw_delta_router(x_feat_lw.to(device=device, dtype=torch.float32))
+            delta_logits = delta_logits.view(B, int(T), int(self.num_heads), int(self.wavelet_ctxscale_k + 1))
+
+            if router_logits.dim() == 3:
+                lw_logits_shared = router_logits.unsqueeze(2).expand(-1, -1, int(self.num_heads), -1)
+            elif router_logits.dim() == 4:
+                lw_logits_shared = router_logits.mean(dim=2, keepdim=True).expand(-1, -1, int(self.num_heads), -1)
+            else:
+                raise ValueError(f"Unsupported router_logits dim for LW residual HW: {router_logits.dim()}")
+
+            alpha = float(getattr(self, "lw_residual_hw_alpha", 0.1))
+            router_logits = lw_logits_shared + (alpha * delta_logits)
+            pi_lw_shared = torch.softmax(lw_logits_shared / max(float(tau), 1e-8), dim=-1)
+            residual_delta_l2 = delta_logits.pow(2).sum(dim=-1).mean()
+            residual_delta_abs_mean = delta_logits.abs().mean()
+            if self.training and float(getattr(self, "lw_residual_hw_l2", 0.0)) > 0.0:
+                residual_l2_loss = residual_delta_l2 * float(getattr(self, "lw_residual_hw_l2", 1e-4))
+        self._last_lw_residual_hw_l2_loss = residual_l2_loss
+        self._last_lw_residual_hw_delta_l2 = residual_delta_l2.detach()
+        self._last_lw_residual_hw_delta_abs_mean = residual_delta_abs_mean.detach()
+        self._last_lw_residual_hw_divergence = residual_router_divergence.detach()
         router_jitter_injected = int(router_jitter_enabled and self.training)
         router_sigmoid_mode = str(getattr(self, "wavelet_router_sigmoid_mode", "softmax")).strip().lower()
         if router_sigmoid_mode not in ("softmax", "with_null", "no_null"):
@@ -5871,6 +5941,9 @@ class PaTHAttention(nn.Module):
             pi=pi,
             layer_idx=lid,
         )
+        if pi_lw_shared is not None and pi.dim() == 4 and pi_lw_shared.dim() == 4:
+            residual_router_divergence = (pi - pi_lw_shared.to(device=pi.device, dtype=pi.dtype)).abs().mean()
+            self._last_lw_residual_hw_divergence = residual_router_divergence.detach()
         # IMPORTANT: pi_scale must be derived from post-intervention pi.
         # Otherwise do(scale) has no effect on the final bias path.
         pi_scale = pi[..., 1:]
@@ -6962,6 +7035,10 @@ class PaTHAttention(nn.Module):
                 "flip_probability_estimate": float(router_jitter_flip_probability_estimate),
                 "router_entropy_reg_loss": float(router_entropy_reg_loss.detach().item()),
                 "router_entropy_reg_active_frac": float(router_entropy_reg_active_frac.item()),
+                "residual_delta_l2": float(residual_delta_l2.detach().item()),
+                "residual_delta_abs_mean": float(residual_delta_abs_mean.detach().item()),
+                "lw_residual_hw_phase": str(lw_residual_hw_phase),
+                "residual_router_divergence": float(residual_router_divergence.detach().item()),
                 "sum_g_mean": float(sum_g_mean),
                 "sum_g_p90": float(sum_g_p90),
                 "g0_mean": float(g0_mean),
@@ -7111,6 +7188,9 @@ class PaTHAttention(nn.Module):
                 "flip_prob": [],
                 "reg_loss": [],
                 "reg_active_frac": [],
+                "res_delta_l2": [],
+                "res_delta_abs": [],
+                "res_div": [],
                 "emitted": False,
             }
             cache[step_i] = rec
@@ -7125,6 +7205,9 @@ class PaTHAttention(nn.Module):
             ("flip_probability_estimate", "flip_prob"),
             ("router_entropy_reg_loss", "reg_loss"),
             ("router_entropy_reg_active_frac", "reg_active_frac"),
+            ("residual_delta_l2", "res_delta_l2"),
+            ("residual_delta_abs_mean", "res_delta_abs"),
+            ("residual_router_divergence", "res_div"),
         ):
             try:
                 v = float(payload.get(key, float("nan")))
@@ -7148,6 +7231,9 @@ class PaTHAttention(nn.Module):
         flip_prob_est, _ = self._finite_float_stats(rec["flip_prob"])
         reg_loss_mean, _ = self._finite_float_stats(rec["reg_loss"])
         reg_active_frac_mean, _ = self._finite_float_stats(rec["reg_active_frac"])
+        res_delta_l2_mean, _ = self._finite_float_stats(rec["res_delta_l2"])
+        res_delta_abs_mean, _ = self._finite_float_stats(rec["res_delta_abs"])
+        res_div_mean, _ = self._finite_float_stats(rec["res_div"])
         self._k1_emit_log(
             f"[wavelet router global stats] step={step_i} "
             f"pi_entropy_mean={pi_entropy_mean:.6e} pi_entropy_std={pi_entropy_std:.6e} "
@@ -7156,6 +7242,9 @@ class PaTHAttention(nn.Module):
             f"flip_probability_estimate={flip_prob_est:.6e} "
             f"router_entropy_reg_loss={reg_loss_mean:.6e} "
             f"router_entropy_reg_active_frac={reg_active_frac_mean:.6e} "
+            f"residual_delta_l2={res_delta_l2_mean:.6e} "
+            f"residual_delta_abs_mean={res_delta_abs_mean:.6e} "
+            f"residual_router_divergence={res_div_mean:.6e} "
             f"layers_seen={len(rec['seen_layers'])} total_layers={int(total_layers) if total_layers is not None else -1}"
         )
         rec["emitted"] = True
@@ -7246,6 +7335,10 @@ class PaTHAttention(nn.Module):
             f"p90={payload.get('pi_margin_p90', float('nan')):.6e} "
             f"| router_entropy_reg_loss={payload.get('router_entropy_reg_loss', float('nan')):.6e} "
             f"router_entropy_reg_active_frac={payload.get('router_entropy_reg_active_frac', float('nan')):.6e} "
+            f"residual_delta_l2={payload.get('residual_delta_l2', float('nan')):.6e} "
+            f"residual_delta_abs_mean={payload.get('residual_delta_abs_mean', float('nan')):.6e} "
+            f"lw_residual_hw_phase={payload.get('lw_residual_hw_phase', 'disabled')} "
+            f"residual_router_divergence={payload.get('residual_router_divergence', float('nan')):.6e} "
             f"null_mean={payload['pi_null_mean']:.6e} | "
             f"rho p50={payload['rho_p50']:.6e} p90={payload['rho_p90']:.6e} p99={payload['rho_p99']:.6e} | "
             f"beta p50={payload['beta_p50']:.6e} p90={payload['beta_p90']:.6e} "
@@ -8919,6 +9012,10 @@ class PaTHAttention(nn.Module):
         w = self.w_proj(hidden_states)           # [B,T,H*R*d]
         self._last_router_entropy_reg_loss = hidden_states.new_zeros([])
         self._last_router_entropy_reg_active_frac = hidden_states.new_zeros([])
+        self._last_lw_residual_hw_l2_loss = hidden_states.new_zeros([])
+        self._last_lw_residual_hw_delta_l2 = hidden_states.new_zeros([])
+        self._last_lw_residual_hw_delta_abs_mean = hidden_states.new_zeros([])
+        self._last_lw_residual_hw_divergence = hidden_states.new_zeros([])
         global_step = kwargs.get("global_step", getattr(self.config, "router_global_step", None))
         router1, router2 = None, None
         record_router1, record_router2 = None, None
@@ -9239,6 +9336,9 @@ class PaTHAttention(nn.Module):
                 reg_loss = getattr(self, "_last_router_entropy_reg_loss", None)
                 if torch.is_tensor(reg_loss):
                     dis_loss = dis_loss + reg_loss.to(dtype=dis_loss.dtype, device=dis_loss.device)
+                residual_l2_loss = getattr(self, "_last_lw_residual_hw_l2_loss", None)
+                if torch.is_tensor(residual_l2_loss):
+                    dis_loss = dis_loss + residual_l2_loss.to(dtype=dis_loss.dtype, device=dis_loss.device)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o)
             if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:
