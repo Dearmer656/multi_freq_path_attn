@@ -2766,7 +2766,6 @@ class PaTHAttention(nn.Module):
         self.lw_residual_hw_l2 = float(getattr(config, "lw_residual_hw_l2", 1e-4))
         self.lw_residual_hw_freeze_steps = max(0, int(getattr(config, "lw_residual_hw_freeze_steps", 1500)))
         self._lw_residual_hw_phase = "disabled"
-        self._lw_residual_hw_switch_logged = False
         self.wavelet_ctxscale_use_relative_position = self._as_bool(
             getattr(config, "wavelet_ctxscale_use_relative_position", False), default=False
         )
@@ -5908,7 +5907,6 @@ class PaTHAttention(nn.Module):
         self._last_lw_residual_hw_l2_loss = residual_l2_loss
         self._last_lw_residual_hw_delta_l2 = residual_delta_l2.detach()
         self._last_lw_residual_hw_delta_abs_mean = residual_delta_abs_mean.detach()
-        self._last_lw_residual_hw_divergence = residual_router_divergence.detach()
         router_jitter_injected = int(router_jitter_enabled and self.training)
         router_sigmoid_mode = str(getattr(self, "wavelet_router_sigmoid_mode", "softmax")).strip().lower()
         if router_sigmoid_mode not in ("softmax", "with_null", "no_null"):
@@ -5943,7 +5941,7 @@ class PaTHAttention(nn.Module):
         )
         if pi_lw_shared is not None and pi.dim() == 4 and pi_lw_shared.dim() == 4:
             residual_router_divergence = (pi - pi_lw_shared.to(device=pi.device, dtype=pi.dtype)).abs().mean()
-            self._last_lw_residual_hw_divergence = residual_router_divergence.detach()
+        self._last_lw_residual_hw_divergence = residual_router_divergence.detach()
         # IMPORTANT: pi_scale must be derived from post-intervention pi.
         # Otherwise do(scale) has no effect on the final bias path.
         pi_scale = pi[..., 1:]
