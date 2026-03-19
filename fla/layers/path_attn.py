@@ -5690,36 +5690,11 @@ class PaTHAttention(nn.Module):
     def _ricker_wavelet(u: torch.Tensor):
         return (1.0 - u.pow(2)) * torch.exp(-0.5 * u.pow(2))
     @staticmethod
-    def _alibi_like_from_wavelet_min(
+    def _linear_basis(
         self,
         u: torch.Tensor,
-        *,
-        symmetric: bool = True,
     ) -> torch.Tensor:
-        """
-        Replace Ricker wavelet basis with an ALiBi-like linear decay basis.
-
-        We use the fact that for Ricker wavelet
-            psi(u) = (1 - u^2) exp(-u^2 / 2),
-        the minimum occurs at |u| = sqrt(3).
-
-        So we define a linear bias:
-            b(u) = max(1 - |u| / sqrt(3), 0)
-
-        This ensures:
-        - maximum at u = 0
-        - decays to 0 exactly at the position where the Ricker wavelet reaches its minimum.
-
-        Args:
-            u: normalized coordinate, typically (x - beta) / scale
-            symmetric: if True, use |u| (two-sided triangular profile);
-                    if False, use one-sided decay max(1 - u/sqrt(3), 0)
-
-        Returns:
-            Tensor with same shape as u.
-        """
-        u_eff = u.abs() if symmetric else u
-        return (1.0 - u_eff / math.sqrt(3.0)).clamp_min(0.0)
+        return (1.0 - u.abs() / math.sqrt(3.0)).clamp_min(0.0)
 
     def _maybe_clamp_p99(self, x: torch.Tensor):
         if not self.wavelet_logit_bias_clamp_enable:
@@ -7142,8 +7117,10 @@ class PaTHAttention(nn.Module):
 
                         if self.bias_type == "wavelet":
                             basis_table = self._ricker_wavelet(u_i)
-                        elif self.bias_type == "alibi":
-                            basis_table = self._alibi_like_basis(u_i)
+                        elif self.bias_type == "linear":
+                            basis_table = self._linear_basis(u_i)
+                        elif self.bias_type == "rotary":
+                            pass
                         else:
                             raise ValueError(f"Unsupported bias_type: {self.bias_type}")
 
