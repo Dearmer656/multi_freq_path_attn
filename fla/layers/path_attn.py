@@ -5689,6 +5689,37 @@ class PaTHAttention(nn.Module):
     @staticmethod
     def _ricker_wavelet(u: torch.Tensor):
         return (1.0 - u.pow(2)) * torch.exp(-0.5 * u.pow(2))
+    @staticmethod
+    def _alibi_like_from_wavelet_min(
+        self,
+        u: torch.Tensor,
+        *,
+        symmetric: bool = True,
+    ) -> torch.Tensor:
+        """
+        Replace Ricker wavelet basis with an ALiBi-like linear decay basis.
+
+        We use the fact that for Ricker wavelet
+            psi(u) = (1 - u^2) exp(-u^2 / 2),
+        the minimum occurs at |u| = sqrt(3).
+
+        So we define a linear bias:
+            b(u) = max(1 - |u| / sqrt(3), 0)
+
+        This ensures:
+        - maximum at u = 0
+        - decays to 0 exactly at the position where the Ricker wavelet reaches its minimum.
+
+        Args:
+            u: normalized coordinate, typically (x - beta) / scale
+            symmetric: if True, use |u| (two-sided triangular profile);
+                    if False, use one-sided decay max(1 - u/sqrt(3), 0)
+
+        Returns:
+            Tensor with same shape as u.
+        """
+        u_eff = u.abs() if symmetric else u
+        return (1.0 - u_eff / math.sqrt(3.0)).clamp_min(0.0)
 
     def _maybe_clamp_p99(self, x: torch.Tensor):
         if not self.wavelet_logit_bias_clamp_enable:
@@ -6346,6 +6377,7 @@ class PaTHAttention(nn.Module):
         layer_idx: Optional[int] = None,
         step: Optional[int] = None,
         enable_film: bool = False,
+        k = None,
     ):
         if hidden_states is None:
             raise ValueError("hidden_states is required for wavelet_mode='logit_bias_ctxscale_shift_v0'")
@@ -7092,7 +7124,7 @@ class PaTHAttention(nn.Module):
                     else:
                         beta_i = beta_m[:, q0:q1]
                     if basis_control == "random_basis":
-                        psi_table = self._random_basis_table(
+                        basis_table = self._random_basis_table(
                             q_len=int(q1 - q0),
                             T=int(T),
                             scale_idx=int(scale_idx),
@@ -7107,18 +7139,25 @@ class PaTHAttention(nn.Module):
                             u_i = (key_anchor_pos - beta_i.unsqueeze(-1)) / s_i
                         else:
                             u_i = (diff.view(1, 1, T) - beta_i.unsqueeze(-1)) / s_i
-                        psi_table = self._ricker_wavelet(u_i)
-                    psi_table = self._rms_norm_last_dim(psi_table, eps=eps)
-                    psi_table = self._maybe_clamp_p99(psi_table)
+
+                        if self.bias_type == "wavelet":
+                            basis_table = self._ricker_wavelet(u_i)
+                        elif self.bias_type == "alibi":
+                            basis_table = self._alibi_like_basis(u_i)
+                        else:
+                            raise ValueError(f"Unsupported bias_type: {self.bias_type}")
+
+                    basis_table = self._rms_norm_last_dim(basis_table, eps=eps)
+                    basis_table = self._maybe_clamp_p99(basis_table)
                     if router_headwise:
                         weight_h = pi_scale[:, q0:q1, :, i].permute(0, 2, 1).unsqueeze(-1)
-                        contrib_i_head = weight_h * psi_table.unsqueeze(1)
+                        contrib_i_head = weight_h * basis_table.unsqueeze(1)
                         if far_mask is not None:
                             contrib_i_head = contrib_i_head * far_mask.to(dtype=torch.float32).unsqueeze(1)
                         bias_chunk_head = bias_chunk_head + contrib_i_head
                         contrib_i = contrib_i_head.mean(dim=1)
                     else:
-                        contrib_i = pi_scale[:, q0:q1, i].unsqueeze(-1) * psi_table
+                        contrib_i = pi_scale[:, q0:q1, i].unsqueeze(-1) * basis_table
                         if far_mask is not None:
                             contrib_i = contrib_i * far_mask.to(dtype=torch.float32)
                         bias_chunk = bias_chunk + contrib_i
@@ -9444,6 +9483,7 @@ class PaTHAttention(nn.Module):
                 layer_idx=layer_idx,
                 step=step_for_ctx,
                 enable_film=bool(wavelet_mode == "logit_bias_ctxscale_shift_v0_film"),
+                k = k if self.bias_type == "rotary" else None,
             )
         elif rel_enabled and wavelet_mode == "router_rel":
             if router1 is not None and router2 is not None:
