@@ -26,7 +26,6 @@ def parallel_path_fwd_kernel(
     M,
     cu_seqlens,
     indices,
-    logit_out,
     T,
     G: tl.constexpr,
     HQ: tl.constexpr,
@@ -39,12 +38,10 @@ def parallel_path_fwd_kernel(
     BV: tl.constexpr,
     USE_GATE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    RETURN_LOGITS: tl.constexpr,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_hq = i_bh // HQ, i_bh % HQ
     i_h = i_hq // G
-    T_total = T  # global / packed total length — used for logit_out stride
 
     if IS_VARLEN:
         i_n, i_t = tl.load(indices + i_t * 2).to(tl.int32), tl.load(indices + i_t * 2 + 1).to(tl.int32)
@@ -95,12 +92,6 @@ def parallel_path_fwd_kernel(
             b_g_cumsum_k = tl.load(p_g_cumsum_k, boundary_check=(0,))
             b_s = b_s + b_g_cumsum_q[:, None] - b_g_cumsum_k[None, :]
         b_s = tl.where(m_s[:, None], b_s * sm_scale, float("-inf"))
-        if RETURN_LOGITS:
-            p_logit = tl.make_block_ptr(
-                logit_out + i_bh * T_total * T_total,
-                (T_total, T_total), (T_total, 1),
-                (i_t * BT, offset), (BT, BS), (1, 0))
-            tl.store(p_logit, b_s.to(tl.float32), boundary_check=(0, 1))
         b_m_new = tl.maximum(b_m, tl.max(b_s, 1))
         alpha = tl.math.exp2((b_m - b_m_new))
         b_s = tl.math.exp2(b_s - b_m_new[:, None])
@@ -132,12 +123,6 @@ def parallel_path_fwd_kernel(
             b_g_cumsum_k = tl.load(p_g_cumsum_k, boundary_check=(0,))
             b_s = b_s + b_g_cumsum_q[:, None] - b_g_cumsum_k[None, :]
         b_s = b_s * sm_scale
-        if RETURN_LOGITS:
-            p_logit = tl.make_block_ptr(
-                logit_out + i_bh * T_total * T_total,
-                (T_total, T_total), (T_total, 1),
-                (i_t * BT, offset), (BT, BS), (1, 0))
-            tl.store(p_logit, b_s.to(tl.float32), boundary_check=(0, 1))
         b_m_new = tl.maximum(b_m, tl.max(b_s, 1))
         alpha = tl.math.exp2((b_m - b_m_new))
         b_s = tl.math.exp2(b_s - b_m_new[:, None])
@@ -192,22 +177,16 @@ def parallel_path_fwd_fn(
     cu_seqlens,
     BT,
     BS,
-    logit_out=None,
 ):
     B, T, HQ, K = q.shape
     V = v.shape[-1]
     H = k.shape[-2]
     G = HQ // H
-    # T_total: total packed sequence length passed to kernel as "global T"
-    # non-varlen: T_total == T (per-sample length, all equal)
-    # varlen:     T_total == total tokens packed in q (q.shape[1])
-    T_total = q.shape[1]  # same as T for non-varlen; packed total for varlen
     indices = prepare_chunk_indices(cu_seqlens, BT) if cu_seqlens is not None else None
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(indices)
     grid = (NT, B * HQ)
     o_new = torch.empty_like(o, dtype=v.dtype)
     L_new = torch.empty_like(L)
-    RETURN_LOGITS = logit_out is not None
     parallel_path_fwd_kernel[grid](
         q=q,
         k=k,
@@ -223,8 +202,7 @@ def parallel_path_fwd_fn(
         L=L,
         L_new=L_new,
         M=M,
-        logit_out=logit_out,
-        T=T_total,
+        T=T,
         K=K,
         V=V,
         BK=triton.next_power_of_2(K),
@@ -234,7 +212,6 @@ def parallel_path_fwd_fn(
         H=H,
         BS=BS,
         BT=BT,
-        RETURN_LOGITS=RETURN_LOGITS,
         num_warps=8 if (BT == 128 and K == 128) else 4
     )
     return o_new, L_new
