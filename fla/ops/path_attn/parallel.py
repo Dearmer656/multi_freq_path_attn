@@ -219,6 +219,46 @@ class ParallelPATHAttentionFunction(torch.autograd.Function):
                 None, None, None, None)
 
 
+@torch.no_grad()
+def _parallel_path_fwd_logits(q, k, v, w, beta, g, scale, cu_seqlens):
+    """Run the PaTH forward pass and return state-cumulative logits.
+
+    Returns:
+        logits (torch.Tensor): shape [B, HQ, T, T], float32.
+            logits[b, h, i, j] = scaled dot-product of the path-state-updated query i
+            with key j, before softmax/exp.
+            Positions j >= block_start(i) within the same BS block, and j >= i (future),
+            are -inf (either causal mask or handled by intra_chunk_preprocess, not stored here).
+        None: placeholder for k_cache (consistent with the normal (o, k_cache) return).
+
+    Note: cu_seqlens (variable-length) is not supported — call with cu_seqlens=None.
+    """
+    if cu_seqlens is not None:
+        raise NotImplementedError(
+            "return_logits=True does not support variable-length inputs (cu_seqlens). "
+            "Pass cu_seqlens=None."
+        )
+    g_cumsum = chunk_global_cumsum(g, cu_seqlens=None, output_dtype=torch.float32) if g is not None else None
+    BS = 64 if check_shared_mem('hopper') else 32
+    BT = 128 if check_shared_mem('ampere') else 64
+    A = chunk_scaled_dot_kkt_fwd(k=w, beta=beta, cu_seqlens=None, chunk_size=BS, output_dtype=torch.float32)
+    A = solve_tril(A=A, cu_seqlens=None, output_dtype=w.dtype)
+    q_new, k_new, w2, o, L, M = intra_chunk_preprocess_fwd_fn(
+        q=q, k=k, v=v, w=w, beta=beta, g_cumsum=g_cumsum, A=A, scale=scale, BT=BS, cu_seqlens=None,
+    )
+    B, T, HQ, _ = q.shape
+    logit_out = torch.full((B * HQ, T, T), float('-inf'), dtype=torch.float32, device=q.device)
+    w_fp16 = w.to(torch.float16)
+    w2_fp16 = w2.to(torch.float16)
+    parallel_path_fwd_fn(
+        q=q_new, k=k_new, v=v, o=o, g_cumsum=g_cumsum,
+        w1=w_fp16, w2=w2_fp16, scale=scale, L=L, M=M,
+        cu_seqlens=None, BT=BT, BS=BS, logit_out=logit_out,
+    )
+    # Return (logits, None) — consistent 2-tuple so callers can write: logits, _ = parallel_path_attn(..., return_logits=True)
+    return logit_out.view(B, HQ, T, T), None
+
+
 @torch.compiler.disable
 def parallel_path_attn(
     q: torch.Tensor,
@@ -229,7 +269,8 @@ def parallel_path_attn(
     g: Optional[torch.Tensor] = None,
     scale: float = None,
     cu_seqlens: Optional[torch.Tensor] = None,
-    use_cache: bool = False
+    use_cache: bool = False,
+    return_logits: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""
     Args:
@@ -273,6 +314,8 @@ def parallel_path_attn(
     if g is not None:
         assert g.shape[:3] == q.shape[:3], 'g should have the same number of heads as q'
     assert q.shape[-2] % k.shape[-2] == 0, 'the number of query heads should be divisible by the number of key heads'
+    if return_logits:
+        return _parallel_path_fwd_logits(q, k, v, w, beta, g, scale, cu_seqlens)
     o, k_cache = ParallelPATHAttentionFunction.apply(q, k, v, w, beta, g, scale, cu_seqlens, use_cache)
     return o, k_cache
 

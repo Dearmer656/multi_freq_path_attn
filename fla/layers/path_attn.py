@@ -2787,6 +2787,9 @@ class PaTHAttention(nn.Module):
         )
         self.wavelet_ctxscale_g_max = float(getattr(config, "wavelet_ctxscale_g_max", 0.5))
         self.wavelet_ctxscale_g_bias_max = float(getattr(config, "wavelet_ctxscale_g_bias_max", 4.0))
+        # Eval-only global multiplier on wavelet additive logits.
+        # Default keeps existing behavior unchanged.
+        self.wavelet_eval_logit_scale = float(getattr(config, "wavelet_eval_logit_scale", 1.0))
         self.wavelet_ctxscale_disable_layer_gate = self._as_bool(
             getattr(config, "wavelet_ctxscale_disable_layer_gate", False), default=False
         )
@@ -3158,6 +3161,7 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctx_path_ln = nn.LayerNorm(3 * self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
         self.wavelet_ctx_path_proj = nn.Linear(3 * self.head_dim, self.head_dim, bias=True)
         self.wavelet_ctx_router = nn.Linear(self.head_dim, self.wavelet_ctxscale_k + 1, bias=True)
+
         # E2b ablation: static globally-learned router (not query-conditioned)
         self.wavelet_router_static_learned = self._as_bool(
             getattr(config, "wavelet_router_static_learned", False), default=False
@@ -3368,8 +3372,13 @@ class PaTHAttention(nn.Module):
 
         # 每个 (head, rank) 一个 beta
         self.bt_proj = nn.Linear(self.hidden_size, self.num_kv_heads * self.r, bias=True)
-        if self.config.distill_teacher == 'rotary' or self.config.qk_rotation:
-            self.rotary_emb = RotaryEmbedding(dim=64)
+        if self.bias_type == 'rotary':
+            self.path_rotary_emb  = RotaryEmbedding(dim=64)
+            self.rotary_gate_ln = nn.LayerNorm(self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
+            self.rotary_gate_proj = nn.Linear(self.head_dim, 1, bias=True)
+            self._last_rotary_delta_l2 = None
+            self._last_rotary_delta_abs_mean = None
+            self._last_rotary_delta_abs_p99 = None            
 
         # 可选 FoX 遗忘门
         self.use_forget_gate = use_forget_gate
@@ -3987,55 +3996,82 @@ class PaTHAttention(nn.Module):
         q_len, k_len = int(mat.shape[-2]), int(mat.shape[-1])
         if q_len <= 0 or k_len <= 0:
             return {}
-        rows = torch.zeros_like(mat)
-        for i in range(q_len):
-            vals = mat[i, : i + 1]
-            if map_type == "raw_score":
-                probs = torch.softmax(vals, dim=-1)
-            else:
-                probs = vals.clamp_min(0.0)
-                probs = probs / probs.sum().clamp_min(1e-8)
-            rows[i, : i + 1] = probs
+        causal_mask = torch.tril(torch.ones(q_len, k_len, dtype=torch.bool))
+        if map_type == "raw_score":
+            masked = mat.masked_fill(~causal_mask, float("-inf"))
+            rows = torch.softmax(masked, dim=-1)
+            rows = torch.nan_to_num(rows, nan=0.0, posinf=0.0, neginf=0.0)
+        else:
+            masked = mat.masked_fill(~causal_mask, 0.0).clamp_min(0.0)
+            row_sums = masked.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            rows = masked / row_sums
 
         stride = max(1, int(query_stride))
         row_ids = list(range(0, q_len, stride))
         if (q_len - 1) not in row_ids:
             row_ids.append(q_len - 1)
 
-        vertical_vals = []
-        diagonal_vals = []
-        jsd_vals = []
-        support_vertical_vals = []
-        nonsupport_vertical_vals = []
-        aligned = torch.zeros((len(row_ids), k_len), dtype=torch.float32)
         support_mask = self._pattern_support_mask(k_len, support_start, support_end, device=rows.device)
 
-        for ridx, q_idx in enumerate(row_ids):
-            vals = rows[q_idx, : q_idx + 1]
-            aligned[ridx, : q_idx + 1] = torch.flip(vals, dims=[0])
-            if ridx == 0:
-                continue
-            prev_q = row_ids[ridx - 1]
-            cur_q = q_idx
-            prev_row = rows[prev_q]
-            cur_row = rows[cur_q]
-            v = self._pattern_row_cos(prev_row, cur_row)
-            vertical_vals.append(v)
-            shift = max(1, int(cur_q - prev_q))
-            if shift < k_len:
-                d = self._pattern_row_cos(prev_row[shift:], cur_row[:-shift])
-            else:
-                d = 0.0
-            diagonal_vals.append(d)
-            jsd_vals.append(self._pattern_jsd(prev_row, cur_row))
+        # ── vectorized feature extraction ────────────────────────────────────
+        q_arr = torch.tensor(row_ids, dtype=torch.long)   # [n]
+        n_rows = len(row_ids)
+
+        # aligned[ridx, j] = rows[q_arr[ridx], q_arr[ridx]-j] if j<=q_arr[ridx] else 0
+        j_idx = torch.arange(k_len, dtype=torch.long)
+        valid_j = (j_idx[None, :] <= q_arr[:, None]).float()                   # [n, k_len]
+        src_j   = (q_arr[:, None] - j_idx[None, :]).clamp_min(0)               # [n, k_len]
+        aligned = rows[q_arr[:, None].expand(n_rows, k_len), src_j] * valid_j  # [n, k_len]
+
+        vertical_vals: list = []
+        diagonal_vals: list = []
+        jsd_vals: list = []
+        support_vertical_vals: list = []
+        nonsupport_vertical_vals: list = []
+
+        if n_rows > 1:
+            prev_rows_t = rows[q_arr[:-1]]    # [n-1, k_len]
+            cur_rows_t  = rows[q_arr[1:]]     # [n-1, k_len]
+
+            # vertical cosine similarity between adjacent sampled rows
+            num_v = (prev_rows_t * cur_rows_t).sum(dim=-1)
+            den_v = prev_rows_t.norm(dim=-1) * cur_rows_t.norm(dim=-1)
+            vertical_t = torch.nan_to_num(num_v / den_v.clamp_min(1e-8), nan=0.0, posinf=0.0, neginf=0.0)
+            vertical_vals = vertical_t.tolist()
+
+            # diagonal cosine (shift = q_gap; grouped per unique shift to support any query_stride)
+            shifts_t = (q_arr[1:] - q_arr[:-1]).clamp_min(1)    # [n-1]
+            diagonal_t = torch.zeros(n_rows - 1, dtype=torch.float32)
+            for sh_val in shifts_t.unique().tolist():
+                sh = int(sh_val)
+                if sh >= k_len:
+                    continue
+                mask = (shifts_t == sh)
+                p = prev_rows_t[mask, sh:]
+                c = cur_rows_t[mask, :k_len - sh]
+                num_d = (p * c).sum(dim=-1)
+                den_d = p.norm(dim=-1) * c.norm(dim=-1)
+                diagonal_t[mask] = torch.nan_to_num(num_d / den_d.clamp_min(1e-8), nan=0.0, posinf=0.0, neginf=0.0)
+            diagonal_vals = diagonal_t.tolist()
+
+            # Jensen-Shannon divergence between adjacent rows
+            a_t = prev_rows_t.clamp_min(1e-8)
+            b_t = cur_rows_t.clamp_min(1e-8)
+            a_t = a_t / a_t.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            b_t = b_t / b_t.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            m_t = 0.5 * (a_t + b_t)
+            jsd_t = 0.5 * ((a_t * (a_t.log() - m_t.log())).sum(dim=-1) +
+                           (b_t * (b_t.log() - m_t.log())).sum(dim=-1))
+            jsd_vals = jsd_t.tolist()
+
+            # support / non-support split
             if support_mask is not None:
-                in_support = bool(support_mask[min(prev_q, support_mask.numel() - 1)].item()) or bool(
-                    support_mask[min(cur_q, support_mask.numel() - 1)].item()
-                )
-                if in_support:
-                    support_vertical_vals.append(v)
-                else:
-                    nonsupport_vertical_vals.append(v)
+                sm_len = support_mask.numel()
+                prev_in = support_mask[q_arr[:-1].clamp(max=sm_len - 1)]   # [n-1]
+                cur_in  = support_mask[q_arr[1:].clamp(max=sm_len - 1)]    # [n-1]
+                in_sup  = prev_in | cur_in
+                support_vertical_vals    = vertical_t[in_sup].tolist()
+                nonsupport_vertical_vals = vertical_t[~in_sup].tolist()
 
         if aligned.shape[0] > 2:
             spec = torch.fft.rfft(aligned, dim=0)
@@ -5691,7 +5727,6 @@ class PaTHAttention(nn.Module):
         return (1.0 - u.pow(2)) * torch.exp(-0.5 * u.pow(2))
     @staticmethod
     def _linear_basis(
-        self,
         u: torch.Tensor,
     ) -> torch.Tensor:
         return (1.0 - u.abs() / math.sqrt(3.0)).clamp_min(0.0)
@@ -6354,7 +6389,7 @@ class PaTHAttention(nn.Module):
         enable_film: bool = False,
         k = None,
     ):
-        if hidden_states is None:
+        if self.bias_type != "rotary" and hidden_states is None:
             raise ValueError("hidden_states is required for wavelet_mode='logit_bias_ctxscale_shift_v0'")
 
         B = int(E_base_raw.shape[0])
@@ -6369,6 +6404,12 @@ class PaTHAttention(nn.Module):
         step_val = self._to_int_or_none(step)
         if step_val is None:
             step_val = self._resolve_wavelet_gate_step(None)
+        # Eval-only multiplier for wavelet logit contribution (default keeps legacy behavior).
+        eval_logit_mult = float(getattr(self.config, "wavelet_eval_logit_multiplier", 1.0))
+        if not math.isfinite(eval_logit_mult):
+            eval_logit_mult = 1.0
+        if self.training:
+            eval_logit_mult = 1.0
         warned_nonfinite = False
 
         def _warn_nonfinite(name: str):
@@ -6424,6 +6465,182 @@ class PaTHAttention(nn.Module):
 
         q_corr = torch.einsum("b h t j, b j h d -> b t h d", mf, wf)
         x_feat = self._ctxscale_router_feature(qf, q_corr, use_mlp=use_mlp_bias_baseline)
+        head_mask = None
+        valid_heads = None
+        if self.wavelet_ctxscale_head_indices is not None:
+            h_total = int(E_base_raw.shape[1])
+            head_mask = torch.zeros((1, h_total, 1, 1), device=device, dtype=torch.float32)
+            valid_heads = [h for h in self.wavelet_ctxscale_head_indices if 0 <= int(h) < h_total]
+            if len(valid_heads) > 0:
+                head_mask[:, valid_heads, :, :] = 1.0        
+        # ------------------------------------------------------------------
+        # rotary ablation branch: normal rotary residual correction
+        # E_out = E_base_raw + gate * ( (R q)(R k)^T - q k^T )
+        # where gate is row-wise and aligned with wavelet router granularity
+        # ------------------------------------------------------------------
+        logits_out = E_base_raw.to(dtype=torch.float32).clone()
+        g_bias_max = float(getattr(self.config, "wavelet_ctxscale_g_bias_max", self.wavelet_ctxscale_g_bias_max))
+        eval_logit_scale = 1.0
+        if not self.training:
+            eval_logit_scale = float(getattr(self.config, "wavelet_eval_logit_scale", self.wavelet_eval_logit_scale))
+
+        if self.bias_type == "rotary":
+            if k is None:
+                raise ValueError("k is required when bias_type='rotary'")
+
+            q_in = q.to(device=device, dtype=torch.float32)
+            k_in = k.to(device=device, dtype=torch.float32)
+
+            if q_in.dim() != 4 or k_in.dim() != 4:
+                raise ValueError(
+                    f"rotary branch expects q,k to be 4D, got "
+                    f"q={tuple(q_in.shape)}, k={tuple(k_in.shape)}"
+                )
+            if q_in.shape != k_in.shape:
+                raise ValueError(
+                    f"rotary branch expects q,k same shape, got "
+                    f"q={tuple(q_in.shape)}, k={tuple(k_in.shape)}"
+                )
+
+            # --------------------------------------------------
+            # Normalize q/k layout to [B,H,T,D]
+            # Accept either [B,T,H,D] or [B,H,T,D]
+            # --------------------------------------------------
+            if int(q_in.shape[1]) == int(T) and int(q_in.shape[2]) == int(self.num_heads):
+                # q/k are [B,T,H,D] -> convert to [B,H,T,D]
+                q_bhtd = q_in.permute(0, 2, 1, 3).contiguous()
+                k_bhtd = k_in.permute(0, 2, 1, 3).contiguous()
+            elif int(q_in.shape[1]) == int(self.num_heads) and int(q_in.shape[2]) == int(T):
+                # already [B,H,T,D]
+                q_bhtd = q_in
+                k_bhtd = k_in
+            else:
+                raise ValueError(
+                    f"Unsupported q/k layout for rotary branch: "
+                    f"q.shape={tuple(q_in.shape)}, expected [B,T,H,D] or [B,H,T,D] "
+                    f"with T={int(T)}, H={int(self.num_heads)}"
+                )
+
+            Bq, Hq, Tq, Dq = q_bhtd.shape
+            if int(Tq) != int(T):
+                raise ValueError(f"rotary branch got q/k seq_len={Tq}, but T={T}")
+            if int(Hq) != int(self.num_heads):
+                raise ValueError(f"rotary branch got num_heads={Hq}, expected {self.num_heads}")
+            if (int(Dq) % 2) != 0:
+                raise ValueError(f"rotary branch requires even head dim, got D={Dq}")
+
+            # --------------------------------------------------
+            # Normalize x_feat layout for row-wise gating
+            # Goal:
+            #   shared gate  -> [B,1,T,1]
+            #   head-wise gate -> [B,H,T,1]
+            # --------------------------------------------------
+            x_gate_feat = self.rotary_gate_ln(x_feat.to(device=device, dtype=torch.float32))
+
+            if x_gate_feat.dim() == 3:
+                # Expect [B,T,D]
+                if int(x_gate_feat.shape[1]) != int(Tq):
+                    raise ValueError(
+                        f"Unexpected 3D x_feat layout for rotary branch: "
+                        f"x_feat.shape={tuple(x_gate_feat.shape)}, expected second dim T={Tq}"
+                    )
+                gate_logits = self.rotary_gate_proj(x_gate_feat)              # [B,T,1]
+                g_rot = torch.sigmoid(gate_logits).squeeze(-1)                # [B,T]
+                rot_gate = (1.0 - g_rot).unsqueeze(1).unsqueeze(-1)           # [B,1,T,1]
+
+            elif x_gate_feat.dim() == 4:
+                # Support either [B,T,H,D] or [B,H,T,D]
+                if int(x_gate_feat.shape[1]) == int(Tq) and int(x_gate_feat.shape[2]) == int(Hq):
+                    # [B,T,H,D] -> [B,H,T,D]
+                    x_gate_feat = x_gate_feat.permute(0, 2, 1, 3).contiguous()
+                elif int(x_gate_feat.shape[1]) == int(Hq) and int(x_gate_feat.shape[2]) == int(Tq):
+                    # already [B,H,T,D]
+                    pass
+                else:
+                    raise ValueError(
+                        f"Unexpected 4D x_feat layout for rotary branch: "
+                        f"x_feat.shape={tuple(x_gate_feat.shape)}, expected [B,T,H,D] or [B,H,T,D] "
+                        f"with T={Tq}, H={Hq}"
+                    )
+
+                gate_logits = self.rotary_gate_proj(x_gate_feat)              # [B,H,T,1]
+                g_rot = torch.sigmoid(gate_logits).squeeze(-1)                # [B,H,T]
+                rot_gate = (1.0 - g_rot).unsqueeze(-1)                        # [B,H,T,1]
+
+            else:
+                raise ValueError(f"Unexpected x_feat dim in rotary branch: {x_gate_feat.dim()}")
+
+            # --------------------------------------------------
+            # normal rotary residual on standardized [B,H,T,D]
+            # --------------------------------------------------
+            q_rot = self.path_rotary_emb.rotate_queries_or_keys(q_bhtd)
+            k_rot = self.path_rotary_emb.rotate_queries_or_keys(k_bhtd)
+
+            base_qk = torch.einsum("bhtd,bhsd->bhts", q_bhtd, k_bhtd)         # [B,H,T,T]
+            rot_qk  = torch.einsum("bhtd,bhsd->bhts", q_rot,  k_rot)          # [B,H,T,T]
+
+            rotary_delta = rot_qk - base_qk                                   # [B,H,T,T]
+
+            if not torch.isfinite(rotary_delta).all():
+                _warn_nonfinite("rotary_delta")
+                rotary_delta = torch.nan_to_num(rotary_delta, nan=0.0, posinf=0.0, neginf=0.0)
+
+            eff_to_add = rot_gate * rotary_delta                              # broadcast to [B,H,T,T]
+            eff_to_add = eff_to_add.clamp(min=-g_bias_max, max=g_bias_max)
+
+            if not torch.isfinite(eff_to_add).all():
+                _warn_nonfinite("rotary_eff_to_add")
+                eff_to_add = torch.nan_to_num(
+                    eff_to_add,
+                    nan=0.0,
+                    posinf=g_bias_max,
+                    neginf=-g_bias_max,
+                )
+
+            if head_mask is not None:
+                eff_to_add = eff_to_add * head_mask
+
+            logits_out = E_base_raw.to(dtype=torch.float32) + eff_to_add
+
+            if need_log:
+                rotary_delta_l2 = rotary_delta.pow(2).mean()
+                rotary_delta_abs_mean = rotary_delta.abs().mean()
+                def _safe_quantile_flat(x: torch.Tensor, q: float, max_samples: int = 200000) -> float:
+                    if x.numel() == 0:
+                        return 0.0
+                    x = x.detach().reshape(-1)
+                    if x.numel() > max_samples:
+                        idx = torch.randint(
+                            low=0,
+                            high=x.numel(),
+                            size=(max_samples,),
+                            device=x.device,
+                        )
+                        x = x.index_select(0, idx)
+                    return float(torch.quantile(x, q).item())                
+                rotary_eff_abs_p99 = _safe_quantile_flat(eff_to_add.abs(), 0.99)
+
+                payload = {
+                    "bias_type": "rotary",
+                    "q_layout_in": tuple(q_in.shape),
+                    "q_layout_std": tuple(q_bhtd.shape),
+                    "x_feat_layout": tuple(x_feat.shape),
+                    "rot_gate_layout": tuple(rot_gate.shape),
+                    "rotary_delta_l2": float(rotary_delta_l2.detach().item()),
+                    "rotary_delta_abs_mean": float(rotary_delta_abs_mean.detach().item()),
+                    "rotary_eff_abs_p99": float(rotary_eff_abs_p99),
+                    "row_gate_mean": float(g_rot.detach().float().mean().item()),
+                    "row_gate_p50": float(torch.quantile(g_rot.detach().float().reshape(-1), 0.5).item()),
+                    "row_gate_p90": float(torch.quantile(g_rot.detach().float().reshape(-1), 0.9).item()),
+                    "seq_len": int(Tq),
+                    "num_heads": int(Hq),
+                    "batch_size": int(Bq),
+                }
+                self._last_ctxscale_monitor_payload = payload
+            else:
+                payload = None
+
+            return logits_out.to(dtype=compute_dtype), payload      
         router_headwise = bool(x_feat.dim() == 4)
         router_mod = self.mlp_bias_router if use_mlp_bias_baseline else self.wavelet_ctx_router
         router_logits = router_mod(x_feat)
@@ -6778,6 +6995,25 @@ class PaTHAttention(nn.Module):
                     posinf=g_max,
                     neginf=0.0,
                 )
+            if bias_type == "rotary":
+                rotary_delta_l2 = float(payload.get("rotary_delta_l2", 0.0))
+                rotary_delta_abs_mean = float(payload.get("rotary_delta_abs_mean", 0.0))
+                rotary_eff_abs_p99 = float(payload.get("rotary_eff_abs_p99", 0.0))
+                row_gate_mean = float(payload.get("row_gate_mean", 0.0))
+                row_gate_p50 = float(payload.get("row_gate_p50", 0.0))
+                row_gate_p90 = float(payload.get("row_gate_p90", 0.0))
+
+                self._k1_emit_log(
+                    f"[ctxscale_shift_v0 monitor][rotary] "
+                    f"layer={int(layer_idx)} step={int(step)} "
+                    f"rotary_delta_l2={rotary_delta_l2:.6e} "
+                    f"rotary_delta_abs_mean={rotary_delta_abs_mean:.6e} "
+                    f"rotary_eff_abs_p99={rotary_eff_abs_p99:.6e} "
+                    f"row_gate_mean={row_gate_mean:.6e} "
+                    f"row_gate_p50={row_gate_p50:.6e} "
+                    f"row_gate_p90={row_gate_p90:.6e}"
+                )
+                return                
             g_layer = g_head.mean()
             g_layer_raw = g_head_raw.mean()
             g_layer_raw_used = g_head_raw_used.mean()
@@ -6856,7 +7092,7 @@ class PaTHAttention(nn.Module):
                     posinf=g_max,
                     neginf=0.0,
                 )
-        logits_out = E_base_raw.to(dtype=torch.float32).clone()
+    
         if self.wavelet_logit_bias_debug_assert:
             assert E_base_raw.dim() == 4
 
@@ -6870,14 +7106,6 @@ class PaTHAttention(nn.Module):
         far_over_alpha = float(getattr(self, "wavelet_ctxscale_far_over_alpha", 1.0))
         apply_far_over = (far_over_delta > 0) and (far_over_alpha < 0.999999)
         k_pos_long = torch.arange(T, device=device, dtype=torch.long).view(1, 1, T) if (far_only or apply_far_over) else None
-        head_mask = None
-        valid_heads = None
-        if self.wavelet_ctxscale_head_indices is not None:
-            h_total = int(E_base_raw.shape[1])
-            head_mask = torch.zeros((1, h_total, 1, 1), device=device, dtype=torch.float32)
-            valid_heads = [h for h in self.wavelet_ctxscale_head_indices if 0 <= int(h) < h_total]
-            if len(valid_heads) > 0:
-                head_mask[:, valid_heads, :, :] = 1.0
 
         do_target_head = int(do_target_head_for_check if do_target_head_for_check >= 0 else -1)
         if do_target_head < 0 and len(do_target_heads) > 0:
@@ -7193,12 +7421,13 @@ class PaTHAttention(nn.Module):
                     bias_chunk_head = scale_m.unsqueeze(1) * bias_chunk_head + shift_m.unsqueeze(1)
                     bias_chunk = bias_chunk_head.mean(dim=1)
 
-            g_bias_max = float(getattr(self.config, "wavelet_ctxscale_g_bias_max", self.wavelet_ctxscale_g_bias_max))
             if bias_chunk_head is not None:
                 if use_head_gate and g_head is not None:
                     eff_to_add = bias_chunk_head * g_head.view(1, -1, 1, 1)
                 else:
                     eff_to_add = g_layer * bias_chunk_head
+                if eval_logit_scale != 1.0:
+                    eff_to_add = eff_to_add * float(eval_logit_scale)
                 eff_to_add = eff_to_add.clamp(min=-g_bias_max, max=g_bias_max)
                 if not torch.isfinite(eff_to_add).all():
                     _warn_nonfinite("g_bias_headwise")
@@ -7211,6 +7440,8 @@ class PaTHAttention(nn.Module):
                 eff_chunk = eff_to_add.mean(dim=1)
             elif use_head_gate and g_head is not None:
                 eff_to_add = bias_chunk.unsqueeze(1) * g_head.view(1, -1, 1, 1)
+                if eval_logit_scale != 1.0:
+                    eff_to_add = eff_to_add * float(eval_logit_scale)
                 eff_to_add = eff_to_add.clamp(min=-g_bias_max, max=g_bias_max)
                 if not torch.isfinite(eff_to_add).all():
                     _warn_nonfinite("g_bias_head")
@@ -7223,6 +7454,8 @@ class PaTHAttention(nn.Module):
                 eff_chunk = eff_to_add.mean(dim=1)
             else:
                 eff_chunk = g_layer * bias_chunk
+                if eval_logit_scale != 1.0:
+                    eff_chunk = eff_chunk * float(eval_logit_scale)
                 eff_chunk = eff_chunk.clamp(min=-g_bias_max, max=g_bias_max)
                 if not torch.isfinite(eff_chunk).all():
                     _warn_nonfinite("g_bias")
@@ -7235,6 +7468,8 @@ class PaTHAttention(nn.Module):
                 eff_to_add = eff_chunk.unsqueeze(1)
             if head_mask is not None:
                 eff_to_add = eff_to_add * head_mask
+            if eval_logit_mult != 1.0:
+                eff_to_add = eff_to_add * float(eval_logit_mult)
 
             if do_active and (0 <= int(do_target_head) < int(eff_to_add.shape[1])):
                 do_t = eff_to_add[:, int(do_target_head), :, :].detach().float()
@@ -7970,6 +8205,27 @@ class PaTHAttention(nn.Module):
             max_heads=int(self.wavelet_logit_bias_log_sample_heads),
         )
         lid = int(self.layer_idx if layer_idx is None else layer_idx)
+        bias_type = str(payload.get("bias_type", "wavelet")).strip().lower()
+
+        if bias_type == "rotary":
+            rotary_delta_l2 = float(payload.get("rotary_delta_l2", 0.0))
+            rotary_delta_abs_mean = float(payload.get("rotary_delta_abs_mean", 0.0))
+            rotary_eff_abs_p99 = float(payload.get("rotary_eff_abs_p99", 0.0))
+            row_gate_mean = float(payload.get("row_gate_mean", 0.0))
+            row_gate_p50 = float(payload.get("row_gate_p50", 0.0))
+            row_gate_p90 = float(payload.get("row_gate_p90", 0.0))
+
+            self._k1_emit_log(
+                f"[ctxscale_shift_v0 monitor][rotary] "
+                f"layer={int(layer_idx)} step={int(step)} "
+                f"rotary_delta_l2={rotary_delta_l2:.6e} "
+                f"rotary_delta_abs_mean={rotary_delta_abs_mean:.6e} "
+                f"rotary_eff_abs_p99={rotary_eff_abs_p99:.6e} "
+                f"row_gate_mean={row_gate_mean:.6e} "
+                f"row_gate_p50={row_gate_p50:.6e} "
+                f"row_gate_p90={row_gate_p90:.6e}"
+            )
+            return        
         g_layer_raw = float(payload["g_layer_raw"].detach().float().item())
         g_layer_raw_used = float(payload["g_layer_raw_used"].detach().float().item())
         g_layer = float(payload["g_layer"].detach().float().item())
@@ -9714,6 +9970,7 @@ class PaTHAttention(nn.Module):
         scale_wise_analyzer=None,
         router_analyzer=None,
         input_ids=None,
+        return_logits: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         if use_cache:
@@ -9945,8 +10202,12 @@ class PaTHAttention(nn.Module):
                 getattr(self.config, "path_attn_impl", self.path_attn_impl)
             )
             self.path_attn_impl = path_attn_impl
+            if return_logits and path_attn_impl != "triton":
+                raise ValueError(f"return_logits=True is only supported with path_attn_impl='triton', got '{path_attn_impl}'")
             if path_attn_impl == "triton":
-                o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
+                o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens, return_logits=return_logits)
+                if return_logits:
+                    return o, None, None  # o is actually logits [B, HQ, T, T]
             else:
                 o = self.path_attention_with_wavelet_QH(
                     q=q, k=k, v=v,
@@ -10120,8 +10381,12 @@ class PaTHAttention(nn.Module):
             getattr(self.config, "path_attn_impl", self.path_attn_impl)
         )
         self.path_attn_impl = path_attn_impl
+        if return_logits and path_attn_impl != "triton":
+            raise ValueError(f"return_logits=True is only supported with path_attn_impl='triton', got '{path_attn_impl}'")
         if path_attn_impl == "triton":
-            o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens)
+            o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g, cu_seqlens=cu_seqlens, return_logits=return_logits)
+            if return_logits:
+                return o, None, None  # o is actually logits [B, HQ, T, T]
         else:
             o = self.path_attention_with_wavelet_QH(
                 q=q, k=k, v=v,
@@ -10472,6 +10737,7 @@ class PaTHAttentionWfreq(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: bool = False,
         use_cache: bool = False,
+        return_logits: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         assert self.hidden_size == self.num_heads * self.head_dim
@@ -10615,7 +10881,9 @@ class PaTHAttentionWfreq(nn.Module):
 
         # === ⑤ Path Attention ===
         o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g,
-                                cu_seqlens=cu_seqlens, use_cache=False)
+                                cu_seqlens=cu_seqlens, use_cache=False, return_logits=return_logits)
+        if return_logits:
+            return o, None, None  # o is actually logits [B, HQ, T, T]
         o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
         o = self.o_proj(o)
         return o, None, past_key_values
