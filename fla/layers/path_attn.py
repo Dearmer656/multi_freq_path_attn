@@ -9579,6 +9579,25 @@ class PaTHAttention(nn.Module):
         #     os._exit(0)
         # Persist attention scores for later analysis when enabled
 
+        # PAT-105: fixed-interval cumulative mask.
+        # At trigger positions t where (t+1) % k == 0: use path logits (E_wav_raw).
+        # At non-trigger positions: replace with standard QK^T logits.
+        # This turns path attention into a hybrid-kernel ablation: path attention is
+        # active only at fixed intervals k, 2k, 3k, ...; elsewhere standard attention.
+        _path_fixed_interval = int(getattr(config, 'path_fixed_interval', 0)) if config is not None else 0
+        if _path_fixed_interval > 0:
+            _pos_ids = torch.arange(T, device=q.device)
+            _trigger = ((_pos_ids + 1) % _path_fixed_interval == 0)  # [T] bool
+            _trigger_mask = _trigger.view(1, 1, T, 1)  # [1,1,T,1], broadcasts over [B,H,T,T]
+            # Standard unscaled dot-product logits (same scale as E_wav_raw — scale applied later)
+            _E_std_raw = torch.einsum(
+                "bihd,bjhd->bhij",
+                q.to(compute_dtype),
+                k.to(compute_dtype),
+            )
+            # Trigger rows → path logits; non-trigger rows → standard QK^T logits
+            E_wav_raw = torch.where(_trigger_mask, E_wav_raw, _E_std_raw)
+
         P_base = None
         heatmap_enabled = bool(getattr(self, "eval_attn_heatmap_enabled", False)) or bool(getattr(self, "_debug_enabled", False))
         mech_enabled = bool((not self.training) and getattr(self, "eval_attn_mech_enabled", False))
