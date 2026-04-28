@@ -6610,17 +6610,23 @@ class PaTHAttention(nn.Module):
         pi_scale = pi[..., 1:]
         router_headwise = bool(pi.dim() == 4)
 
-        # Weak selective entropy-floor regularization (training only).
+        # Entropy regularization (training only).
+        # floor mode (default): penalize entropy below floor — keeps routing diverse.
+        # ceiling mode (router_entropy_ceiling > 0): penalize entropy above ceiling — encourages selective routing.
         router_entropy_reg_enable = bool(getattr(self.config, "router_entropy_reg_enable", False))
         router_entropy_reg_lambda = float(getattr(self.config, "router_entropy_reg_lambda", 0.0))
         router_entropy_floor = float(getattr(self.config, "router_entropy_floor", 1.72))
+        router_entropy_ceiling = float(getattr(self.config, "router_entropy_ceiling", -1.0))
         router_entropy_reg_loss = reg_zero
         router_entropy_reg_active_frac = reg_zero.detach()
         if self.training and router_entropy_reg_enable and router_entropy_reg_lambda > 0.0:
             pi_reg = pi.to(device=device, dtype=torch.float32)
             pi_reg = pi_reg / pi_reg.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             pi_entropy_reg = -(pi_reg * (pi_reg + 1e-8).log()).sum(dim=-1)
-            reg_penalty = F.relu(router_entropy_floor - pi_entropy_reg)
+            if router_entropy_ceiling > 0.0:
+                reg_penalty = F.relu(pi_entropy_reg - router_entropy_ceiling)
+            else:
+                reg_penalty = F.relu(router_entropy_floor - pi_entropy_reg)
             router_entropy_reg_loss = reg_penalty.mean() * router_entropy_reg_lambda
             router_entropy_reg_active_frac = (reg_penalty > 0).to(torch.float32).mean().detach()
         self._last_router_entropy_reg_loss = router_entropy_reg_loss
