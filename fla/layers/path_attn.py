@@ -7258,6 +7258,12 @@ class PaTHAttention(nn.Module):
                             acc["count"] += int(do_n.numel())
                             acc["maxabs"] = max(float(acc["maxabs"]), float(do_n.abs().max().item()))
 
+            # A0 lambda sweep: scale QWAB bias at inference (wavelet_ctxscale_lambda != 1.0)
+            _lambda = float(getattr(self.config, "wavelet_ctxscale_lambda", 1.0))
+            if _lambda != 1.0:
+                # row-center then scale: softmax is invariant to row-wise constant shifts
+                _row_mean = eff_to_add.mean(dim=-1, keepdim=True)
+                eff_to_add = (eff_to_add - _row_mean) * _lambda
             logits_out[:, :, q0:q1, :] = logits_out[:, :, q0:q1, :] + eff_to_add
 
             if analysis_enabled and analysis_q_local is not None and analysis_q_abs is not None and analysis_eff_abs_vals is not None:
