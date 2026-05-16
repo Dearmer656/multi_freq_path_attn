@@ -2749,6 +2749,9 @@ class PaTHAttention(nn.Module):
         )
         self.wavelet_logit_bias_local_step = 0
         self.wavelet_ctxscale_k = 8
+        # Head-group shared QWAB: split num_heads into G groups; each group shares one QWAB output.
+        # Default 1 = fully shared (current behavior). 2 = two groups of num_heads/2 each.
+        self.qwab_groups_per_layer = max(1, int(getattr(config, "qwab_groups_per_layer", 1)))
         self.wavelet_ctxscale_tau = float(getattr(config, "wavelet_ctxscale_tau", getattr(config, "tau", 1.0)))
         self.wavelet_ctxscale_tau_schedule = str(
             getattr(config, "wavelet_ctxscale_tau_schedule", "none")
@@ -6423,10 +6426,26 @@ class PaTHAttention(nn.Module):
                 )
 
         q_corr = torch.einsum("b h t j, b j h d -> b t h d", mf, wf)
-        x_feat = self._ctxscale_router_feature(qf, q_corr, use_mlp=use_mlp_bias_baseline)
-        router_headwise = bool(x_feat.dim() == 4)
         router_mod = self.mlp_bias_router if use_mlp_bias_baseline else self.wavelet_ctx_router
-        router_logits = router_mod(x_feat)
+        n_groups = int(getattr(self, "qwab_groups_per_layer", 1))
+        if n_groups > 1 and self.num_heads % n_groups == 0:
+            # Head-group shared QWAB: compute per-group feature then broadcast to per-head shape.
+            group_size = self.num_heads // n_groups
+            feat_ln = (self.mlp_bias_ctx_feat_ln if use_mlp_bias_baseline else self.wavelet_ctx_feat_ln)
+            delta = qf - q_corr
+            if self.wavelet_ctx_feat_detach_delta:
+                delta = delta.detach()
+            # Mean over heads within each group: [B, T, n_groups, d]
+            qf_g = qf.view(B, T, n_groups, group_size, self.head_dim).mean(dim=3)
+            x_feat_g = feat_ln(qf_g)
+            router_logits = router_mod(x_feat_g)  # [B, T, n_groups, K+1]
+            # Broadcast each group's logits to its member heads: [B, T, H, K+1]
+            router_logits = router_logits.repeat_interleave(group_size, dim=2)
+            router_headwise = True
+        else:
+            x_feat = self._ctxscale_router_feature(qf, q_corr, use_mlp=use_mlp_bias_baseline)
+            router_headwise = bool(x_feat.dim() == 4)
+            router_logits = router_mod(x_feat)
         router_logits = self._rms_norm_last_dim(router_logits, eps=float(self.wavelet_ctxscale_router_rms_eps))
         # E2b ablation: replace with globally-learned static logits (not query-conditioned)
         if getattr(self, "wavelet_router_static_learned", False) and self.wavelet_static_router_logits is not None:
