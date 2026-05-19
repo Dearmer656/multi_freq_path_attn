@@ -2310,17 +2310,35 @@ def path_ut_M_from_S(
     M = S @ T^{-1}, where T^{-1} = A^{-1} D and D=diag(beta)
     We compute Z = S @ A^{-1} via A^{-T} trick, then M = Z @ D (column-wise scaling).
     returns M: [B,H,T,T]
+
+    For T > 4096, float32 back-substitution over 8192+ rows accumulates to overflow.
+    Fix: use float64 for the triangular solve, processed head-by-head to bound peak
+    memory (each head is B×T×T×8 bytes, e.g. 2.15 GB for B=4,T=8192).
     """
     b0 = beta.to(compute_dtype)
     beta_h = b0.transpose(1, 2)  # [B,H,T] (column index j)
 
-    Zt = torch.linalg.solve_triangular(
-        A.transpose(-1, -2),      # A^T (upper)
-        S.transpose(-1, -2),      # RHS = S^T
-        upper=True,
-        unitriangular=True,
-    )
-    Z = Zt.transpose(-1, -2)      # [B,H,T,T] = S @ A^{-1}
+    T = A.shape[-1]
+    if T > 4096:
+        # Head-by-head fp64 solve to avoid float32 overflow in back-substitution
+        H = A.shape[1]
+        Z_heads = []
+        for h in range(H):
+            A_h = A[:, h, :, :].to(torch.float64).transpose(-1, -2)  # [B,T,T] upper
+            S_h = S[:, h, :, :].to(torch.float64).transpose(-1, -2)  # [B,T,T]
+            Zt_h = torch.linalg.solve_triangular(
+                A_h, S_h, upper=True, unitriangular=True
+            ).to(compute_dtype)
+            Z_heads.append(Zt_h.transpose(-1, -2))  # [B,T,T]
+        Z = torch.stack(Z_heads, dim=1)  # [B,H,T,T]
+    else:
+        Zt = torch.linalg.solve_triangular(
+            A.transpose(-1, -2),      # A^T (upper)
+            S.transpose(-1, -2),      # RHS = S^T
+            upper=True,
+            unitriangular=True,
+        )
+        Z = Zt.transpose(-1, -2)      # [B,H,T,T] = S @ A^{-1}
 
     # right-multiply D => scale by beta on column j
     M = Z * beta_h.unsqueeze(2)   # [B,H,T,T]
