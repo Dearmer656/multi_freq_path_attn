@@ -3328,7 +3328,7 @@ class PaTHAttention(nn.Module):
                         )
                         self.router2 = None
                     elif config.router_mode == 'seperate':
-                        if config.router_gate_use:
+                        if getattr(config, 'router_gate_use', False):
                             self.low_rank_map1 = nn.Linear(self.hidden_size, 32, bias=False)
                             self.low_rank_map2 = nn.Linear(self.hidden_size, 32, bias=False)
 
