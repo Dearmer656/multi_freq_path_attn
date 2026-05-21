@@ -5944,11 +5944,18 @@ class PaTHAttention(nn.Module):
             self._last_router_jitter_stats["injected"] = 1
         return out
 
-    def _ctxscale_router_feature(self, qf: torch.Tensor, q_corr: torch.Tensor, *, use_mlp: bool = False):
+    def _ctxscale_router_feature(self, qf: torch.Tensor, q_corr: torch.Tensor, *, use_mlp: bool = False, hidden_states: Optional[torch.Tensor] = None):
         mode = str(getattr(self, "wavelet_ctx_feat_mode", "q_meanH")).strip().lower()
         feat_ln = self.mlp_bias_ctx_feat_ln if use_mlp else self.wavelet_ctx_feat_ln
         path_ln = self.mlp_bias_ctx_path_ln if use_mlp else self.wavelet_ctx_path_ln
         path_proj = self.mlp_bias_ctx_path_proj if use_mlp else self.wavelet_ctx_path_proj
+        # hidden_ln: route from pre-attention LN-normalized hidden state instead of PaTH q_corr.
+        # hidden_states is already ln_1(h^{l-1}) in GPT-2 pre-LN, so no additional LN is applied.
+        if mode == "hidden_ln":
+            assert hidden_states is not None, "hidden_ln mode requires hidden_states"
+            h = hidden_states.detach().to(device=qf.device, dtype=qf.dtype)
+            h = h.view(h.shape[0], h.shape[1], self.num_heads, self.head_dim).mean(dim=2)
+            return h  # [B, T, head_dim]
         delta = qf - q_corr
         if self.wavelet_ctx_feat_detach_delta:
             delta = delta.detach()
@@ -6459,7 +6466,7 @@ class PaTHAttention(nn.Module):
             router_logits = router_logits.repeat_interleave(group_size, dim=2)
             router_headwise = True
         else:
-            x_feat = self._ctxscale_router_feature(qf, q_corr, use_mlp=use_mlp_bias_baseline)
+            x_feat = self._ctxscale_router_feature(qf, q_corr, use_mlp=use_mlp_bias_baseline, hidden_states=hidden_states)
             router_headwise = bool(x_feat.dim() == 4)
             router_logits = router_mod(x_feat)
         router_logits = self._rms_norm_last_dim(router_logits, eps=float(self.wavelet_ctxscale_router_rms_eps))
