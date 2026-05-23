@@ -5708,6 +5708,11 @@ class PaTHAttention(nn.Module):
     @staticmethod
     def _ricker_wavelet(u: torch.Tensor):
         return (1.0 - u.pow(2)) * torch.exp(-0.5 * u.pow(2))
+
+    @staticmethod
+    def _sine_basis(u: torch.Tensor) -> torch.Tensor:
+        return torch.sin(math.pi * u)
+
     @staticmethod
     def _linear_basis(
         self,
@@ -7165,6 +7170,8 @@ class PaTHAttention(nn.Module):
 
                         if self.bias_type == "wavelet":
                             basis_table = self._ricker_wavelet(u_i)
+                        elif self.bias_type == "sine":
+                            basis_table = self._sine_basis(u_i)
                         elif self.bias_type == "linear":
                             basis_table = self._linear_basis(u_i)
                         elif self.bias_type == "rotary":
