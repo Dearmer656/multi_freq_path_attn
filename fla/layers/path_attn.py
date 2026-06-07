@@ -9659,6 +9659,9 @@ class PaTHAttention(nn.Module):
             # Trigger rows → path logits; non-trigger rows → standard QK^T logits
             E_wav_raw = torch.where(_trigger_mask, E_wav_raw, _E_std_raw)
 
+        if getattr(self, '_nmf_capture', False):
+            self._nmf_last_base_logits = (E_base_raw * scale).detach().to(torch.float32).cpu()
+
         P_base = None
         heatmap_enabled = bool(getattr(self, "eval_attn_heatmap_enabled", False)) or bool(getattr(self, "_debug_enabled", False))
         mech_enabled = bool((not self.training) and getattr(self, "eval_attn_mech_enabled", False))
