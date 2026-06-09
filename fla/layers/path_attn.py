@@ -2320,8 +2320,9 @@ def path_ut_M_from_S(
     beta_h = b0.transpose(1, 2)  # [B,H,T] (column index j)
 
     T = A.shape[-1]
-    if T > 4096:
+    if T > 16384:
         # Batched fp64 solve: all heads at once, cast back to compute_dtype after
+        # (fp64 at T<=16384 peaks at 3x[T,T]@fp64; only use beyond 16384 to avoid OOM on 40GB GPU)
         Zt = torch.linalg.solve_triangular(
             A.to(torch.float64).transpose(-1, -2),
             S.to(torch.float64).transpose(-1, -2),
@@ -2368,12 +2369,16 @@ def path_ut_base_raw(
     WK = torch.einsum("b i h d, b j h d -> b h i j", w0, k0)
 
     lower_QK  = torch.tril(QK, diagonal=0)
+    del QK
     strict_WK = torch.tril(WK, diagonal=-1)
+    del WK
 
     QW = torch.einsum("b i h d, b j h d -> b h i j", q0, w0)
     S_base = torch.tril(QW, diagonal=0)
+    del QW
 
     M_base = path_ut_M_from_S(A, S_base, b0, compute_dtype=compute_dtype)
+    del S_base
 
     E_base_raw = lower_QK - (M_base @ strict_WK)
     return E_base_raw, M_base, strict_WK, A
@@ -3168,9 +3173,10 @@ class PaTHAttention(nn.Module):
             self._capture_wavelet_gate_grad
         )
         self._wavelet_gate_grad_hook_param_id = id(self.wavelet_logit_bias_a)
+        _scale_multiplier = float(getattr(config, "wavelet_ctxscale_scale_multiplier", 1.0))
         self.register_buffer(
             "wavelet_ctxscale_scales",
-            torch.tensor([2 ** (2 * i) for i in range(self.wavelet_ctxscale_k)], dtype=torch.float32),
+            torch.tensor([2 ** (2 * i) * _scale_multiplier for i in range(self.wavelet_ctxscale_k)], dtype=torch.float32),
             persistent=False,
         )
         self.wavelet_ctx_feat_ln = nn.LayerNorm(self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
@@ -5092,17 +5098,21 @@ class PaTHAttention(nn.Module):
                 )
             )
 
+            _stop_layer_check = self.eval_attn_heatmap_stop_layer
+            if _stop_layer_check is None:
+                _cfg_for_stop = getattr(self, "config", None)
+                _total_for_stop = self._infer_total_layers_from_config(_cfg_for_stop)
+                if _total_for_stop is not None:
+                    _stop_layer_check = int(_total_for_stop) - 1
+            _at_last_layer = (_stop_layer_check is not None) and (int(lid) == int(_stop_layer_check))
+            if _at_last_layer:
+                import gc as _gc; _gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             if bool(getattr(self, "eval_attn_heatmap_stop_after_case", False)) and (
                 int(self._eval_attn_heatmap_export_count) >= int(self.eval_attn_heatmap_case_limit)
             ):
-                cfg = getattr(self, "config", None)
-                stop_layer = self.eval_attn_heatmap_stop_layer
-                if stop_layer is None:
-                    total_layers = self._infer_total_layers_from_config(cfg)
-                    if total_layers is not None:
-                        stop_layer = int(total_layers) - 1
-                should_stop = False if stop_layer is None else (int(lid) == int(stop_layer))
-                if should_stop:
+                if _at_last_layer:
                     self._eval_attn_heatmap_emit(
                         f"[EvalAttnHeatmap] stop_after_case=1 case_limit={int(self.eval_attn_heatmap_case_limit)} reached at layer={lid}; exiting."
                     )
@@ -5714,6 +5724,14 @@ class PaTHAttention(nn.Module):
         return torch.sin(math.pi * u)
 
     @staticmethod
+    def _morlet_basis(u: torch.Tensor) -> torch.Tensor:
+        return torch.exp(-0.5 * u.pow(2)) * torch.cos(5.0 * u)
+
+    @staticmethod
+    def _gaussian_basis(u: torch.Tensor) -> torch.Tensor:
+        return torch.exp(-0.5 * u.pow(2))
+
+    @staticmethod
     def _linear_basis(
         self,
         u: torch.Tensor,
@@ -5954,6 +5972,7 @@ class PaTHAttention(nn.Module):
         feat_ln = self.mlp_bias_ctx_feat_ln if use_mlp else self.wavelet_ctx_feat_ln
         path_ln = self.mlp_bias_ctx_path_ln if use_mlp else self.wavelet_ctx_path_ln
         path_proj = self.mlp_bias_ctx_path_proj if use_mlp else self.wavelet_ctx_path_proj
+        ln_dtype = feat_ln.weight.dtype  # match LayerNorm weight dtype (may be bf16 under bf16_full_eval)
         # hidden_ln: route from pre-attention LN-normalized hidden state instead of PaTH q_corr.
         # hidden_states is already ln_1(h^{l-1}) in GPT-2 pre-LN, so no additional LN is applied.
         if mode == "hidden_ln":
@@ -5965,22 +5984,22 @@ class PaTHAttention(nn.Module):
         if self.wavelet_ctx_feat_detach_delta:
             delta = delta.detach()
         if mode in ("q_perh", "q_headwise", "q_hw"):
-            return feat_ln(qf)
+            return feat_ln(qf.to(ln_dtype))
         if mode in ("q_minus_qcorr_perh", "q_minus_qcorr_headwise", "dq_perh"):
-            return feat_ln(delta)
+            return feat_ln(delta.to(ln_dtype))
         q_mean = qf.mean(dim=2)
         d_mean = delta.mean(dim=2)
         if mode == "q_minus_qcorr_meanh":
-            return feat_ln(d_mean)
+            return feat_ln(d_mean.to(ln_dtype))
         if mode == "q_minus_qcorr_rmsh":
             d_rms = torch.sqrt(delta.pow(2).mean(dim=2).clamp_min(0.0) + float(self.wavelet_ctx_feat_rms_eps))
-            return feat_ln(d_rms)
+            return feat_ln(d_rms.to(ln_dtype))
         if mode == "path_ctx":
             x_cat = torch.cat([q_mean, q_corr.mean(dim=2), d_mean], dim=-1)
-            x_cat = path_ln(x_cat)
-            return feat_ln(path_proj(x_cat))
+            x_cat = path_ln(x_cat.to(ln_dtype))
+            return feat_ln(path_proj(x_cat).to(ln_dtype))
         # Default safer baseline: pure query summary.
-        return feat_ln(q_mean)
+        return feat_ln(q_mean.to(ln_dtype))
 
     def _ctxscale_param_count(self, *, use_mlp: bool, include_film: bool) -> int:
         if use_mlp:
@@ -6465,7 +6484,7 @@ class PaTHAttention(nn.Module):
                 delta = delta.detach()
             # Mean over heads within each group: [B, T, n_groups, d]
             qf_g = qf.view(B, T, n_groups, group_size, self.head_dim).mean(dim=3)
-            x_feat_g = feat_ln(qf_g)
+            x_feat_g = feat_ln(qf_g.to(feat_ln.weight.dtype))
             router_logits = router_mod(x_feat_g)  # [B, T, n_groups, K+1]
             # Broadcast each group's logits to its member heads: [B, T, H, K+1]
             router_logits = router_logits.repeat_interleave(group_size, dim=2)
@@ -6538,7 +6557,8 @@ class PaTHAttention(nn.Module):
 
             # Shared LW feature -> small head-specific residual delta.
             x_feat_lw = x_feat if x_feat.dim() == 3 else x_feat.mean(dim=2)
-            delta_logits = self.lw_residual_hw_delta_router(x_feat_lw.to(device=device, dtype=torch.float32))
+            _lw_dtype = next(self.lw_residual_hw_delta_router.parameters()).dtype
+            delta_logits = self.lw_residual_hw_delta_router(x_feat_lw.to(device=device, dtype=_lw_dtype))
             delta_logits = delta_logits.view(B, int(T), int(self.num_heads), int(self.wavelet_ctxscale_k + 1))
 
             if router_logits.dim() == 3:
@@ -6726,7 +6746,7 @@ class PaTHAttention(nn.Module):
 
         shift_ln = self.mlp_bias_shift_ln if use_mlp_bias_baseline else self.wavelet_shift_ln
         shift_proj = self.mlp_bias_shift_proj if use_mlp_bias_baseline else self.wavelet_shift_proj
-        h_ln = shift_ln(hidden_states.to(device=device, dtype=torch.float32))
+        h_ln = shift_ln(hidden_states.to(device=device, dtype=shift_ln.weight.dtype))
         rho = torch.sigmoid(shift_proj(h_ln).squeeze(-1))
         # Causal rho intervention: override rho to a fixed constant for ablation studies.
         # Set wavelet_ctxscale_rho_override=<float in [0,1]> in supply_model.cfg to activate.
@@ -7172,6 +7192,10 @@ class PaTHAttention(nn.Module):
                             basis_table = self._ricker_wavelet(u_i)
                         elif self.bias_type == "sine":
                             basis_table = self._sine_basis(u_i)
+                        elif self.bias_type == "morlet":
+                            basis_table = self._morlet_basis(u_i)
+                        elif self.bias_type == "gaussian":
+                            basis_table = self._gaussian_basis(u_i)
                         elif self.bias_type == "linear":
                             basis_table = self._linear_basis(u_i)
                         elif self.bias_type == "rotary":
@@ -9659,6 +9683,9 @@ class PaTHAttention(nn.Module):
             # Trigger rows → path logits; non-trigger rows → standard QK^T logits
             E_wav_raw = torch.where(_trigger_mask, E_wav_raw, _E_std_raw)
 
+        if getattr(self, '_nmf_capture', False):
+            self._nmf_last_base_logits = (E_base_raw * scale).detach().to(torch.float32).cpu()
+
         P_base = None
         heatmap_enabled = bool(getattr(self, "eval_attn_heatmap_enabled", False)) or bool(getattr(self, "_debug_enabled", False))
         mech_enabled = bool((not self.training) and getattr(self, "eval_attn_mech_enabled", False))
@@ -9670,6 +9697,10 @@ class PaTHAttention(nn.Module):
             P_base = torch.softmax(E_base, dim=-1)
 
         E_wav = E_wav_raw * scale
+        if getattr(self, '_nmf_capture_total', False):
+            # Capture softmax-input logits including wavelet bias (E_wav_raw * scale, before masking).
+            # For PaTH-only this equals E_base_raw * scale; for QWAB it includes the wavelet logit bias.
+            self._nmf_last_total_logits = E_wav_raw.detach().mul(scale).to(torch.float32).cpu()
         wave_fill = causal_mask_fill_value(E_wav.dtype)
         E_wav = E_wav.masked_fill(future, wave_fill)
         self._log_attn_margin_distance(
@@ -9728,6 +9759,9 @@ class PaTHAttention(nn.Module):
         if P_base is not None and (mech_enabled or (analyzer is not None and rel is not None)):
             out_base = torch.einsum("b h i j, b j h d -> b i h d", P_base, v.to(compute_dtype))
         out_wav = torch.einsum("b h i j, b j h d -> b i h d", P_wav, v.to(compute_dtype))
+        if getattr(self, "_mask_heads", None):
+            for h in self._mask_heads:
+                out_wav[:, :, h, :].zero_()
         if out_base is not None:
             self._record_eval_attn_mech_stats(
                 layer_idx=layer_idx,
@@ -10152,7 +10186,7 @@ class PaTHAttention(nn.Module):
                 if torch.is_tensor(residual_l2_loss):
                     dis_loss = dis_loss + residual_l2_loss.to(dtype=dis_loss.dtype, device=dis_loss.device)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
-            o = self.o_proj(o)
+            o = self.o_proj(o.to(hidden_states.dtype))
             if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:
                 o = self.wavelet_cond_film_v2(
                     q_in=hidden_states,
@@ -10223,7 +10257,7 @@ class PaTHAttention(nn.Module):
                 router_log_every=getattr(self.config, "router_log_every", 500),
             )
         o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
-        o = self.o_proj(o)
+        o = self.o_proj(o.to(hidden_states.dtype))
         if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:
             o = self.wavelet_cond_film_v2(
                 q_in=hidden_states,
@@ -10697,5 +10731,5 @@ class PaTHAttentionWfreq(nn.Module):
         o, _ = parallel_path_attn(q=q, k=k, v=v, w=w, beta=beta, g=g,
                                 cu_seqlens=cu_seqlens, use_cache=False)
         o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
-        o = self.o_proj(o)
+        o = self.o_proj(o.to(hidden_states.dtype))
         return o, None, past_key_values
