@@ -30,6 +30,7 @@ from fla.layers.router_norm import (
 from fla.modules import RMSNorm, ShortConvolution
 from fla.modules.l2norm import l2_norm
 from fla.ops.attn.decoding import attn_decoding_one_step
+from fla.ops.entmax import masked_entmax_bisect
 from fla.ops.path_attn.parallel import parallel_path_attn
 
 import math
@@ -2693,6 +2694,12 @@ class PaTHAttention(nn.Module):
             getattr(config, "attn_margin_stats_eval_enabled", True), default=True
         )
         self._attn_margin_local_step = 0
+        self.attn_norm = str(getattr(config, "attn_norm", "softmax")).strip().lower()
+        self.entmax_alpha = float(getattr(config, "entmax_alpha", 1.5))
+        self.entmax_scope = str(getattr(config, "entmax_scope", "all")).strip().lower()
+        self.entmax_layers = self._parse_layer_set(getattr(config, "entmax_layers", "8,9,10,11"))
+        self.entmax_stable_heads_csv = getattr(config, "entmax_stable_heads_csv", None)
+        self.entmax_stable_heads = self._load_head_pair_csv(self.entmax_stable_heads_csv)
 
         self.router_norm_cfg = build_router_norm_config(config)
         self._router_norm_local_step = 0
@@ -3514,6 +3521,70 @@ class PaTHAttention(nn.Module):
             return {int(v)}
         except Exception:
             return {0}
+
+    def _load_head_pair_csv(self, path):
+        if path is None:
+            return set()
+        pairs = set()
+        with open(path, newline="") as f:
+            for row in csv.DictReader(f):
+                pairs.add((int(row["layer"]), int(row["head"])))
+        return pairs
+
+    def _apply_eval_attn_norm(self, masked_logits, future, layer_idx):
+        if self.attn_norm != "entmax":
+            return torch.softmax(masked_logits, dim=-1)
+
+        if self.entmax_scope == "all":
+            return masked_entmax_bisect(masked_logits, alpha=self.entmax_alpha, valid_mask=~future, dim=-1)
+
+        if self.entmax_scope == "deep_layers":
+            if self.entmax_layers is None or int(layer_idx) in self.entmax_layers:
+                return masked_entmax_bisect(masked_logits, alpha=self.entmax_alpha, valid_mask=~future, dim=-1)
+            return torch.softmax(masked_logits, dim=-1)
+
+        if self.entmax_scope == "stable_heads":
+            p_softmax = torch.softmax(masked_logits, dim=-1)
+            p_entmax = masked_entmax_bisect(masked_logits, alpha=self.entmax_alpha, valid_mask=~future, dim=-1)
+            H = masked_logits.shape[1]
+            is_stable = torch.tensor(
+                [(int(layer_idx), h) in self.entmax_stable_heads for h in range(H)],
+                device=masked_logits.device, dtype=torch.bool,
+            )
+            return torch.where(is_stable[None, :, None, None], p_entmax, p_softmax)
+
+        if self.entmax_scope == "qwab_active_heads":
+            raise NotImplementedError("PAT-195: qwab_active_heads not implemented")
+
+        raise ValueError(f"unknown entmax_scope: {self.entmax_scope!r}")
+
+    def _maybe_capture_entmax_attention_stats(self, probs, future, layer_idx):
+        if not getattr(self, "_entmax_stats_capture", False):
+            return
+
+        probs_fp32 = probs.detach().to(torch.float32)
+        valid_mask = ~future
+        valid_rows = valid_mask.any(dim=-1)
+        valid_counts = valid_mask.to(torch.float32).sum(dim=-1)
+        safe_probs = torch.where(valid_mask, probs_fp32, torch.zeros_like(probs_fp32))
+        safe_log_probs = torch.where(safe_probs > 0, safe_probs.clamp_min(torch.finfo(safe_probs.dtype).tiny).log(), torch.zeros_like(safe_probs))
+        entropy = -(safe_probs * safe_log_probs).sum(dim=-1)
+        log_valid_counts = torch.where(valid_counts > 1, valid_counts.log(), torch.ones_like(valid_counts))
+        norm_entropy = torch.where(valid_counts > 1, entropy / log_valid_counts, torch.zeros_like(entropy))
+        support_size = (safe_probs > 1e-6).to(torch.float32).sum(dim=-1)
+        top32_mass = safe_probs.topk(k=min(32, safe_probs.shape[-1]), dim=-1).values.sum(dim=-1)
+        top128_mass = safe_probs.topk(k=min(128, safe_probs.shape[-1]), dim=-1).values.sum(dim=-1)
+        row_weight = valid_rows.to(torch.float32)
+        n_rows = row_weight.sum(dim=(0, 2))
+        denom = n_rows.clamp_min(1.0)
+        self._entmax_last_stats = {
+            "mean_entropy": (entropy * row_weight).sum(dim=(0, 2)).div(denom).cpu(),
+            "mean_norm_entropy": (norm_entropy * row_weight).sum(dim=(0, 2)).div(denom).cpu(),
+            "mean_support_size": (support_size * row_weight).sum(dim=(0, 2)).div(denom).cpu(),
+            "mean_top32_mass": (top32_mass * row_weight).sum(dim=(0, 2)).div(denom).cpu(),
+            "mean_top128_mass": (top128_mass * row_weight).sum(dim=(0, 2)).div(denom).cpu(),
+            "n_rows": n_rows.cpu(),
+        }
 
     def _track_eval_layer(self, layer_idx: int) -> bool:
         if not self.eval_stats_enabled:
@@ -9708,7 +9779,8 @@ class PaTHAttention(nn.Module):
             masked_logits=E_wav,
             global_step=global_step,
         )
-        P_wav = torch.softmax(E_wav, dim=-1)
+        P_wav = self._apply_eval_attn_norm(masked_logits=E_wav, future=future, layer_idx=layer_idx)
+        self._maybe_capture_entmax_attention_stats(probs=P_wav, future=future, layer_idx=layer_idx)
         only_rel_layers = bool(getattr(self, "eval_attn_heatmap_only_rel_layers", False))
         if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:
             self._wavelet_condfilm_v2_last_attn_stats = _monitor_attn_prob_stats(

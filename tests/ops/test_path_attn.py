@@ -8,6 +8,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 
+from fla.layers.path_attn import PaTHAttention
+from fla.ops.entmax import masked_entmax_bisect
 from fla.ops.path_attn.parallel import parallel_path_attention
 from fla.utils import assert_close, device, is_intel_alchemist
 
@@ -211,3 +213,99 @@ def test_parallel_varlen(
         assert_close("dg", ref_dg, tri_dg, 0.005)
     assert_close("dw", ref_dw, tri_dw, 0.005)
     assert_close("db", ref_db, tri_db, 0.005)
+
+
+def test_path_attention_entmax_helpers(tmp_path):
+    attn = PaTHAttention.__new__(PaTHAttention)
+    attn.attn_norm = "softmax"
+    attn.entmax_alpha = 1.2
+    attn.entmax_scope = "all"
+    attn.entmax_layers = None
+    attn.entmax_stable_heads = set()
+
+    batch_size, num_heads, seq_len = 2, 2, 4
+    raw_logits = torch.tensor(
+        [
+            [
+                [[0.2, -0.1, 0.5, -0.4], [0.6, -0.2, 0.1, 0.3], [0.1, 0.0, -0.3, 0.2], [0.4, 0.3, -0.5, 0.2]],
+                [[-0.2, 0.4, -0.1, 0.0], [0.1, 0.5, -0.4, 0.2], [0.3, -0.3, 0.6, -0.2], [-0.1, 0.2, 0.0, 0.7]],
+            ],
+            [
+                [[0.3, -0.5, 0.2, 0.1], [0.7, 0.1, -0.2, -0.4], [-0.3, 0.4, 0.5, -0.1], [0.2, -0.2, 0.3, 0.6]],
+                [[0.5, 0.2, -0.6, 0.1], [-0.4, 0.8, 0.2, -0.3], [0.6, -0.1, 0.4, 0.0], [0.1, 0.3, -0.2, 0.5]],
+            ],
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    future = torch.triu(
+        torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+        diagonal=1,
+    ).view(1, 1, seq_len, seq_len).expand(batch_size, num_heads, seq_len, seq_len)
+    masked_logits = raw_logits.masked_fill(future, torch.finfo(raw_logits.dtype).min)
+    softmax_probs = torch.softmax(masked_logits, dim=-1)
+    entmax_probs = masked_entmax_bisect(masked_logits, alpha=attn.entmax_alpha, valid_mask=~future, dim=-1)
+
+    out = attn._apply_eval_attn_norm(masked_logits=masked_logits, future=future, layer_idx=0)
+    assert torch.allclose(out, softmax_probs)
+
+    attn.attn_norm = "entmax"
+    attn.entmax_scope = "all"
+    out = attn._apply_eval_attn_norm(masked_logits=masked_logits, future=future, layer_idx=0)
+    assert torch.allclose(out, entmax_probs)
+
+    attn.entmax_scope = "deep_layers"
+    attn.entmax_layers = {1}
+    out_layer0 = attn._apply_eval_attn_norm(masked_logits=masked_logits, future=future, layer_idx=0)
+    out_layer1 = attn._apply_eval_attn_norm(masked_logits=masked_logits, future=future, layer_idx=1)
+    assert torch.allclose(out_layer0, softmax_probs)
+    assert torch.allclose(out_layer1, entmax_probs)
+    assert not torch.allclose(out_layer0, out_layer1)
+
+    attn.entmax_scope = "stable_heads"
+    attn.entmax_stable_heads = {(0, 1)}
+    stable_out = attn._apply_eval_attn_norm(masked_logits=masked_logits, future=future, layer_idx=0)
+    assert torch.allclose(stable_out[:, 0], softmax_probs[:, 0])
+    assert torch.allclose(stable_out[:, 1], entmax_probs[:, 1])
+
+    attn.entmax_scope = "qwab_active_heads"
+    with pytest.raises(NotImplementedError):
+        attn._apply_eval_attn_norm(masked_logits=masked_logits, future=future, layer_idx=0)
+
+    assert attn._load_head_pair_csv(None) == set()
+    csv_path = tmp_path / "stable_heads.csv"
+    csv_path.write_text("layer,head\n0,1\n2,3\n", encoding="utf-8")
+    assert attn._load_head_pair_csv(csv_path) == {(0, 1), (2, 3)}
+
+    if hasattr(attn, "_entmax_last_stats"):
+        delattr(attn, "_entmax_last_stats")
+    attn._maybe_capture_entmax_attention_stats(probs=softmax_probs, future=future, layer_idx=0)
+    assert not hasattr(attn, "_entmax_last_stats")
+
+    attn._entmax_stats_capture = True
+    attn._maybe_capture_entmax_attention_stats(probs=softmax_probs, future=future, layer_idx=0)
+    stats = attn._entmax_last_stats
+    expected_keys = {
+        "mean_entropy",
+        "mean_norm_entropy",
+        "mean_support_size",
+        "mean_top32_mass",
+        "mean_top128_mass",
+        "n_rows",
+    }
+    assert set(stats) == expected_keys
+    expected_rows = torch.full((num_heads,), float(batch_size * seq_len), dtype=torch.float32)
+    for key in expected_keys:
+        value = stats[key]
+        assert value.shape == (num_heads,)
+        assert value.dtype == torch.float32
+        assert value.device.type == "cpu"
+    assert torch.all(stats["mean_entropy"] >= 0)
+    assert torch.all(stats["mean_norm_entropy"] >= 0)
+    assert torch.all(stats["mean_support_size"] >= 1)
+    assert torch.all(stats["mean_support_size"] <= seq_len)
+    assert torch.all(stats["mean_top32_mass"] > 0)
+    assert torch.all(stats["mean_top32_mass"] <= 1)
+    assert torch.all(stats["mean_top128_mass"] > 0)
+    assert torch.all(stats["mean_top128_mass"] <= 1)
+    assert torch.allclose(stats["n_rows"], expected_rows)
