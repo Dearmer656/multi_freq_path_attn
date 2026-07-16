@@ -2776,7 +2776,10 @@ class PaTHAttention(nn.Module):
             1, int(getattr(config, "wavelet_logit_bias_log_sample_heads", 4))
         )
         self.wavelet_logit_bias_local_step = 0
-        self.wavelet_ctxscale_k = 8
+        # PAT-225: scale cardinality S is configurable; default 8 keeps every
+        # pre-existing config/checkpoint bit-identical (router_band_num does NOT
+        # control this branch — it only feeds the legacy router1/router2 modes).
+        self.wavelet_ctxscale_k = max(1, int(getattr(config, "wavelet_ctxscale_k", 8)))
         # Head-group shared QWAB: split num_heads into G groups; each group shares one QWAB output.
         # Default 1 = fully shared (current behavior). 2 = two groups of num_heads/2 each.
         self.qwab_groups_per_layer = max(1, int(getattr(config, "qwab_groups_per_layer", 1)))
@@ -3181,11 +3184,24 @@ class PaTHAttention(nn.Module):
         )
         self._wavelet_gate_grad_hook_param_id = id(self.wavelet_logit_bias_a)
         _scale_multiplier = float(getattr(config, "wavelet_ctxscale_scale_multiplier", 1.0))
+        # PAT-225: fixed-support log-uniform grid over [2^0, 2^14] for any K.
+        # K=8 -> exponents 14*i/7 == 2*i, i.e. the production grid [2^0,2^2,...,2^14]
+        # reproduced bit-exactly. K=1 -> geometric center of the support, 2^7 = 128
+        # (pre-registered in PAT-225). Endpoints stay fixed for every K>1 so that
+        # scale cardinality is the only changed factor.
+        _K = self.wavelet_ctxscale_k
+        _scale_exps = [7.0] if _K == 1 else [14.0 * i / (_K - 1) for i in range(_K)]
         self.register_buffer(
             "wavelet_ctxscale_scales",
-            torch.tensor([2 ** (2 * i) * _scale_multiplier for i in range(self.wavelet_ctxscale_k)], dtype=torch.float32),
+            torch.tensor([2.0 ** e * _scale_multiplier for e in _scale_exps], dtype=torch.float32),
             persistent=False,
         )
+        if layer_idx in (0, None):
+            print(
+                f"[PAT-225] wavelet_ctxscale_k={_K} effective scales="
+                f"{[float(2.0 ** e * _scale_multiplier) for e in _scale_exps]}",
+                flush=True,
+            )
         self.wavelet_ctx_feat_ln = nn.LayerNorm(self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
         self.wavelet_ctx_path_ln = nn.LayerNorm(3 * self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
         self.wavelet_ctx_path_proj = nn.Linear(3 * self.head_dim, self.head_dim, bias=True)
