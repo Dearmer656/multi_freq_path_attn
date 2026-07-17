@@ -300,7 +300,10 @@ class Mamba2(nn.Module):
             dt_limit_kwargs = {} if self.time_step_limit == (0.0, float("inf")) else {"dt_limit": self.time_step_limit}
 
             # 2-4. Fused kernel for conv1d, SSM, and the final projection
-            if self.training and cache_params is None:
+            # PAT-226: the fused split_conv1d op internally requires the
+            # causal_conv1d CUDA package; without it, fall through to the
+            # chunked path (fla triton conv + mamba_chunk_scan_combined).
+            if self.training and cache_params is None and causal_conv1d_fn is not None:
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
