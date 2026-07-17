@@ -2780,6 +2780,19 @@ class PaTHAttention(nn.Module):
         # pre-existing config/checkpoint bit-identical (router_band_num does NOT
         # control this branch — it only feeds the legacy router1/router2 modes).
         self.wavelet_ctxscale_k = max(1, int(getattr(config, "wavelet_ctxscale_k", 8)))
+        # PAT-225 mechanism probe: inference-time per-scale knockout. Comma-
+        # separated 0-based scale indices whose router logit is forced to -1e4
+        # (atom off in every router mode). Empty/absent = no-op.
+        _mask_raw = str(getattr(config, "wavelet_ctxscale_scale_mask", "") or "").strip()
+        self.wavelet_ctxscale_scale_mask_idx = tuple(
+            int(x) for x in _mask_raw.split(",") if x.strip() != ""
+        ) if _mask_raw else ()
+        if self.wavelet_ctxscale_scale_mask_idx and layer_idx in (0, None):
+            print(
+                f"[PAT-225] scale-knockout active: masking scale indices "
+                f"{list(self.wavelet_ctxscale_scale_mask_idx)} of K={self.wavelet_ctxscale_k}",
+                flush=True,
+            )
         # Head-group shared QWAB: split num_heads into G groups; each group shares one QWAB output.
         # Default 1 = fully shared (current behavior). 2 = two groups of num_heads/2 each.
         self.qwab_groups_per_layer = max(1, int(getattr(config, "qwab_groups_per_layer", 1)))
@@ -6671,6 +6684,13 @@ class PaTHAttention(nn.Module):
             fixed = torch.zeros_like(router_logits)
             fixed[..., 0] = 10.0  # strong non-null gate activation
             router_logits = fixed
+        # PAT-225 per-scale knockout: force masked atoms' logits to -1e4 before
+        # any routing mode (sigmoid(-1e4)=0, softmax weight -> 0).
+        if getattr(self, "wavelet_ctxscale_scale_mask_idx", ()):
+            router_logits = router_logits.clone()
+            for _mi in self.wavelet_ctxscale_scale_mask_idx:
+                if 0 <= int(_mi) < int(self.wavelet_ctxscale_k):
+                    router_logits[..., 1 + int(_mi)] = -1e4
         router_sigmoid_mode = str(getattr(self, "wavelet_router_sigmoid_mode", "softmax")).strip().lower()
         if router_sigmoid_mode not in ("softmax", "with_null", "no_null", "with_null_independent_scales"):
             router_sigmoid_mode = "softmax"
