@@ -3203,7 +3203,10 @@ class PaTHAttention(nn.Module):
         # (pre-registered in PAT-225). Endpoints stay fixed for every K>1 so that
         # scale cardinality is the only changed factor.
         _K = self.wavelet_ctxscale_k
-        _scale_exps = [7.0] if _K == 1 else [14.0 * i / (_K - 1) for i in range(_K)]
+        # PAT-227: support upper bound is configurable (log2 exponent; default 14
+        # keeps every existing grid bit-identical). K=1 -> geometric center.
+        _max_exp = float(getattr(config, "wavelet_ctxscale_scale_max_exp", 14.0))
+        _scale_exps = [_max_exp / 2.0] if _K == 1 else [_max_exp * i / (_K - 1) for i in range(_K)]
         self.register_buffer(
             "wavelet_ctxscale_scales",
             torch.tensor([2.0 ** e * _scale_multiplier for e in _scale_exps], dtype=torch.float32),
