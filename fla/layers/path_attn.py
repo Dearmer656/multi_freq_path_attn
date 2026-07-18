@@ -10102,7 +10102,7 @@ class PaTHAttention(nn.Module):
         # ========= 其它路径（mask!=None）：最小实现 =========
         if self.use_w_shortconv:
             w, _ = self.w_conv1d(w, cache=None, output_final_state=False, cu_seqlens=cu_seqlens)
-        q = rearrange(q, 'b t (h d) -> b t hq d', d=self.head_dim)
+        q = rearrange(q, 'b t (h d) -> b t h d', d=self.head_dim)
         k = rearrange(k, 'b t (h d) -> b t h d',  d=self.head_dim)
         v = rearrange(v, 'b t (h d) -> b t h d',  d=self.head_dim)
         W = rearrange(w, 'b t (h r d) -> b t h r d', h=self.num_kv_heads, r=self.r, d=self.head_dim)
