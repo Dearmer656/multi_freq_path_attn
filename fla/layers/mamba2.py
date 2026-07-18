@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import warnings
 from typing import TYPE_CHECKING, Optional, Tuple
 
@@ -606,7 +607,12 @@ class Mamba2(nn.Module):
         cache_position: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ):
-        if is_fast_path_available and "cuda" in self.in_proj.weight.device.type:
+        # PAT-226 diagnostic: FLA_MAMBA2_FORCE_NAIVE=1 bypasses the fast path
+        # (which silently falls back to fla's untested Triton conv1d backend
+        # when the real causal_conv1d CUDA package isn't installed) to isolate
+        # whether that kernel is the source of the wt103 pretrain divergence.
+        _force_naive = os.environ.get("FLA_MAMBA2_FORCE_NAIVE", "0") == "1"
+        if is_fast_path_available and "cuda" in self.in_proj.weight.device.type and not _force_naive:
             return self.cuda_kernels_forward(hidden_states, cache_params, cache_position, attention_mask)
         dtype = hidden_states.dtype
         if attention_mask is not None and attention_mask.shape[1] > 1 and attention_mask.shape[0] > 1:
