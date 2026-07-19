@@ -2689,6 +2689,20 @@ class PaTHAttention(nn.Module):
                 f"{list(self.wavelet_ctxscale_scale_mask_idx)} of K={self.wavelet_ctxscale_k}",
                 flush=True,
             )
+        # PAT-225 seed-variance probe: inference-time per-LAYER knockout. Comma-
+        # separated 0-based layer indices whose null-vs-nonnull gate logit is forced
+        # to -1e4 (g0_gate->0, pi_null->1), i.e. that layer's wavelet bias is fully
+        # disabled and it degenerates to baseline PaTH attention. Empty/absent = no-op.
+        _ko_layers_raw = str(getattr(config, "wavelet_ctxscale_ko_layers", "") or "").strip()
+        self.wavelet_ctxscale_ko_layers_idx = tuple(
+            int(x) for x in _ko_layers_raw.split(",") if x.strip() != ""
+        ) if _ko_layers_raw else ()
+        if self.wavelet_ctxscale_ko_layers_idx and layer_idx in (0, None):
+            print(
+                f"[PAT-225] layer-knockout active: forcing layers "
+                f"{list(self.wavelet_ctxscale_ko_layers_idx)} to null (wavelet bias off)",
+                flush=True,
+            )
         # Head-group shared QWAB: split num_heads into G groups; each group shares one QWAB output.
         # Default 1 = fully shared (current behavior). 2 = two groups of num_heads/2 each.
         self.qwab_groups_per_layer = max(1, int(getattr(config, "qwab_groups_per_layer", 1)))
@@ -6590,6 +6604,12 @@ class PaTHAttention(nn.Module):
             for _mi in self.wavelet_ctxscale_scale_mask_idx:
                 if 0 <= int(_mi) < int(self.wavelet_ctxscale_k):
                     router_logits[..., 1 + int(_mi)] = -1e4
+        # PAT-225 per-layer knockout: force this layer's null-vs-nonnull gate to
+        # pi_null=1 (wavelet bias fully off, degenerate to baseline PaTH) if this
+        # layer_idx is in the configured knockout set.
+        if getattr(self, "wavelet_ctxscale_ko_layers_idx", ()) and int(self.layer_idx or 0) in self.wavelet_ctxscale_ko_layers_idx:
+            router_logits = router_logits.clone()
+            router_logits[..., 0] = -1e4
         router_sigmoid_mode = str(getattr(self, "wavelet_router_sigmoid_mode", "softmax")).strip().lower()
         if router_sigmoid_mode not in ("softmax", "with_null", "no_null", "with_null_independent_scales"):
             router_sigmoid_mode = "softmax"
