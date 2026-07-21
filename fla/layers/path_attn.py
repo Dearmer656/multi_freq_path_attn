@@ -3132,6 +3132,13 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctx_path_ln = nn.LayerNorm(3 * self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
         self.wavelet_ctx_path_proj = nn.Linear(3 * self.head_dim, self.head_dim, bias=True)
         self.wavelet_ctx_router = nn.Linear(self.head_dim, self.wavelet_ctxscale_k + 1, bias=True)
+        # PAT-225 follow-up: router defaults to nn.Linear's kaiming_uniform init
+        # (bound +/-1/sqrt(head_dim), ~125x larger std than wavelet_bias_film's
+        # explicit 1e-3 init). Opt-in zero init tests whether that larger init
+        # variance is what makes the router's converged state seed/hardware-chaotic.
+        if self._as_bool(getattr(config, "wavelet_ctx_router_zero_init", False), default=False):
+            nn.init.zeros_(self.wavelet_ctx_router.weight)
+            nn.init.zeros_(self.wavelet_ctx_router.bias)
         # E2b ablation: static globally-learned router (not query-conditioned)
         self.wavelet_router_static_learned = self._as_bool(
             getattr(config, "wavelet_router_static_learned", False), default=False
