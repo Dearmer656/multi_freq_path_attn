@@ -7254,7 +7254,11 @@ class PaTHAttention(nn.Module):
                         _mean_k = (basis_table * _causal).sum(dim=-1, keepdim=True) / _cnt
                         basis_table = basis_table - _mean_k
                     basis_table = self._rms_norm_last_dim(basis_table, eps=eps)
+                    if getattr(self, "_pat234_cap", None) is not None:  # PAT-234 stage probe (default off)
+                        self._pat234_cap.setdefault("S1_postnorm", []).append((int(lid), int(scale_idx), int(q0), basis_table.detach().float().cpu()))
                     basis_table = self._maybe_clamp_p99(basis_table)
+                    if getattr(self, "_pat234_cap", None) is not None:
+                        self._pat234_cap.setdefault("S2_postp99", []).append((int(lid), int(scale_idx), int(q0), basis_table.detach().float().cpu()))
                     if router_headwise:
                         weight_h = pi_scale[:, q0:q1, :, i].permute(0, 2, 1).unsqueeze(-1)
                         contrib_i_head = weight_h * basis_table.unsqueeze(1)
@@ -7264,6 +7268,8 @@ class PaTHAttention(nn.Module):
                         contrib_i = contrib_i_head.mean(dim=1)
                     else:
                         contrib_i = pi_scale[:, q0:q1, i].unsqueeze(-1) * basis_table
+                        if getattr(self, "_pat234_cap", None) is not None:  # PAT-234: post-gain per scale
+                            self._pat234_cap.setdefault("S3_postgain", []).append((int(lid), int(scale_idx), int(q0), contrib_i.detach().float().cpu()))
                         if far_mask is not None:
                             contrib_i = contrib_i * far_mask.to(dtype=torch.float32)
                         bias_chunk = bias_chunk + contrib_i
@@ -7352,7 +7358,11 @@ class PaTHAttention(nn.Module):
                 eff_chunk = eff_to_add.mean(dim=1)
             else:
                 eff_chunk = g_layer * bias_chunk
+                if getattr(self, "_pat234_cap", None) is not None:  # PAT-234: pre final g_bias clamp
+                    self._pat234_cap.setdefault("S4pre_preclamp", []).append((int(lid), int(q0), eff_chunk.detach().float().cpu()))
                 eff_chunk = eff_chunk.clamp(min=-g_bias_max, max=g_bias_max)
+                if getattr(self, "_pat234_cap", None) is not None:  # PAT-234: post final g_bias clamp
+                    self._pat234_cap.setdefault("S4post_postclamp", []).append((int(lid), int(q0), eff_chunk.detach().float().cpu()))
                 if not torch.isfinite(eff_chunk).all():
                     _warn_nonfinite("g_bias")
                     eff_chunk = torch.nan_to_num(
