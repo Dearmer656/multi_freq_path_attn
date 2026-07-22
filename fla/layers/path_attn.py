@@ -2662,6 +2662,12 @@ class PaTHAttention(nn.Module):
         self.wavelet_logit_bias_clamp_enable = self._as_bool(
             getattr(config, "wavelet_logit_bias_clamp_enable", True), default=True
         )
+        # PAT-234 variant C: center the per-scale basis over causal keys before RMS-norm,
+        # removing the softmax-invisible key-independent (DC) component so coarse
+        # (near-constant) scales can actually influence attention. Default off.
+        self.wavelet_logit_bias_center = self._as_bool(
+            getattr(config, "wavelet_logit_bias_center_enable", False), default=False
+        )
         self.wavelet_logit_bias_clamp_quantile = float(getattr(config, "wavelet_logit_bias_clamp_quantile", 0.99))
         self.wavelet_logit_bias_clamp_min = float(getattr(config, "wavelet_logit_bias_clamp_min", 0.0))
         self.wavelet_logit_bias_clamp_scale = float(getattr(config, "wavelet_logit_bias_clamp_scale", 1.0))
@@ -7236,6 +7242,17 @@ class PaTHAttention(nn.Module):
                         else:
                             raise ValueError(f"Unsupported bias_type: {self.bias_type}")
 
+                    if getattr(self, "wavelet_logit_bias_center", False) and self.bias_type != "rotary":
+                        # PAT-234 C: remove softmax-invisible key-independent component over
+                        # causal keys (k <= query) before normalization. basis_table: [B, q_chunk, T].
+                        _qc = basis_table.shape[-2]
+                        _Tk = basis_table.shape[-1]
+                        _qabs = torch.arange(q0, q0 + _qc, device=basis_table.device).view(1, _qc, 1)
+                        _kidx = torch.arange(_Tk, device=basis_table.device).view(1, 1, _Tk)
+                        _causal = (_kidx <= _qabs).to(basis_table.dtype)
+                        _cnt = _causal.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                        _mean_k = (basis_table * _causal).sum(dim=-1, keepdim=True) / _cnt
+                        basis_table = basis_table - _mean_k
                     basis_table = self._rms_norm_last_dim(basis_table, eps=eps)
                     basis_table = self._maybe_clamp_p99(basis_table)
                     if router_headwise:
