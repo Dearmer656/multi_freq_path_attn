@@ -2668,6 +2668,13 @@ class PaTHAttention(nn.Module):
         self.wavelet_logit_bias_center = self._as_bool(
             getattr(config, "wavelet_logit_bias_center_enable", False), default=False
         )
+        # PAT-234: disable the per-scale RMS-norm entirely -> raw (absolute) wavelet basis.
+        # This is the only length/position-invariant normalization choice (all-T RMS is
+        # length-dependent, causal RMS is position-dependent / OOD past train length).
+        # Cost: scales no longer equalized (coarse=DC-invisible, fine=small spike). Default off.
+        self.wavelet_logit_bias_norm_disable = self._as_bool(
+            getattr(config, "wavelet_logit_bias_norm_disable", False), default=False
+        )
         self.wavelet_logit_bias_clamp_quantile = float(getattr(config, "wavelet_logit_bias_clamp_quantile", 0.99))
         self.wavelet_logit_bias_clamp_min = float(getattr(config, "wavelet_logit_bias_clamp_min", 0.0))
         self.wavelet_logit_bias_clamp_scale = float(getattr(config, "wavelet_logit_bias_clamp_scale", 1.0))
@@ -7253,7 +7260,8 @@ class PaTHAttention(nn.Module):
                         _cnt = _causal.sum(dim=-1, keepdim=True).clamp_min(1.0)
                         _mean_k = (basis_table * _causal).sum(dim=-1, keepdim=True) / _cnt
                         basis_table = basis_table - _mean_k
-                    basis_table = self._rms_norm_last_dim(basis_table, eps=eps)
+                    if not getattr(self, "wavelet_logit_bias_norm_disable", False):
+                        basis_table = self._rms_norm_last_dim(basis_table, eps=eps)
                     if getattr(self, "_pat234_cap", None) is not None:  # PAT-234 stage probe (default off)
                         self._pat234_cap.setdefault("S1_postnorm", []).append((int(lid), int(scale_idx), int(q0), basis_table.detach().float().cpu()))
                     basis_table = self._maybe_clamp_p99(basis_table)
