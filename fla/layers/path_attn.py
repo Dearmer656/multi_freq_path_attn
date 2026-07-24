@@ -2803,7 +2803,7 @@ class PaTHAttention(nn.Module):
         if self.wavelet_basis_control not in ("none", "permute_scales", "random_basis"):
             self.wavelet_basis_control = "none"
         self.wavelet_router_sigmoid_mode = str(getattr(config, "wavelet_router_sigmoid_mode", "softmax")).strip().lower()
-        if self.wavelet_router_sigmoid_mode not in ("softmax", "with_null", "no_null", "with_null_independent_scales"):
+        if self.wavelet_router_sigmoid_mode not in ("softmax", "with_null", "no_null", "with_null_independent_scales", "signed"):
             self.wavelet_router_sigmoid_mode = "softmax"
         # Optional eval-time wavelet intervention hook (default off).
         self.wavelet_intervention_enable = self._as_bool(
@@ -6631,7 +6631,7 @@ class PaTHAttention(nn.Module):
             router_logits = router_logits.clone()
             router_logits[..., 0] = -1e4
         router_sigmoid_mode = str(getattr(self, "wavelet_router_sigmoid_mode", "softmax")).strip().lower()
-        if router_sigmoid_mode not in ("softmax", "with_null", "no_null", "with_null_independent_scales"):
+        if router_sigmoid_mode not in ("softmax", "with_null", "no_null", "with_null_independent_scales", "signed"):
             router_sigmoid_mode = "softmax"
         g0_gate = None
         alpha_gate = None
@@ -6688,6 +6688,16 @@ class PaTHAttention(nn.Module):
             pi = torch.cat([pi_null, pi_scale], dim=-1)
             router_mode = "sigmoid_with_null_independent_scales"
 
+        elif router_sigmoid_mode == "signed":
+            # K=1 signed gate: pi_scale = 2*sigmoid(logit)-1 in (-1,1); no null branch
+            # (pi=0 is the natural "off"). pi is NOT a probability simplex (like the
+            # independent_scales mode). Negative pi flips the ricker's sign at inference.
+            g = 2.0 * torch.sigmoid(router_logits[..., 1:] / tau) - 1.0
+            pi_scale = g
+            pi_null = torch.zeros_like(router_logits[..., 0:1])
+            pi = torch.cat([pi_null, pi_scale], dim=-1)
+            router_mode = "sigmoid_signed"
+
         else:
             raise ValueError(f"Unknown router_sigmoid_mode: {router_sigmoid_mode}")        
         # if router_sigmoid_mode == "softmax":
@@ -6722,6 +6732,13 @@ class PaTHAttention(nn.Module):
         # Otherwise do(scale) has no effect on the final bias path.
         pi_scale = pi[..., 1:]
         router_headwise = bool(pi.dim() == 4)
+        router_mode_is_signed = router_mode == "sigmoid_signed"
+
+        def _router_diag_prob_dist(pi_tensor: torch.Tensor) -> torch.Tensor:
+            if router_mode_is_signed:
+                pi_prob = pi_tensor.abs()
+                return pi_prob / pi_prob.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            return pi_tensor.clamp_min(1e-12)
 
         # Entropy regularization (training only).
         # floor mode (default): penalize entropy below floor — keeps routing diverse.
@@ -6733,8 +6750,7 @@ class PaTHAttention(nn.Module):
         router_entropy_reg_loss = reg_zero
         router_entropy_reg_active_frac = reg_zero.detach()
         if self.training and router_entropy_reg_enable and router_entropy_reg_lambda > 0.0:
-            pi_reg = pi.to(device=device, dtype=torch.float32)
-            pi_reg = pi_reg / pi_reg.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            pi_reg = _router_diag_prob_dist(pi.to(device=device, dtype=torch.float32))
             pi_entropy_reg = -(pi_reg * (pi_reg + 1e-8).log()).sum(dim=-1)
             if router_entropy_ceiling > 0.0:
                 reg_penalty = F.relu(pi_entropy_reg - router_entropy_ceiling)
@@ -6784,7 +6800,10 @@ class PaTHAttention(nn.Module):
         elif alpha_gate is not None:
             non_null_mass = alpha_gate
         elif torch.is_tensor(pi_scale):
-            non_null_mass = pi_scale.sum(dim=-1, keepdim=True)
+            if router_mode_is_signed:
+                non_null_mass = pi_scale.abs().sum(dim=-1, keepdim=True)
+            else:
+                non_null_mass = pi_scale.sum(dim=-1, keepdim=True)
         if torch.is_tensor(non_null_mass):
             self._last_ctxscale_non_null_mass = non_null_mass.detach().to(dtype=torch.float32)
         if torch.is_tensor(pi_null):
@@ -7531,7 +7550,7 @@ class PaTHAttention(nn.Module):
                 posinf=0.0,
                 neginf=0.0,
             )
-            pi_dist_a = pi_sample_a.clamp_min(1e-12)
+            pi_dist_a = _router_diag_prob_dist(pi_sample_a)
             pi_entropy_a = -(pi_dist_a * pi_dist_a.log()).sum(dim=-1)
             pi_top1_a = pi_dist_a.max(dim=-1).values
             pi_top2_a = torch.topk(pi_dist_a, k=2, dim=-1).values
@@ -7693,7 +7712,7 @@ class PaTHAttention(nn.Module):
             alpha_mean = float("nan")
             alpha_p90 = float("nan")
             pi_sample = torch.nan_to_num(pi.index_select(1, sample_q_idx).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
-            pi_dist = pi_sample.clamp_min(1e-12)
+            pi_dist = _router_diag_prob_dist(pi_sample)
             pi_entropy = -(pi_dist * pi_dist.log()).sum(dim=-1)
             pi_top1 = pi_dist.max(dim=-1).values
             pi_top2 = torch.topk(pi_dist, k=2, dim=-1).values
