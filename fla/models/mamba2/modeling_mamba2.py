@@ -154,6 +154,18 @@ class Mamba2Block(GradientCheckpointingLayer):
             use_bias=config.use_bias,
             norm_eps=config.norm_eps,
             layer_idx=layer_idx,
+            wavelet_write_gate_enable=config.wavelet_write_gate_enable,
+            wavelet_write_gate_k=config.wavelet_write_gate_k,
+            wavelet_write_gate_scale_max_exp=config.wavelet_write_gate_scale_max_exp,
+            wavelet_write_gate_sigmoid_mode=config.wavelet_write_gate_sigmoid_mode,
+            wavelet_write_gate_tau=config.wavelet_write_gate_tau,
+            wavelet_write_gate_rms_eps=config.wavelet_write_gate_rms_eps,
+            wavelet_write_gate_clamp1_enable=config.wavelet_write_gate_clamp1_enable,
+            wavelet_write_gate_clamp1_quantile=config.wavelet_write_gate_clamp1_quantile,
+            wavelet_write_gate_clamp1_scale=config.wavelet_write_gate_clamp1_scale,
+            wavelet_write_gate_clamp1_min=config.wavelet_write_gate_clamp1_min,
+            wavelet_write_gate_g_bias_max=config.wavelet_write_gate_g_bias_max,
+            wavelet_write_gate_layer_gain_init=config.wavelet_write_gate_layer_gain_init,
         )
 
     def forward(

@@ -82,6 +82,30 @@ class Mamba2Config(PretrainedConfig):
             Whether to use RMS norm or not.
         chunk_size (`int`, *optional*, defaults to 256):
             Size of the chunks that will comprise the sequence.
+        wavelet_write_gate_enable (`bool`, *optional*, defaults to `False`):
+            Enables the optional wavelet write-gate for Mamba2.
+        wavelet_write_gate_k (`int`, *optional*, defaults to 8):
+            Number of wavelet scales used by the write-gate router.
+        wavelet_write_gate_scale_max_exp (`float` or `list[float]`, *optional*, defaults to 14.0):
+            Maximum scale exponent, or per-scale exponents, for the wavelet table.
+        wavelet_write_gate_sigmoid_mode (`str`, *optional*, defaults to `"signed"`):
+            Router sigmoid mode used to combine scales.
+        wavelet_write_gate_tau (`float`, *optional*, defaults to 1.0):
+            Temperature used in the router sigmoid.
+        wavelet_write_gate_rms_eps (`float`, *optional*, defaults to 1e-6):
+            Epsilon used by the router and basis RMS normalization.
+        wavelet_write_gate_clamp1_enable (`bool`, *optional*, defaults to `True`):
+            Enables the p99 clamp used before scale combination.
+        wavelet_write_gate_clamp1_quantile (`float`, *optional*, defaults to 0.99):
+            Quantile used by the first clamp.
+        wavelet_write_gate_clamp1_scale (`float`, *optional*, defaults to 1.0):
+            Multiplicative scale applied to the p99 clamp reference.
+        wavelet_write_gate_clamp1_min (`float`, *optional*, defaults to 1e-6):
+            Minimum value for the first clamp magnitude.
+        wavelet_write_gate_g_bias_max (`float`, *optional*, defaults to 4.0):
+            Hard clamp bound applied after the layer gain.
+        wavelet_write_gate_layer_gain_init (`float`, *optional*, defaults to -2.0):
+            Initial value of the learnable layer gain parameter.
         tie_word_embeddings (`bool`, *optional*, defaults to `False`):
             Whether to tie word embeddings or not.
     """
@@ -116,6 +140,18 @@ class Mamba2Config(PretrainedConfig):
         use_cache: bool = True,
         rms_norm: bool = True,
         chunk_size: int = 256,
+        wavelet_write_gate_enable: bool = False,
+        wavelet_write_gate_k: int = 8,
+        wavelet_write_gate_scale_max_exp = 14.0,
+        wavelet_write_gate_sigmoid_mode: str = "signed",
+        wavelet_write_gate_tau: float = 1.0,
+        wavelet_write_gate_rms_eps: float = 1e-6,
+        wavelet_write_gate_clamp1_enable: bool = True,
+        wavelet_write_gate_clamp1_quantile: float = 0.99,
+        wavelet_write_gate_clamp1_scale: float = 1.0,
+        wavelet_write_gate_clamp1_min: float = 1e-6,
+        wavelet_write_gate_g_bias_max: float = 4.0,
+        wavelet_write_gate_layer_gain_init: float = -2.0,
         fuse_norm: bool = True,
         fuse_cross_entropy: bool = True,
         fuse_linear_cross_entropy: bool = False,
@@ -155,6 +191,18 @@ class Mamba2Config(PretrainedConfig):
         self.rms_norm = rms_norm
         self.state_size = state_size
         self.chunk_size = chunk_size
+        self.wavelet_write_gate_enable = wavelet_write_gate_enable
+        self.wavelet_write_gate_k = wavelet_write_gate_k
+        self.wavelet_write_gate_scale_max_exp = wavelet_write_gate_scale_max_exp
+        self.wavelet_write_gate_sigmoid_mode = wavelet_write_gate_sigmoid_mode
+        self.wavelet_write_gate_tau = wavelet_write_gate_tau
+        self.wavelet_write_gate_rms_eps = wavelet_write_gate_rms_eps
+        self.wavelet_write_gate_clamp1_enable = wavelet_write_gate_clamp1_enable
+        self.wavelet_write_gate_clamp1_quantile = wavelet_write_gate_clamp1_quantile
+        self.wavelet_write_gate_clamp1_scale = wavelet_write_gate_clamp1_scale
+        self.wavelet_write_gate_clamp1_min = wavelet_write_gate_clamp1_min
+        self.wavelet_write_gate_g_bias_max = wavelet_write_gate_g_bias_max
+        self.wavelet_write_gate_layer_gain_init = wavelet_write_gate_layer_gain_init
         self.time_step_limit = time_step_limit
         self.fuse_norm = fuse_norm
         self.fuse_cross_entropy = fuse_cross_entropy

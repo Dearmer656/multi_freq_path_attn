@@ -13,6 +13,7 @@ from transformers.utils import logging
 
 from fla.modules.activations import ACT2FN
 from fla.modules.layernorm_gated import RMSNormGated
+from fla.modules.wavelet_write_gate import WaveletWriteGate
 
 with warnings.catch_warnings():
     warnings.simplefilter('ignore')
@@ -125,6 +126,18 @@ class Mamba2(nn.Module):
         norm_eps: float = 1e-5,
         layer_idx: int = None,
         backend: str = "cuda",
+        wavelet_write_gate_enable: bool = False,
+        wavelet_write_gate_k: int = 8,
+        wavelet_write_gate_scale_max_exp=14.0,
+        wavelet_write_gate_sigmoid_mode: str = "signed",
+        wavelet_write_gate_tau: float = 1.0,
+        wavelet_write_gate_rms_eps: float = 1e-6,
+        wavelet_write_gate_clamp1_enable: bool = True,
+        wavelet_write_gate_clamp1_quantile: float = 0.99,
+        wavelet_write_gate_clamp1_scale: float = 1.0,
+        wavelet_write_gate_clamp1_min: float = 1e-6,
+        wavelet_write_gate_g_bias_max: float = 4.0,
+        wavelet_write_gate_layer_gain_init: float = -2.0,
     ) -> Mamba2:
         super().__init__()
 
@@ -189,6 +202,23 @@ class Mamba2(nn.Module):
         self.use_bias = use_bias
 
         self.layer_idx = layer_idx
+        self.wavelet_write_gate = None
+        if wavelet_write_gate_enable:
+            self.wavelet_write_gate = WaveletWriteGate(
+                head_dim=head_dim,
+                num_heads=num_heads,
+                k_scales=wavelet_write_gate_k,
+                scale_max_exp=wavelet_write_gate_scale_max_exp,
+                sigmoid_mode=wavelet_write_gate_sigmoid_mode,
+                tau=wavelet_write_gate_tau,
+                rms_eps=wavelet_write_gate_rms_eps,
+                clamp1_enable=wavelet_write_gate_clamp1_enable,
+                clamp1_quantile=wavelet_write_gate_clamp1_quantile,
+                clamp1_scale=wavelet_write_gate_clamp1_scale,
+                clamp1_min=wavelet_write_gate_clamp1_min,
+                g_bias_max=wavelet_write_gate_g_bias_max,
+                layer_gain_init=wavelet_write_gate_layer_gain_init,
+            )
 
         if not is_fast_path_available:
             logger.warning_once(
@@ -274,6 +304,8 @@ class Mamba2(nn.Module):
             dt_bias = self.dt_bias[:, None, ...].expand(-1, self.head_dim)
             D = self.D[:, None, ...].expand(-1, self.head_dim)
             B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
+            if self.wavelet_write_gate is not None:
+                B = B * self.wavelet_write_gate(hidden_states[:, None, :]).unsqueeze(-1)
             C = C.view(batch_size, self.n_groups, C.shape[1] // self.n_groups)
             hidden_states_reshaped = hidden_states.view(batch_size, self.num_heads, self.head_dim)
 
@@ -304,7 +336,8 @@ class Mamba2(nn.Module):
             # PAT-226: the fused split_conv1d op internally requires the
             # causal_conv1d CUDA package; without it, fall through to the
             # chunked path (fla triton conv + mamba_chunk_scan_combined).
-            if self.training and cache_params is None and causal_conv1d_fn is not None:
+            if self.training and cache_params is None and causal_conv1d_fn is not None and self.wavelet_write_gate is None:
+                # Keep the fully fused path only when the write-gate is disabled.
                 out = mamba_split_conv1d_scan_combined(
                     projected_states,
                     self.conv1d.weight.squeeze(1),
@@ -369,6 +402,8 @@ class Mamba2(nn.Module):
                     [self.intermediate_size, groups_time_state_size, groups_time_state_size],
                     dim=-1,
                 )
+                if self.wavelet_write_gate is not None:
+                    B = B * self.wavelet_write_gate(hidden_states).unsqueeze(-1)
 
                 # 3. SSM transformation
                 scan_output, ssm_state = mamba_chunk_scan_combined(
@@ -449,6 +484,7 @@ class Mamba2(nn.Module):
             [self.intermediate_size, self.n_groups * self.ssm_state_size, self.n_groups * self.ssm_state_size],
             dim=-1
         )
+        write_gate_hidden_states = hidden_states
 
         # 3. SSM transformation
         A = -torch.exp(self.A_log.float())                            # [num_heads]
@@ -473,6 +509,11 @@ class Mamba2(nn.Module):
             # [bsz, n_groups * state_size] -> [bsz, n_groups, 1, state_size] ->
             # -> [bsz, n_groups, group to head repetition factor, state_size] -> [bsz, num_heads, state_size]
             B = B.reshape(batch_size, self.n_groups, -1)[..., None, :]
+            if self.wavelet_write_gate is not None:
+                # B here is [bsz, n_groups, 1, state_size] (4D); gate is [bsz, 1] ->
+                # needs two trailing singleton dims to broadcast against the
+                # n_groups/state_size axes without colliding with the batch axis.
+                B = B * self.wavelet_write_gate(hidden_states[:, None, :]).unsqueeze(-1).unsqueeze(-1)
             B = B.expand(batch_size, self.n_groups, self.num_heads // self.n_groups, B.shape[-1]).contiguous()
             B = B.reshape(batch_size, -1, B.shape[-1])
             # [bsz, num_heads, head_dim, state_size]
@@ -520,6 +561,11 @@ class Mamba2(nn.Module):
             C = C.reshape(batch_size, seq_len, -1, self.ssm_state_size).float()
             B = B.repeat(1, 1, self.num_heads // self.n_groups, 1)
             C = C.repeat(1, 1, self.num_heads // self.n_groups, 1)
+            if self.wavelet_write_gate is not None:
+                # B here is [bsz, seq_len, num_heads, state_size] (4D); gate is
+                # [bsz, seq_len] -> needs two trailing singleton dims to broadcast
+                # against the num_heads/state_size axes instead of colliding with them.
+                B = B * self.wavelet_write_gate(write_gate_hidden_states).unsqueeze(-1).unsqueeze(-1)
             pad_size = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
 
             D_residual = self.D[..., None] * pad_tensor_by_size(hidden_states, pad_size)
