@@ -7060,6 +7060,11 @@ class PaTHAttention(nn.Module):
         sample_shift_vals = []
         sample_sraw_vals = []
         sample_traw_vals = []
+        norm_scale_vals = []
+        norm_keff_vals = []
+        norm_pre_sum_sq = torch.zeros((), device=device, dtype=torch.float32)
+        norm_post_sum_sq = torch.zeros((), device=device, dtype=torch.float32)
+        norm_elem_count = 0
         film_nf_flags = {"s_raw": 0, "t_raw": 0, "scale": 0, "shift": 0}
         sat_s_num = 0
         sat_t_num = 0
@@ -7313,6 +7318,10 @@ class PaTHAttention(nn.Module):
                             analysis_q_local,
                             analysis_q_abs,
                         )
+                if need_log:
+                    bias_pre_norm = bias_chunk.detach().to(torch.float32)
+                    norm_pre_sum_sq = norm_pre_sum_sq + bias_pre_norm.square().sum()
+                    norm_elem_count += int(bias_pre_norm.numel())
                 if self.multiscale_norm in (
                     "sqrt_keff_detach",
                     "keff_detach",
@@ -7329,11 +7338,30 @@ class PaTHAttention(nn.Module):
                         eps=eps,
                         K=self.wavelet_ctxscale_k,
                     )
+                    if need_log:
+                        scale_detached = multiscale_scale.detach().to(torch.float32)
+                        norm_scale_vals.append(scale_detached.reshape(-1))
+                        norm_keff_vals.append(
+                            scale_detached.square().reciprocal().reshape(-1)
+                        )
                     bias_chunk = bias_chunk * multiscale_scale.to(
                         dtype=bias_chunk.dtype
                     )
                 else:
                     bias_chunk = bias_chunk * self.multiscale_sum_scale
+                    if need_log:
+                        norm_scale_vals.append(
+                            torch.tensor(
+                                [self.multiscale_sum_scale],
+                                device=device,
+                                dtype=torch.float32,
+                            )
+                        )
+                if need_log:
+                    norm_post_sum_sq = (
+                        norm_post_sum_sq
+                        + bias_chunk.detach().to(torch.float32).square().sum()
+                    )
             if far_mask is not None:
                 bias_chunk = bias_chunk * far_mask.to(dtype=torch.float32)
             if far_over_mask is not None:
@@ -7806,6 +7834,34 @@ class PaTHAttention(nn.Module):
             )
             sat_s = float(sat_s_num / max(1, sat_den))
             sat_t = float(sat_t_num / max(1, sat_den))
+            norm_scale_sample = (
+                torch.cat(norm_scale_vals, dim=0)
+                if len(norm_scale_vals) > 0
+                else torch.empty(0, device=device, dtype=torch.float32)
+            )
+            norm_keff_sample = (
+                torch.cat(norm_keff_vals, dim=0)
+                if len(norm_keff_vals) > 0
+                else torch.empty(0, device=device, dtype=torch.float32)
+            )
+            norm_scale_q = _quantiles_flat(
+                norm_scale_sample,
+                qs=(0.5, 0.9),
+            )
+            norm_keff_q = _quantiles_flat(
+                norm_keff_sample,
+                qs=(0.5, 0.9),
+            )
+            if norm_elem_count > 0:
+                norm_pre_rms = float(
+                    torch.sqrt(norm_pre_sum_sq / float(norm_elem_count)).item()
+                )
+                norm_post_rms = float(
+                    torch.sqrt(norm_post_sum_sq / float(norm_elem_count)).item()
+                )
+            else:
+                norm_pre_rms = float("nan")
+                norm_post_rms = float("nan")
 
             payload = {
                 "g_layer_raw": g_layer_raw.detach(),
@@ -7906,6 +7962,24 @@ class PaTHAttention(nn.Module):
                 "g0_p90": float(g0_p90),
                 "alpha_mean": float(alpha_mean),
                 "alpha_p90": float(alpha_p90),
+                "multiscale_norm": str(self.multiscale_norm),
+                "multiscale_k": int(self.wavelet_ctxscale_k),
+                "norm_scale_mean": (
+                    float(norm_scale_sample.mean().item())
+                    if norm_scale_sample.numel() > 0
+                    else float("nan")
+                ),
+                "norm_scale_p50": float(norm_scale_q["p50"]),
+                "norm_scale_p90": float(norm_scale_q["p90"]),
+                "norm_keff_mean": (
+                    float(norm_keff_sample.mean().item())
+                    if norm_keff_sample.numel() > 0
+                    else float("nan")
+                ),
+                "norm_keff_p50": float(norm_keff_q["p50"]),
+                "norm_keff_p90": float(norm_keff_q["p90"]),
+                "bias_pre_norm_rms": float(norm_pre_rms),
+                "bias_post_norm_rms": float(norm_post_rms),
                 "film_enabled": int(bool(enable_film)),
                 "film_nf_s_raw": int(film_nf_flags["s_raw"]),
                 "film_nf_t_raw": int(film_nf_flags["t_raw"]),
@@ -8142,6 +8216,70 @@ class PaTHAttention(nn.Module):
         film_scale_stats = _monitor_scalar_stats(payload.get("film_scale_sample"))
         film_shift_stats = _monitor_scalar_stats(payload.get("film_shift_sample"))
         g_bias_std_finite = math.isfinite(float(eff_stats["std"]))
+        router_gate_parts = []
+        for name in (
+            "sum_g_mean",
+            "sum_g_p90",
+            "g0_mean",
+            "g0_p90",
+            "alpha_mean",
+            "alpha_p90",
+        ):
+            value = float(payload.get(name, float("nan")))
+            if math.isfinite(value):
+                router_gate_parts.append(f"{name}={value:.6e}")
+        router_gate_stats = (
+            " ".join(router_gate_parts) + " | "
+            if router_gate_parts
+            else ""
+        )
+        jitter_stats = ""
+        if int(payload.get("router_jitter_enabled", 0)):
+            jitter_stats = (
+                f"jitter_style={payload.get('router_jitter_style_resolved', 'na')} "
+                f"jitter_std={payload.get('router_jitter_std', float('nan')):.6e} "
+                f"jitter_inj={int(payload.get('router_jitter_injected', 0))} "
+                f"jitter_target_flip_prob="
+                f"{payload.get('router_jitter_target_flip_probability', float('nan')):.6e} "
+                f"jitter_sigma_mean={payload.get('sigma_mean', float('nan')):.6e} "
+                f"jitter_sigma_std={payload.get('sigma_std', float('nan')):.6e} "
+                f"jitter_flip_prob={payload.get('flip_probability_estimate', float('nan')):.6e} | "
+            )
+        norm_stats = (
+            f"norm_mode={payload.get('multiscale_norm', 'none')} "
+            f"norm_K={int(payload.get('multiscale_k', 1))} "
+            f"norm_scale_mean={payload.get('norm_scale_mean', float('nan')):.6e} "
+            f"norm_scale_p50={payload.get('norm_scale_p50', float('nan')):.6e} "
+            f"norm_scale_p90={payload.get('norm_scale_p90', float('nan')):.6e} "
+            f"bias_pre_norm_rms={payload.get('bias_pre_norm_rms', float('nan')):.6e} "
+            f"bias_post_norm_rms={payload.get('bias_post_norm_rms', float('nan')):.6e}"
+        )
+        norm_keff_mean = float(payload.get("norm_keff_mean", float("nan")))
+        if math.isfinite(norm_keff_mean):
+            norm_stats += (
+                f" k_eff_mean={norm_keff_mean:.6e} "
+                f"k_eff_p50={payload.get('norm_keff_p50', float('nan')):.6e} "
+                f"k_eff_p90={payload.get('norm_keff_p90', float('nan')):.6e}"
+            )
+        norm_stats += " | "
+        film_stats = ""
+        if int(payload.get("film_enabled", 0)):
+            film_stats = (
+                f"film_nf={int(payload.get('film_nf_s_raw', 0))},"
+                f"{int(payload.get('film_nf_t_raw', 0))},"
+                f"{int(payload.get('film_nf_scale', 0))},"
+                f"{int(payload.get('film_nf_shift', 0))} "
+                f"film_sat_s={payload.get('film_sat_s', float('nan')):.6e} "
+                f"film_sat_t={payload.get('film_sat_t', float('nan')):.6e} | "
+                f"film_s_raw mean={film_sraw_stats['mean']:.6e} "
+                f"p50={film_sraw_stats['p50']:.6e} p90={film_sraw_stats['p90']:.6e} | "
+                f"film_t_raw mean={film_traw_stats['mean']:.6e} "
+                f"p50={film_traw_stats['p50']:.6e} p90={film_traw_stats['p90']:.6e} | "
+                f"film_scale mean={film_scale_stats['mean']:.6e} "
+                f"p50={film_scale_stats['p50']:.6e} p90={film_scale_stats['p90']:.6e} | "
+                f"film_shift mean={film_shift_stats['mean']:.6e} "
+                f"p50={film_shift_stats['p50']:.6e} p90={film_shift_stats['p90']:.6e} | "
+            )
         msg = (
             f"[wavelet ctxscale_shift_v0 stats] layer={lid} step={int(step)} "
             f"g_layer_raw={g_layer_raw:.6e} g_layer_raw_used={g_layer_raw_used:.6e} "
@@ -8162,21 +8300,9 @@ class PaTHAttention(nn.Module):
             f"wavelet_mode={payload.get('wavelet_mode', 'na')} "
             f"basis_ctrl={payload.get('basis_control', 'none')} "
             f"router_mode={payload.get('router_mode', 'softmax')} "
-            f"router_jitter_style={payload.get('router_jitter_style', 'na')} "
-            f"router_jitter_style_resolved={payload.get('router_jitter_style_resolved', 'na')} "
-            f"router_jitter_std={payload.get('router_jitter_std', float('nan')):.6e} "
-            f"router_jitter_enabled={int(payload.get('router_jitter_enabled', 0))} "
-            f"router_jitter_inj={int(payload.get('router_jitter_injected', 0))} "
-            f"router_jitter_target_flip_prob={payload.get('router_jitter_target_flip_probability', float('nan')):.6e} "
-            f"sigma_mean={payload.get('sigma_mean', float('nan')):.6e} "
-            f"sigma_std={payload.get('sigma_std', float('nan')):.6e} "
-            f"flip_prob_est={payload.get('flip_probability_estimate', float('nan')):.6e} "
-            f"sum_g_mean={payload.get('sum_g_mean', float('nan')):.6e} "
-            f"sum_g_p90={payload.get('sum_g_p90', float('nan')):.6e} "
-            f"g0_mean={payload.get('g0_mean', float('nan')):.6e} "
-            f"g0_p90={payload.get('g0_p90', float('nan')):.6e} "
-            f"alpha_mean={payload.get('alpha_mean', float('nan')):.6e} "
-            f"alpha_p90={payload.get('alpha_p90', float('nan')):.6e} | "
+            f"{jitter_stats}"
+            f"{router_gate_stats}"
+            f"{norm_stats}"
             f"pi_entropy mean={payload['pi_entropy_mean']:.6e} p50={payload['pi_entropy_p50']:.6e} "
             f"p90={payload['pi_entropy_p90']:.6e} | "
             f"pi_top1 mean={payload['pi_top1_mean']:.6e} p90={payload['pi_top1_p90']:.6e} "
@@ -8203,14 +8329,7 @@ class PaTHAttention(nn.Module):
             f"delta_over_base_absmean={eff_over_base_absmean:.6e} "
             f"delta_over_base_elem_mean={eff_over_base_elem_mean:.6e} "
             f"delta_abs_mean={eff_abs_mean:.6e} base_abs_mean={base_abs_mean:.6e} | "
-            f"film_en={int(payload.get('film_enabled', 0))} "
-            f"film_nf={int(payload.get('film_nf_s_raw', 0))},{int(payload.get('film_nf_t_raw', 0))},"
-            f"{int(payload.get('film_nf_scale', 0))},{int(payload.get('film_nf_shift', 0))} "
-            f"film_sat_s={payload.get('film_sat_s', float('nan')):.6e} film_sat_t={payload.get('film_sat_t', float('nan')):.6e} | "
-            f"film_s_raw mean={film_sraw_stats['mean']:.6e} p50={film_sraw_stats['p50']:.6e} p90={film_sraw_stats['p90']:.6e} | "
-            f"film_t_raw mean={film_traw_stats['mean']:.6e} p50={film_traw_stats['p50']:.6e} p90={film_traw_stats['p90']:.6e} | "
-            f"film_scale mean={film_scale_stats['mean']:.6e} p50={film_scale_stats['p50']:.6e} p90={film_scale_stats['p90']:.6e} | "
-            f"film_shift mean={film_shift_stats['mean']:.6e} p50={film_shift_stats['p50']:.6e} p90={film_shift_stats['p90']:.6e} | "
+            f"{film_stats}"
             f"attn_entropy mean={attn_stats['entropy_mean']:.6e} p50={attn_stats['entropy_p50']:.6e} "
             f"p90={attn_stats['entropy_p90']:.6e} | "
             f"attn_top1 mean={attn_stats['top1_mean']:.6e} p50={attn_stats['top1_p50']:.6e} "
