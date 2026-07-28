@@ -127,9 +127,9 @@ class Mamba2(nn.Module):
         layer_idx: int = None,
         backend: str = "cuda",
         wavelet_write_gate_enable: bool = False,
-        wavelet_write_gate_k: int = 8,
+        wavelet_write_gate_k: int = 1,
         wavelet_write_gate_scale_max_exp=14.0,
-        wavelet_write_gate_sigmoid_mode: str = "signed",
+        wavelet_write_gate_sigmoid_mode: str = "with_null_independent_scales",
         wavelet_write_gate_tau: float = 1.0,
         wavelet_write_gate_rms_eps: float = 1e-6,
         wavelet_write_gate_clamp1_enable: bool = True,
@@ -305,7 +305,7 @@ class Mamba2(nn.Module):
             D = self.D[:, None, ...].expand(-1, self.head_dim)
             B = B.view(batch_size, self.n_groups, B.shape[1] // self.n_groups)
             if self.wavelet_write_gate is not None:
-                B = B * self.wavelet_write_gate(hidden_states[:, None, :]).unsqueeze(-1)
+                B = B * (1.0 + self.wavelet_write_gate(hidden_states[:, None, :]).unsqueeze(-1))
             C = C.view(batch_size, self.n_groups, C.shape[1] // self.n_groups)
             hidden_states_reshaped = hidden_states.view(batch_size, self.num_heads, self.head_dim)
 
@@ -403,7 +403,7 @@ class Mamba2(nn.Module):
                     dim=-1,
                 )
                 if self.wavelet_write_gate is not None:
-                    B = B * self.wavelet_write_gate(hidden_states).unsqueeze(-1)
+                    B = B * (1.0 + self.wavelet_write_gate(hidden_states).unsqueeze(-1))
 
                 # 3. SSM transformation
                 scan_output, ssm_state = mamba_chunk_scan_combined(
@@ -513,7 +513,7 @@ class Mamba2(nn.Module):
                 # B here is [bsz, n_groups, 1, state_size] (4D); gate is [bsz, 1] ->
                 # needs two trailing singleton dims to broadcast against the
                 # n_groups/state_size axes without colliding with the batch axis.
-                B = B * self.wavelet_write_gate(hidden_states[:, None, :]).unsqueeze(-1).unsqueeze(-1)
+                B = B * (1.0 + self.wavelet_write_gate(hidden_states[:, None, :]).unsqueeze(-1).unsqueeze(-1))
             B = B.expand(batch_size, self.n_groups, self.num_heads // self.n_groups, B.shape[-1]).contiguous()
             B = B.reshape(batch_size, -1, B.shape[-1])
             # [bsz, num_heads, head_dim, state_size]
@@ -565,7 +565,7 @@ class Mamba2(nn.Module):
                 # B here is [bsz, seq_len, num_heads, state_size] (4D); gate is
                 # [bsz, seq_len] -> needs two trailing singleton dims to broadcast
                 # against the num_heads/state_size axes instead of colliding with them.
-                B = B * self.wavelet_write_gate(write_gate_hidden_states).unsqueeze(-1).unsqueeze(-1)
+                B = B * (1.0 + self.wavelet_write_gate(write_gate_hidden_states).unsqueeze(-1).unsqueeze(-1))
             pad_size = (self.chunk_size - seq_len % self.chunk_size) % self.chunk_size
 
             D_residual = self.D[..., None] * pad_tensor_by_size(hidden_states, pad_size)

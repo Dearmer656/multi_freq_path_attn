@@ -84,12 +84,13 @@ class Mamba2Config(PretrainedConfig):
             Size of the chunks that will comprise the sequence.
         wavelet_write_gate_enable (`bool`, *optional*, defaults to `False`):
             Enables the optional wavelet write-gate for Mamba2.
-        wavelet_write_gate_k (`int`, *optional*, defaults to 8):
+        wavelet_write_gate_k (`int`, *optional*, defaults to 1):
             Number of wavelet scales used by the write-gate router.
         wavelet_write_gate_scale_max_exp (`float` or `list[float]`, *optional*, defaults to 14.0):
             Maximum scale exponent, or per-scale exponents, for the wavelet table.
-        wavelet_write_gate_sigmoid_mode (`str`, *optional*, defaults to `"signed"`):
-            Router sigmoid mode used to combine scales.
+        wavelet_write_gate_sigmoid_mode (`str`, *optional*, defaults to `"with_null_independent_scales"`):
+            Router sigmoid mode used to combine scales. One of `"signed"`, `"with_null"`,
+            `"with_null_independent_scales"`.
         wavelet_write_gate_tau (`float`, *optional*, defaults to 1.0):
             Temperature used in the router sigmoid.
         wavelet_write_gate_rms_eps (`float`, *optional*, defaults to 1e-6):
@@ -141,9 +142,9 @@ class Mamba2Config(PretrainedConfig):
         rms_norm: bool = True,
         chunk_size: int = 256,
         wavelet_write_gate_enable: bool = False,
-        wavelet_write_gate_k: int = 8,
+        wavelet_write_gate_k: int = 1,
         wavelet_write_gate_scale_max_exp = 14.0,
-        wavelet_write_gate_sigmoid_mode: str = "signed",
+        wavelet_write_gate_sigmoid_mode: str = "with_null_independent_scales",
         wavelet_write_gate_tau: float = 1.0,
         wavelet_write_gate_rms_eps: float = 1e-6,
         wavelet_write_gate_clamp1_enable: bool = True,

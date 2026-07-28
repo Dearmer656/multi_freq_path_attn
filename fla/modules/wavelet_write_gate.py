@@ -99,6 +99,14 @@ class WaveletWriteGate(nn.Module):
             w = g / sum_g
             g0_gate = torch.sigmoid(router_logits[..., 0:1] / tau)
             pi_scale = g0_gate * w
+        elif self.sigmoid_mode == "with_null_independent_scales":
+            # Factorized routing (matches fla/layers/path_attn.py): null vs
+            # non-null compete through g0_gate, but scales do NOT compete
+            # against each other inside non-null (no renormalization by sum_g),
+            # so multiple scales can be simultaneously active.
+            g = torch.sigmoid(router_logits[..., 1:] / tau)
+            g0_gate = torch.sigmoid(router_logits[..., 0:1] / tau)
+            pi_scale = g0_gate * g
         else:
             raise ValueError(f"unsupported mode {self.sigmoid_mode}")
 
@@ -121,4 +129,6 @@ class WaveletWriteGate(nn.Module):
         g_layer = torch.nn.functional.softplus(self.layer_gain_raw)
         wavelet_bias = wavelet_bias * g_layer
         wavelet_bias = wavelet_bias.clamp(min=-self.g_bias_max, max=self.g_bias_max)
-        return 1.0 + wavelet_bias
+        # Return the raw bias only; callers apply B_t' = B_t * (1 + bias)
+        # explicitly, so the "+1" stays visible at the point B is gated.
+        return wavelet_bias
