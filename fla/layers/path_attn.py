@@ -3514,14 +3514,19 @@ class PaTHAttention(nn.Module):
     def _validate_dynamic_multiscale_norm_router(
         multiscale_norm: str,
         router_mode: str,
+        *,
+        intervention_active: bool = False,
     ) -> None:
-        if (
-            multiscale_norm in ("sqrt_keff_detach", "keff_detach")
-            and router_mode != "sigmoid_with_null_independent_scales"
-        ):
+        if multiscale_norm not in ("sqrt_keff_detach", "keff_detach"):
+            return
+        if router_mode != "sigmoid_with_null_independent_scales":
             raise ValueError(
                 "sqrt_keff_detach is only supported for "
                 "with_null_independent_scales routing"
+            )
+        if intervention_active:
+            raise ValueError(
+                "sqrt_keff_detach cannot be combined with scale intervention"
             )
     # 小工具：按 head 打印
     def _get_layer_accum(self, layer_idx: int):
@@ -7315,6 +7320,7 @@ class PaTHAttention(nn.Module):
                     self._validate_dynamic_multiscale_norm_router(
                         self.multiscale_norm,
                         router_mode,
+                        intervention_active=do_active,
                     )
                     # Use independent scale gates only; the null gate is excluded.
                     g_chunk = g[:, q0:q1, :]

@@ -118,6 +118,18 @@ def test_sqrt_keff_detach_rejects_non_independent_router(
         )
 
 
+def test_sqrt_keff_detach_rejects_scale_intervention():
+    with pytest.raises(
+        ValueError,
+        match="cannot be combined with scale intervention",
+    ):
+        PaTHAttention._validate_dynamic_multiscale_norm_router(
+            "sqrt_keff_detach",
+            "sigmoid_with_null_independent_scales",
+            intervention_active=True,
+        )
+
+
 def test_ctxscale_intervention_keeps_shared_router_shape():
     attention = PaTHAttention.__new__(PaTHAttention)
     torch.nn.Module.__init__(attention)
