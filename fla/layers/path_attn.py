@@ -2545,6 +2545,7 @@ class PaTHAttention(nn.Module):
         self.log_rel_eval_every = max(0, int(getattr(config, "log_rel_eval_every", 0)))
         self.log_rel_tail_tau = max(1, int(getattr(config, "log_rel_tail_tau", 1024)))
         qpos_cfg = getattr(config, "log_rel_sample_qpos", None)
+
         if qpos_cfg is None:
             qpos_cfg = getattr(config, "log_rel_sample_tokens", "128,512,2048")
         self.log_rel_sample_qpos = self._parse_int_list(qpos_cfg, default=[128, 512, 2048])
@@ -2660,8 +2661,18 @@ class PaTHAttention(nn.Module):
             getattr(config, "wavelet_logit_bias_debug_assert", False), default=False
         )
         self.wavelet_logit_bias_clamp_enable = self._as_bool(
-            getattr(config, "wavelet_logit_bias_clamp_enable", True), default=True
+            getattr(config, "wavelet_logit_bias_clamp_enable", True), default=False
         )
+        self.wavelet_logit_bias_rms_scope = str(
+            getattr(config, "wavelet_logit_bias_rms_scope", "context")
+        ).strip().lower()
+        if self.wavelet_logit_bias_rms_scope in ("full", "all", "all_context", "context_length"):
+            self.wavelet_logit_bias_rms_scope = "context"
+        if self.wavelet_logit_bias_rms_scope not in ("context", "causal"):
+            raise ValueError(
+                "wavelet_logit_bias_rms_scope must be 'context' or 'causal', "
+                f"got {self.wavelet_logit_bias_rms_scope!r}"
+            )
         # PAT-234 variant C: center the per-scale basis over causal keys before RMS-norm,
         # removing the softmax-invisible key-independent (DC) component so coarse
         # (near-constant) scales can actually influence attention. Default off.
@@ -2716,9 +2727,12 @@ class PaTHAttention(nn.Module):
                 f"{list(self.wavelet_ctxscale_ko_layers_idx)} to null (wavelet bias off)",
                 flush=True,
             )
-        # Head-group shared QWAB: split num_heads into G groups; each group shares one QWAB output.
-        # Default 1 = fully shared (current behavior). 2 = two groups of num_heads/2 each.
-        self.qwab_groups_per_layer = max(1, int(getattr(config, "qwab_groups_per_layer", 1)))
+        qwab_groups_per_layer = max(1, int(getattr(config, "qwab_groups_per_layer", 1)))
+        if qwab_groups_per_layer != 1:
+            raise ValueError(
+                "Head-wise wavelet routing has been removed; "
+                "qwab_groups_per_layer must be 1."
+            )
         self.wavelet_ctxscale_tau = float(getattr(config, "wavelet_ctxscale_tau", getattr(config, "tau", 1.0)))
         self.wavelet_ctxscale_tau_schedule = str(
             getattr(config, "wavelet_ctxscale_tau_schedule", "none")
@@ -2740,17 +2754,27 @@ class PaTHAttention(nn.Module):
         self._last_router_jitter_stats = {}
         self._last_router_entropy_reg_loss = torch.tensor(0.0)
         self._last_router_entropy_reg_active_frac = torch.tensor(0.0)
-        self._last_lw_residual_hw_l2_loss = torch.tensor(0.0)
-        self._last_lw_residual_hw_delta_l2 = torch.tensor(0.0)
-        self._last_lw_residual_hw_delta_abs_mean = torch.tensor(0.0)
-        self._last_lw_residual_hw_divergence = torch.tensor(0.0)
         self.wavelet_ctxscale_rho_override = getattr(config, "wavelet_ctxscale_rho_override", None)
         self.wavelet_ctxscale_router_rms_eps = float(getattr(config, "wavelet_ctxscale_router_rms_eps", 1e-6))
         self.wavelet_ctxscale_chunk_q = max(1, int(getattr(config, "wavelet_ctxscale_chunk_q", 128)))
         self.wavelet_ctxscale_max_log_samples = max(
             128, int(getattr(config, "wavelet_ctxscale_max_log_samples", 4096))
         )
-        self.wavelet_ctx_feat_mode = str(getattr(config, "wavelet_ctx_feat_mode", "q_meanH")).strip()
+        self.wavelet_ctx_feat_mode = str(
+            getattr(config, "wavelet_ctx_feat_mode", "q_meanH")
+        ).strip()
+        if self.wavelet_ctx_feat_mode.lower() in (
+            "q_perh",
+            "q_headwise",
+            "q_hw",
+            "q_minus_qcorr_perh",
+            "q_minus_qcorr_headwise",
+            "dq_perh",
+        ):
+            raise ValueError(
+                "Head-wise wavelet routing has been removed; "
+                f"wavelet_ctx_feat_mode={self.wavelet_ctx_feat_mode!r} is unsupported."
+            )
         self.wavelet_ctx_feat_rms_eps = float(getattr(config, "wavelet_ctx_feat_rms_eps", 1e-6))
         self.wavelet_ctx_feat_detach_delta = self._as_bool(
             getattr(config, "wavelet_ctx_feat_detach_delta", False), default=False
@@ -2766,13 +2790,11 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctxscale_scale_dependent_shift = self._as_bool(
             getattr(config, "wavelet_ctxscale_scale_dependent_shift", False), default=False
         )
-        self.lw_residual_hw_enable = self._as_bool(
-            getattr(config, "lw_residual_hw_enable", False), default=False
-        )
-        self.lw_residual_hw_alpha = float(getattr(config, "lw_residual_hw_alpha", 0.1))
-        self.lw_residual_hw_l2 = float(getattr(config, "lw_residual_hw_l2", 1e-4))
-        self.lw_residual_hw_freeze_steps = max(0, int(getattr(config, "lw_residual_hw_freeze_steps", 1500)))
-        self._lw_residual_hw_phase = "disabled"
+        if self._as_bool(getattr(config, "lw_residual_hw_enable", False), default=False):
+            raise ValueError(
+                "Head-wise wavelet routing has been removed; "
+                "lw_residual_hw_enable must be false."
+            )
         self.wavelet_ctxscale_use_relative_position = self._as_bool(
             getattr(config, "wavelet_ctxscale_use_relative_position", False), default=False
         )
@@ -3126,10 +3148,49 @@ class PaTHAttention(nn.Module):
         # (pre-registered in PAT-225). Endpoints stay fixed for every K>1 so that
         # scale cardinality is the only changed factor.
         _K = self.wavelet_ctxscale_k
+        self.multiscale_norm_requested = str(
+            getattr(config, "multiscale_norm", "none")
+        ).strip().lower()
+        self.wavelet_ctxscale_allow_with_null_multiscale_norm = self._as_bool(
+            getattr(
+                config,
+                "wavelet_ctxscale_allow_with_null_multiscale_norm",
+                False,
+            ),
+            default=False,
+        )
+        self.multiscale_norm = self._resolve_multiscale_norm(
+            self.multiscale_norm_requested,
+            self.wavelet_router_sigmoid_mode,
+            self.wavelet_ctxscale_allow_with_null_multiscale_norm,
+        )
+        self.multiscale_sum_scale = self._get_multiscale_sum_scale(
+            self.multiscale_norm,
+            _K,
+        )
         # PAT-227: support upper bound is configurable (log2 exponent; default 14
         # keeps every existing grid bit-identical). K=1 -> geometric center.
-        _max_exp = float(getattr(config, "wavelet_ctxscale_scale_max_exp", 14.0))
-        _scale_exps = [_max_exp / 2.0] if _K == 1 else [_max_exp * i / (_K - 1) for i in range(_K)]
+        _max_exp = getattr(
+            config,
+            "wavelet_ctxscale_scale_max_exp",
+            14.0,
+        )
+
+        if isinstance(_max_exp, (list, tuple)):
+            if len(_max_exp) != _K:
+                raise ValueError(
+                    f"wavelet_ctxscale_scale_max_exp must have "
+                    f"{_K} elements, not {len(_max_exp)}: {_max_exp}"
+                )
+            _scale_exps = [float(x) / 2.0 for x in _max_exp]
+        else:
+            if _K != 1:
+                raise ValueError(
+                    f"wavelet_ctxscale_scale_max_exp must be a list/tuple of length {_K} when wavelet_ctxscale_k={_K}, not a single value: {_max_exp}"
+                )
+            _max_exp = float(_max_exp)
+            _scale_exps = [_max_exp / 2.0]
+
         self.register_buffer(
             "wavelet_ctxscale_scales",
             torch.tensor([2.0 ** e * _scale_multiplier for e in _scale_exps], dtype=torch.float32),
@@ -3162,19 +3223,6 @@ class PaTHAttention(nn.Module):
             )
         else:
             self.wavelet_static_router_logits = None
-        if self.lw_residual_hw_enable:
-            self.lw_residual_hw_delta_router = nn.Linear(
-                self.head_dim,
-                self.num_heads * (self.wavelet_ctxscale_k + 1),
-                bias=True,
-            )
-            nn.init.zeros_(self.lw_residual_hw_delta_router.weight)
-            nn.init.zeros_(self.lw_residual_hw_delta_router.bias)
-            self._lw_residual_hw_phase = "frozen" if self.lw_residual_hw_freeze_steps > 0 else "trainable"
-            for p in self.lw_residual_hw_delta_router.parameters():
-                p.requires_grad = bool(self._lw_residual_hw_phase == "trainable")
-        else:
-            self.lw_residual_hw_delta_router = None
         self.wavelet_shift_ln = nn.LayerNorm(self.hidden_size, eps=getattr(config, "layer_norm_epsilon", 1e-5))
         self.wavelet_shift_proj = nn.Linear(self.hidden_size, 1, bias=True)
         film_in_dim = self.wavelet_ctxscale_k + 2
@@ -3411,7 +3459,70 @@ class PaTHAttention(nn.Module):
 
             # softmix 的可学习混合系数
             # self.mix_logit = nn.Parameter(torch.tensor(1.0)) if wavelet_mode == "softmix" else None
+    @staticmethod
+    def _resolve_multiscale_norm(
+        multiscale_norm: str,
+        router_sigmoid_mode: str,
+        allow_with_null_multiscale_norm: bool = False,
+    ) -> str:
+        multiscale_norm = str(multiscale_norm).strip().lower()
+        router_sigmoid_mode = str(router_sigmoid_mode).strip().lower()
+        if multiscale_norm in ("sqrt_keff_detach", "keff_detach"):
+            return multiscale_norm
+        if (
+            router_sigmoid_mode == "with_null"
+            and not allow_with_null_multiscale_norm
+        ):
+            return "none"
+        return multiscale_norm
 
+    def _get_multiscale_sum_scale(self, multiscale_norm: str, K: int) -> float:
+        if multiscale_norm in ("sqrt", "sqrt_k"):
+            multiscale_sum_scale = 1.0 / math.sqrt(float(K))
+        elif multiscale_norm == "k":
+            multiscale_sum_scale = 1.0 / float(K)
+        elif multiscale_norm in ("sqrt_keff_detach", "keff_detach"):
+            # Runtime-dependent normalization is applied in forward.
+            multiscale_sum_scale = 1.0
+        elif multiscale_norm == "gram":
+            multiscale_sum_scale = float(
+                self.wavelet_ctxscale_gram_alpha
+            )
+        else:
+            multiscale_sum_scale = 1.0
+        return multiscale_sum_scale
+
+    @staticmethod
+    def _get_sqrt_keff_detach_scale(
+        g_chunk: torch.Tensor,
+        *,
+        eps: float,
+        K: int,
+    ) -> torch.Tensor:
+        g_detached = g_chunk.detach().to(torch.float32)
+        gate_sum = g_detached.sum(dim=-1, keepdim=True)
+        gate_sq_sum = g_detached.square().sum(dim=-1, keepdim=True)
+        k_eff = (
+            gate_sum.square() / gate_sq_sum.clamp_min(eps)
+        ).clamp(
+            min=1.0,
+            max=float(K),
+        )
+        return torch.rsqrt(k_eff)
+
+    @staticmethod
+    def _validate_dynamic_multiscale_norm_router(
+        multiscale_norm: str,
+        router_mode: str,
+    ) -> None:
+        if (
+            multiscale_norm in ("sqrt_keff_detach", "keff_detach")
+            and router_mode != "sigmoid_with_null_independent_scales"
+        ):
+            raise ValueError(
+                "sqrt_keff_detach is only supported for "
+                "with_null_independent_scales routing"
+            )
     # 小工具：按 head 打印
     def _get_layer_accum(self, layer_idx: int):
         st = self.debug_accum.get(layer_idx)
@@ -5743,10 +5854,27 @@ class PaTHAttention(nn.Module):
         self._k1_emit_log(msg)
 
     @staticmethod
-    def _rms_norm_last_dim(x: torch.Tensor, eps: float = 1e-6):
+    def _rms_norm_last_dim(x: torch.Tensor, eps: float = 1e-6, mask: Optional[torch.Tensor] = None):
         xf = x.to(dtype=torch.float32)
-        denom = torch.sqrt(xf.pow(2).mean(dim=-1, keepdim=True).clamp_min(0.0) + float(eps))
+        if mask is None:
+            denom = torch.sqrt(xf.pow(2).mean(dim=-1, keepdim=True).clamp_min(0.0) + float(eps))
+        else:
+            m = mask.to(device=xf.device, dtype=torch.float32)
+            while m.dim() < xf.dim():
+                m = m.unsqueeze(0)
+            count = m.sum(dim=-1, keepdim=True).clamp_min(1.0)
+            denom = torch.sqrt((xf.pow(2) * m).sum(dim=-1, keepdim=True).div(count).clamp_min(0.0) + float(eps))
         return xf / denom
+
+    def _rms_norm_wavelet_basis(self, basis_table: torch.Tensor, *, q0: int, eps: float):
+        if self.wavelet_logit_bias_rms_scope == "context":
+            return self._rms_norm_last_dim(basis_table, eps=eps)
+        q_len = int(basis_table.shape[-2])
+        T = int(basis_table.shape[-1])
+        q_abs = torch.arange(q0, q0 + q_len, device=basis_table.device).view(q_len, 1)
+        k_idx = torch.arange(T, device=basis_table.device).view(1, T)
+        causal = k_idx <= q_abs
+        return self._rms_norm_last_dim(basis_table, eps=eps, mask=causal)
 
     @staticmethod
     def _ricker_wavelet(u: torch.Tensor):
@@ -6016,10 +6144,6 @@ class PaTHAttention(nn.Module):
         delta = qf - q_corr
         if self.wavelet_ctx_feat_detach_delta:
             delta = delta.detach()
-        if mode in ("q_perh", "q_headwise", "q_hw"):
-            return feat_ln(qf.to(ln_dtype))
-        if mode in ("q_minus_qcorr_perh", "q_minus_qcorr_headwise", "dq_perh"):
-            return feat_ln(delta.to(ln_dtype))
         q_mean = qf.mean(dim=2)
         d_mean = delta.mean(dim=2)
         if mode == "q_minus_qcorr_meanh":
@@ -6159,8 +6283,7 @@ class PaTHAttention(nn.Module):
           {
             "enabled": bool,
             "mode": "null" | "small" | "large" | "uniform",
-            "target_layer": int,
-            "target_heads": [int, ...]
+            "target_layer": int
           }
         """
         self._last_ctxscale_do_stat = None
@@ -6172,7 +6295,7 @@ class PaTHAttention(nn.Module):
         mode = str(spec.get("mode", "")).strip().lower()
         if mode not in ("null", "small", "large", "uniform"):
             return pi
-        if pi.dim() not in (3, 4):
+        if pi.dim() != 3:
             return pi
         Kp1 = int(pi.shape[-1])
         if Kp1 <= 1:
@@ -6192,43 +6315,15 @@ class PaTHAttention(nn.Module):
             scale_idx = max(0, min(K - 1, int(scale_idx_spec)))
         expected_argmax = 0 if mode == "null" else int(scale_idx + 1)
 
-        head_idx_list = []
-        if "target_head" in spec:
-            try:
-                head_idx_list.append(int(spec.get("target_head")))
-            except Exception:
-                pass
-        th = spec.get("target_heads", [])
-        if isinstance(th, str) and th.strip().lower() == "all":
-            head_idx_list = list(range(max(0, int(getattr(self, "num_heads", 0)))))
-        elif isinstance(th, (list, tuple, set)):
-            for x in th:
-                try:
-                    head_idx_list.append(int(x))
-                except Exception:
-                    continue
+        target_head = spec.get("target_head", None)
+        target_heads = spec.get("target_heads", None)
+        if target_head is not None or target_heads not in (None, [], (), "all", "*"):
+            raise ValueError(
+                "Per-head ctxscale intervention has been removed; "
+                "only shared-router intervention is supported."
+            )
 
-        if pi.dim() == 4:
-            H = int(pi.shape[2])
-            head_idx = sorted(set(h for h in head_idx_list if 0 <= int(h) < H))
-            pi_old = pi
-            pi_work = pi.clone()
-            scope = "headwise"
-        else:
-            H = int(getattr(self, "num_heads", 0))
-            if H <= 0:
-                H = 1
-            head_idx = sorted(set(h for h in head_idx_list if 0 <= int(h) < H))
-            # Scheme A: keep router params shared, but expand to head-wise probs in forward.
-            # This enables single-head intervention while preserving non-target heads.
-            pi_old = pi.unsqueeze(2).expand(-1, -1, H, -1).clone()
-            pi_work = pi_old.clone()
-            scope = "broadcast_headwise_mask"
-
-        if len(head_idx) == 0:
-            head_idx = [0]
-
-        forced = torch.zeros_like(pi_work)
+        forced = torch.zeros_like(pi)
         if mode == "null":
             forced[..., 0] = 1.0
         elif mode in ("small", "large"):
@@ -6236,16 +6331,12 @@ class PaTHAttention(nn.Module):
         elif mode == "uniform":
             forced[..., 1:] = 1.0 / float(K)
 
-        pi_new = pi_work
-        for h in head_idx:
-            if 0 <= int(h) < int(pi_new.shape[2]):
-                pi_new[:, :, int(h), :] = forced[:, :, int(h), :]
+        pi_new = forced
 
         # validation payload for downstream logging / hard checks.
         try:
             v = pi_new.detach().float()
-            target_h = int(head_idx[0])
-            target_pi = v[:, :, target_h, :]  # [B,T,K+1]
+            target_pi = v
             sum_prob = target_pi.sum(dim=-1)
             pi0 = target_pi[..., 0]
             argmax_idx = target_pi.argmax(dim=-1)
@@ -6256,26 +6347,18 @@ class PaTHAttention(nn.Module):
                 uniform_ref = torch.full_like(target_scale, 1.0 / float(K))
                 uniform_dev = float((target_scale - uniform_ref).abs().max().item())
 
-            non_target_heads = [h for h in range(int(v.shape[2])) if h not in set(head_idx)]
-            non_target_pi_change_maxabs = 0.0
-            non_target_pi_change_meanabs = 0.0
-            if len(non_target_heads) > 0:
-                d_non = (v[:, :, non_target_heads, :] - pi_old[:, :, non_target_heads, :]).abs()
-                non_target_pi_change_maxabs = float(d_non.max().item())
-                non_target_pi_change_meanabs = float(d_non.mean().item())
-
             stat = {
                 "enabled": True,
                 "mode": mode,
                 "layer": int(layer_idx),
-                "scope": scope,
+                "scope": "shared",
                 "strict": int(strict),
                 "num_scales": int(K),
-                "target_heads": [int(x) for x in head_idx],
-                "target_head_for_check": int(target_h),
+                "target_heads": list(range(max(1, int(getattr(self, "num_heads", 1))))),
+                "target_head_for_check": 0,
                 "scale_idx": int(scale_idx),
                 "expected_argmax": int(expected_argmax),
-                "pi_dim_in": int(pi.dim()),
+                "pi_dim_in": 3,
                 "pi_dim_out": int(pi_new.dim()),
                 "target_pi_min": float(target_pi.min().item()),
                 "target_pi_max": float(target_pi.max().item()),
@@ -6287,8 +6370,8 @@ class PaTHAttention(nn.Module):
                 "target_nonzero_count_mean": float(nnz.mean().item()),
                 "target_nonzero_count_max": float(nnz.max().item()),
                 "target_uniform_scale_maxdev": float(uniform_dev),
-                "non_target_pi_change_maxabs": float(non_target_pi_change_maxabs),
-                "non_target_pi_change_meanabs": float(non_target_pi_change_meanabs),
+                "non_target_pi_change_maxabs": 0.0,
+                "non_target_pi_change_meanabs": 0.0,
             }
 
             tol = 1e-6
@@ -6507,25 +6590,18 @@ class PaTHAttention(nn.Module):
 
         q_corr = torch.einsum("b h t j, b j h d -> b t h d", mf, wf)
         router_mod = self.mlp_bias_router if use_mlp_bias_baseline else self.wavelet_ctx_router
-        n_groups = int(getattr(self, "qwab_groups_per_layer", 1))
-        if n_groups > 1 and self.num_heads % n_groups == 0:
-            # Head-group shared QWAB: compute per-group feature then broadcast to per-head shape.
-            group_size = self.num_heads // n_groups
-            feat_ln = (self.mlp_bias_ctx_feat_ln if use_mlp_bias_baseline else self.wavelet_ctx_feat_ln)
-            delta = qf - q_corr
-            if self.wavelet_ctx_feat_detach_delta:
-                delta = delta.detach()
-            # Mean over heads within each group: [B, T, n_groups, d]
-            qf_g = qf.view(B, T, n_groups, group_size, self.head_dim).mean(dim=3)
-            x_feat_g = feat_ln(qf_g.to(feat_ln.weight.dtype))
-            router_logits = router_mod(x_feat_g)  # [B, T, n_groups, K+1]
-            # Broadcast each group's logits to its member heads: [B, T, H, K+1]
-            router_logits = router_logits.repeat_interleave(group_size, dim=2)
-            router_headwise = True
-        else:
-            x_feat = self._ctxscale_router_feature(qf, q_corr, use_mlp=use_mlp_bias_baseline, hidden_states=hidden_states)
-            router_headwise = bool(x_feat.dim() == 4)
-            router_logits = router_mod(x_feat)
+        x_feat = self._ctxscale_router_feature(
+            qf,
+            q_corr,
+            use_mlp=use_mlp_bias_baseline,
+            hidden_states=hidden_states,
+        )
+        if x_feat.dim() != 3:
+            raise ValueError(
+                "Wavelet router features must have shape [B, T, D]; "
+                f"got {tuple(x_feat.shape)}."
+            )
+        router_logits = router_mod(x_feat)
         router_logits = self._rms_norm_last_dim(router_logits, eps=float(self.wavelet_ctxscale_router_rms_eps))
         # E2b ablation: replace with globally-learned static logits (not query-conditioned)
         if getattr(self, "wavelet_router_static_learned", False) and self.wavelet_static_router_logits is not None:
@@ -6569,48 +6645,6 @@ class PaTHAttention(nn.Module):
                     jitter_stat.get("flip_probability_estimate", default_jitter_stat)
                 )
 
-        lw_residual_hw_phase = "disabled"
-        residual_delta_l2 = reg_zero
-        residual_delta_abs_mean = reg_zero
-        residual_router_divergence = reg_zero
-        residual_l2_loss = reg_zero
-        pi_lw_shared = None
-        if bool(getattr(self, "lw_residual_hw_enable", False)) and (self.lw_residual_hw_delta_router is not None):
-            freeze_steps = int(getattr(self, "lw_residual_hw_freeze_steps", 1500))
-            lw_residual_hw_phase = "frozen" if int(step_val) < freeze_steps else "trainable"
-            phase_should_train = bool(lw_residual_hw_phase == "trainable")
-            if self._lw_residual_hw_phase != lw_residual_hw_phase:
-                if phase_should_train:
-                    self._k1_emit_log(
-                        f"[LWResidualHW] switching residual from frozen to trainable at step {int(step_val)}"
-                    )
-                self._lw_residual_hw_phase = lw_residual_hw_phase
-            for p in self.lw_residual_hw_delta_router.parameters():
-                p.requires_grad = phase_should_train
-
-            # Shared LW feature -> small head-specific residual delta.
-            x_feat_lw = x_feat if x_feat.dim() == 3 else x_feat.mean(dim=2)
-            _lw_dtype = next(self.lw_residual_hw_delta_router.parameters()).dtype
-            delta_logits = self.lw_residual_hw_delta_router(x_feat_lw.to(device=device, dtype=_lw_dtype))
-            delta_logits = delta_logits.view(B, int(T), int(self.num_heads), int(self.wavelet_ctxscale_k + 1))
-
-            if router_logits.dim() == 3:
-                lw_logits_shared = router_logits.unsqueeze(2).expand(-1, -1, int(self.num_heads), -1)
-            elif router_logits.dim() == 4:
-                lw_logits_shared = router_logits.mean(dim=2, keepdim=True).expand(-1, -1, int(self.num_heads), -1)
-            else:
-                raise ValueError(f"Unsupported router_logits dim for LW residual HW: {router_logits.dim()}")
-
-            alpha = float(getattr(self, "lw_residual_hw_alpha", 0.1))
-            router_logits = lw_logits_shared + (alpha * delta_logits)
-            pi_lw_shared = torch.softmax(lw_logits_shared / max(float(tau), 1e-8), dim=-1)
-            residual_delta_l2 = delta_logits.pow(2).sum(dim=-1).mean()
-            residual_delta_abs_mean = delta_logits.abs().mean()
-            if self.training and float(getattr(self, "lw_residual_hw_l2", 0.0)) > 0.0:
-                residual_l2_loss = residual_delta_l2 * float(getattr(self, "lw_residual_hw_l2", 1e-4))
-        self._last_lw_residual_hw_l2_loss = residual_l2_loss
-        self._last_lw_residual_hw_delta_l2 = residual_delta_l2.detach()
-        self._last_lw_residual_hw_delta_abs_mean = residual_delta_abs_mean.detach()
         router_jitter_injected = int(router_jitter_enabled and self.training)
         # E2 ablation: fixed uniform router — bypass learned routing weights
         if bool(getattr(self.config, "wavelet_router_fixed_uniform", False)):
@@ -6699,39 +6733,20 @@ class PaTHAttention(nn.Module):
             router_mode = "sigmoid_signed"
 
         else:
-            raise ValueError(f"Unknown router_sigmoid_mode: {router_sigmoid_mode}")        
-        # if router_sigmoid_mode == "softmax":
-        #     pi = torch.softmax(router_logits / tau, dim=-1)
-        #     pi_scale = pi[..., 1:]
-        #     router_mode = "softmax"
-        # else:
-        #     g = torch.sigmoid(router_logits[..., 1:] / tau)
-        #     sum_g = g.sum(dim=-1, keepdim=True).clamp_min(eps)
-        #     w = g / sum_g
-        #     if router_sigmoid_mode == "with_null":
-        #         g0_gate = torch.sigmoid(router_logits[..., 0:1] / tau)
-        #         pi_scale = g0_gate * w
-        #         pi_null = (1.0 - g0_gate).clamp(min=0.0, max=1.0)
-        #         router_mode = "sigmoid_with_null"
-        #     else:
-        #         alpha_gate = g.mean(dim=-1, keepdim=True)
-        #         pi_scale = alpha_gate * w
-        #         pi_null = (1.0 - alpha_gate).clamp(min=0.0, max=1.0)
-        #         router_mode = "sigmoid_no_null"
-        #     pi = torch.cat([pi_null, pi_scale], dim=-1)
+            raise ValueError(f"Unknown router_sigmoid_mode: {router_sigmoid_mode}")
 
-        # Optional forward-only do(.) intervention for causal analysis.
         pi = self._apply_ctxscale_do_intervention(
             pi=pi,
             layer_idx=lid,
         )
-        if pi_lw_shared is not None and pi.dim() == 4 and pi_lw_shared.dim() == 4:
-            residual_router_divergence = (pi - pi_lw_shared.to(device=pi.device, dtype=pi.dtype)).abs().mean()
-        self._last_lw_residual_hw_divergence = residual_router_divergence.detach()
         # IMPORTANT: pi_scale must be derived from post-intervention pi.
         # Otherwise do(scale) has no effect on the final bias path.
         pi_scale = pi[..., 1:]
-        router_headwise = bool(pi.dim() == 4)
+        if pi.dim() != 3:
+            raise ValueError(
+                "Head-wise wavelet routing has been removed; "
+                f"router probabilities must be 3D, got {tuple(pi.shape)}."
+            )
         router_mode_is_signed = router_mode == "sigmoid_signed"
 
         def _router_diag_prob_dist(pi_tensor: torch.Tensor) -> torch.Tensor:
@@ -7173,15 +7188,11 @@ class PaTHAttention(nn.Module):
                     analysis_q_count += int(B * int(q_abs_a.numel()))
 
             bias_chunk = torch.zeros((B, q1 - q0, T), device=device, dtype=torch.float32)
-            bias_chunk_head = None
             if self.wavelet_logit_bias_debug_assert:
                 assert bias_chunk.shape == (B, q1 - q0, T)
             if use_mlp_bias_baseline:
                 # Param-matched non-wavelet baseline: low-rank U@V^T without pi-mixture.
                 u_q = torch.tanh(router_logits[:, q0:q1, 1:] / tau)
-                if u_q.dim() == 4:
-                    # Keep compatibility for mlp_bias_baseline_v0 by reducing head-wise router to shared router.
-                    u_q = u_q.mean(dim=2)
                 beta_ref = beta_m[:, q0:q1]
                 if use_scale_coupled_shift:
                     beta_scale = torch.tanh(beta_ref)
@@ -7211,9 +7222,6 @@ class PaTHAttention(nn.Module):
                 perm = None
                 if basis_control == "permute_scales":
                     perm = self._wavelet_basis_perm(K=K, layer_idx=lid, device=device)
-                if router_headwise:
-                    H_router = int(pi_scale.shape[2])
-                    bias_chunk_head = torch.zeros((B, H_router, q1 - q0, T), device=device, dtype=torch.float32)
                 use_relative_position = bool(getattr(self, "wavelet_ctxscale_use_relative_position", False))
                 center_pos_ratio = float(getattr(self, "wavelet_ctxscale_center_pos_ratio", 0.0))
                 center_pos_ratio = max(0.0, min(1.0, center_pos_ratio))
@@ -7280,26 +7288,18 @@ class PaTHAttention(nn.Module):
                         _mean_k = (basis_table * _causal).sum(dim=-1, keepdim=True) / _cnt
                         basis_table = basis_table - _mean_k
                     if not getattr(self, "wavelet_logit_bias_norm_disable", False):
-                        basis_table = self._rms_norm_last_dim(basis_table, eps=eps)
+                        basis_table = self._rms_norm_wavelet_basis(basis_table, q0=q0, eps=eps)
                     if getattr(self, "_pat234_cap", None) is not None:  # PAT-234 stage probe (default off)
                         self._pat234_cap.setdefault("S1_postnorm", []).append((int(lid), int(scale_idx), int(q0), basis_table.detach().float().cpu()))
                     basis_table = self._maybe_clamp_p99(basis_table)
                     if getattr(self, "_pat234_cap", None) is not None:
                         self._pat234_cap.setdefault("S2_postp99", []).append((int(lid), int(scale_idx), int(q0), basis_table.detach().float().cpu()))
-                    if router_headwise:
-                        weight_h = pi_scale[:, q0:q1, :, i].permute(0, 2, 1).unsqueeze(-1)
-                        contrib_i_head = weight_h * basis_table.unsqueeze(1)
-                        if far_mask is not None:
-                            contrib_i_head = contrib_i_head * far_mask.to(dtype=torch.float32).unsqueeze(1)
-                        bias_chunk_head = bias_chunk_head + contrib_i_head
-                        contrib_i = contrib_i_head.mean(dim=1)
-                    else:
-                        contrib_i = pi_scale[:, q0:q1, i].unsqueeze(-1) * basis_table
-                        if getattr(self, "_pat234_cap", None) is not None:  # PAT-234: post-gain per scale
-                            self._pat234_cap.setdefault("S3_postgain", []).append((int(lid), int(scale_idx), int(q0), contrib_i.detach().float().cpu()))
-                        if far_mask is not None:
-                            contrib_i = contrib_i * far_mask.to(dtype=torch.float32)
-                        bias_chunk = bias_chunk + contrib_i
+                    contrib_i = pi_scale[:, q0:q1, i].unsqueeze(-1) * basis_table
+                    if getattr(self, "_pat234_cap", None) is not None:  # PAT-234: post-gain per scale
+                        self._pat234_cap.setdefault("S3_postgain", []).append((int(lid), int(scale_idx), int(q0), contrib_i.detach().float().cpu()))
+                    if far_mask is not None:
+                        contrib_i = contrib_i * far_mask.to(dtype=torch.float32)
+                    bias_chunk = bias_chunk + contrib_i
                     if analysis_enabled and analysis_q_local is not None and analysis_q_abs is not None:
                         _analysis_accumulate_component(
                             int(scale_idx),
@@ -7308,29 +7308,35 @@ class PaTHAttention(nn.Module):
                             analysis_q_local,
                             analysis_q_abs,
                         )
-                if router_headwise and bias_chunk_head is not None:
-                    bias_chunk = bias_chunk_head.mean(dim=1)
-
+                if self.multiscale_norm in (
+                    "sqrt_keff_detach",
+                    "keff_detach",
+                ):
+                    self._validate_dynamic_multiscale_norm_router(
+                        self.multiscale_norm,
+                        router_mode,
+                    )
+                    # Use independent scale gates only; the null gate is excluded.
+                    g_chunk = g[:, q0:q1, :]
+                    multiscale_scale = self._get_sqrt_keff_detach_scale(
+                        g_chunk,
+                        eps=eps,
+                        K=self.wavelet_ctxscale_k,
+                    )
+                    bias_chunk = bias_chunk * multiscale_scale.to(
+                        dtype=bias_chunk.dtype
+                    )
+                else:
+                    bias_chunk = bias_chunk * self.multiscale_sum_scale
             if far_mask is not None:
                 bias_chunk = bias_chunk * far_mask.to(dtype=torch.float32)
-                if bias_chunk_head is not None:
-                    bias_chunk_head = bias_chunk_head * far_mask.to(dtype=torch.float32).unsqueeze(1)
             if far_over_mask is not None:
                 over_m = far_over_mask.to(dtype=torch.float32)
                 keep_m = 1.0 - over_m
                 bias_chunk = bias_chunk * keep_m + bias_chunk * over_m * float(far_over_alpha)
-                if bias_chunk_head is not None:
-                    over_mh = over_m.unsqueeze(1)
-                    keep_mh = 1.0 - over_mh
-                    bias_chunk_head = (
-                        bias_chunk_head * keep_mh
-                        + bias_chunk_head * over_mh * float(far_over_alpha)
-                    )
 
             if enable_film:
                 pi_chunk = pi[:, q0:q1, :]
-                if pi_chunk.dim() == 4:
-                    pi_chunk = pi_chunk.mean(dim=2)
                 rho_chunk = rho[:, q0:q1]
                 bias_chunk, s_raw, t_raw, scale_m, shift_m = self._ctxscale_apply_bias_film(
                     bias_chunk=bias_chunk,
@@ -7351,27 +7357,8 @@ class PaTHAttention(nn.Module):
                 sat_s_num += int((s_raw.detach().abs() > 7.5).sum().item())
                 sat_t_num += int((t_raw.detach().abs() > 7.5).sum().item())
                 sat_den += int(s_raw.numel())
-                if bias_chunk_head is not None:
-                    bias_chunk_head = scale_m.unsqueeze(1) * bias_chunk_head + shift_m.unsqueeze(1)
-                    bias_chunk = bias_chunk_head.mean(dim=1)
-
             g_bias_max = float(getattr(self.config, "wavelet_ctxscale_g_bias_max", self.wavelet_ctxscale_g_bias_max))
-            if bias_chunk_head is not None:
-                if use_head_gate and g_head is not None:
-                    eff_to_add = bias_chunk_head * g_head.view(1, -1, 1, 1)
-                else:
-                    eff_to_add = g_layer * bias_chunk_head
-                eff_to_add = eff_to_add.clamp(min=-g_bias_max, max=g_bias_max)
-                if not torch.isfinite(eff_to_add).all():
-                    _warn_nonfinite("g_bias_headwise")
-                    eff_to_add = torch.nan_to_num(
-                        eff_to_add,
-                        nan=0.0,
-                        posinf=g_bias_max,
-                        neginf=-g_bias_max,
-                    )
-                eff_chunk = eff_to_add.mean(dim=1)
-            elif use_head_gate and g_head is not None:
+            if use_head_gate and g_head is not None:
                 eff_to_add = bias_chunk.unsqueeze(1) * g_head.view(1, -1, 1, 1)
                 eff_to_add = eff_to_add.clamp(min=-g_bias_max, max=g_bias_max)
                 if not torch.isfinite(eff_to_add).all():
@@ -7503,7 +7490,6 @@ class PaTHAttention(nn.Module):
                 "layer": int(lid),
                 "mode": str(do_mode),
                 "scope": str(do_scope),
-                "router_headwise": int(bool(router_headwise)),
                 "num_scales": int(K),
                 "target_heads": [int(x) for x in do_target_heads],
                 "target_head_for_check": int(do_target_head),
@@ -7908,10 +7894,6 @@ class PaTHAttention(nn.Module):
                 "flip_probability_estimate": float(router_jitter_flip_probability_estimate),
                 "router_entropy_reg_loss": float(router_entropy_reg_loss.detach().item()),
                 "router_entropy_reg_active_frac": float(router_entropy_reg_active_frac.item()),
-                "residual_delta_l2": float(residual_delta_l2.detach().item()),
-                "residual_delta_abs_mean": float(residual_delta_abs_mean.detach().item()),
-                "lw_residual_hw_phase": str(lw_residual_hw_phase),
-                "residual_router_divergence": float(residual_router_divergence.detach().item()),
                 "sum_g_mean": float(sum_g_mean),
                 "sum_g_p90": float(sum_g_p90),
                 "g0_mean": float(g0_mean),
@@ -8062,9 +8044,6 @@ class PaTHAttention(nn.Module):
                 "flip_prob": [],
                 "reg_loss": [],
                 "reg_active_frac": [],
-                "res_delta_l2": [],
-                "res_delta_abs": [],
-                "res_div": [],
                 "emitted": False,
             }
             cache[step_i] = rec
@@ -8079,9 +8058,6 @@ class PaTHAttention(nn.Module):
             ("flip_probability_estimate", "flip_prob"),
             ("router_entropy_reg_loss", "reg_loss"),
             ("router_entropy_reg_active_frac", "reg_active_frac"),
-            ("residual_delta_l2", "res_delta_l2"),
-            ("residual_delta_abs_mean", "res_delta_abs"),
-            ("residual_router_divergence", "res_div"),
         ):
             try:
                 v = float(payload.get(key, float("nan")))
@@ -8105,9 +8081,6 @@ class PaTHAttention(nn.Module):
         flip_prob_est, _ = self._finite_float_stats(rec["flip_prob"])
         reg_loss_mean, _ = self._finite_float_stats(rec["reg_loss"])
         reg_active_frac_mean, _ = self._finite_float_stats(rec["reg_active_frac"])
-        res_delta_l2_mean, _ = self._finite_float_stats(rec["res_delta_l2"])
-        res_delta_abs_mean, _ = self._finite_float_stats(rec["res_delta_abs"])
-        res_div_mean, _ = self._finite_float_stats(rec["res_div"])
         self._k1_emit_log(
             f"[wavelet router global stats] step={step_i} "
             f"pi_entropy_mean={pi_entropy_mean:.6e} pi_entropy_std={pi_entropy_std:.6e} "
@@ -8116,9 +8089,6 @@ class PaTHAttention(nn.Module):
             f"flip_probability_estimate={flip_prob_est:.6e} "
             f"router_entropy_reg_loss={reg_loss_mean:.6e} "
             f"router_entropy_reg_active_frac={reg_active_frac_mean:.6e} "
-            f"residual_delta_l2={res_delta_l2_mean:.6e} "
-            f"residual_delta_abs_mean={res_delta_abs_mean:.6e} "
-            f"residual_router_divergence={res_div_mean:.6e} "
             f"layers_seen={len(rec['seen_layers'])} total_layers={int(total_layers) if total_layers is not None else -1}"
         )
         rec["emitted"] = True
@@ -8209,10 +8179,6 @@ class PaTHAttention(nn.Module):
             f"p90={payload.get('pi_margin_p90', float('nan')):.6e} "
             f"| router_entropy_reg_loss={payload.get('router_entropy_reg_loss', float('nan')):.6e} "
             f"router_entropy_reg_active_frac={payload.get('router_entropy_reg_active_frac', float('nan')):.6e} "
-            f"residual_delta_l2={payload.get('residual_delta_l2', float('nan')):.6e} "
-            f"residual_delta_abs_mean={payload.get('residual_delta_abs_mean', float('nan')):.6e} "
-            f"lw_residual_hw_phase={payload.get('lw_residual_hw_phase', 'disabled')} "
-            f"residual_router_divergence={payload.get('residual_router_divergence', float('nan')):.6e} "
             f"null_mean={payload['pi_null_mean']:.6e} | "
             f"rho p50={payload['rho_p50']:.6e} p90={payload['rho_p90']:.6e} p99={payload['rho_p99']:.6e} | "
             f"beta p50={payload['beta_p50']:.6e} p90={payload['beta_p90']:.6e} "
@@ -9941,10 +9907,6 @@ class PaTHAttention(nn.Module):
             self._last_pat82_qk_stage_debug = None
         self._last_router_entropy_reg_loss = hidden_states.new_zeros([])
         self._last_router_entropy_reg_active_frac = hidden_states.new_zeros([])
-        self._last_lw_residual_hw_l2_loss = hidden_states.new_zeros([])
-        self._last_lw_residual_hw_delta_l2 = hidden_states.new_zeros([])
-        self._last_lw_residual_hw_delta_abs_mean = hidden_states.new_zeros([])
-        self._last_lw_residual_hw_divergence = hidden_states.new_zeros([])
         global_step = kwargs.get("global_step", getattr(self.config, "router_global_step", None))
         router1, router2 = None, None
         record_router1, record_router2 = None, None
@@ -10270,9 +10232,6 @@ class PaTHAttention(nn.Module):
                 reg_loss = getattr(self, "_last_router_entropy_reg_loss", None)
                 if torch.is_tensor(reg_loss):
                     dis_loss = dis_loss + reg_loss.to(dtype=dis_loss.dtype, device=dis_loss.device)
-                residual_l2_loss = getattr(self, "_last_lw_residual_hw_l2_loss", None)
-                if torch.is_tensor(residual_l2_loss):
-                    dis_loss = dis_loss + residual_l2_loss.to(dtype=dis_loss.dtype, device=dis_loss.device)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o.to(hidden_states.dtype))
             if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:

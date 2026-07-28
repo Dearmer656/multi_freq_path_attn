@@ -14,6 +14,148 @@ from fla.ops.path_attn.parallel import parallel_path_attention
 from fla.utils import assert_close, device, is_intel_alchemist
 
 
+@pytest.mark.parametrize(
+    (
+        "router_mode",
+        "configured_norm",
+        "allow_with_null_norm",
+        "K",
+        "expected_norm",
+        "expected_scale",
+    ),
+    [
+        ("with_null", "sqrt", False, 4, "none", 1.0),
+        ("with_null", "sqrt", True, 4, "sqrt", 0.5),
+        (
+            "with_null_independent_scales",
+            "sqrt",
+            False,
+            4,
+            "sqrt",
+            0.5,
+        ),
+    ],
+)
+def test_multiscale_norm_respects_router_semantics(
+    router_mode: str,
+    configured_norm: str,
+    allow_with_null_norm: bool,
+    K: int,
+    expected_norm: str,
+    expected_scale: float,
+):
+    attention = PaTHAttention.__new__(PaTHAttention)
+    effective_norm = attention._resolve_multiscale_norm(
+        configured_norm,
+        router_mode,
+        allow_with_null_norm,
+    )
+    effective_scale = attention._get_multiscale_sum_scale(effective_norm, K)
+
+    assert effective_norm == expected_norm
+    assert effective_scale == pytest.approx(expected_scale)
+
+
+@pytest.mark.parametrize("mode", ["sqrt_keff_detach", "keff_detach"])
+def test_keff_norm_uses_runtime_scale(mode: str):
+    attention = PaTHAttention.__new__(PaTHAttention)
+
+    assert attention._get_multiscale_sum_scale(mode, 4) == 1.0
+
+
+def test_sqrt_keff_detach_scale_matches_effective_gate_count():
+    gates = torch.tensor(
+        [
+            [[1.0, 1.0, 1.0, 1.0]],
+            [[1.0, 0.0, 0.0, 0.0]],
+        ]
+    )
+
+    scale = PaTHAttention._get_sqrt_keff_detach_scale(
+        gates,
+        eps=1e-6,
+        K=4,
+    )
+
+    assert scale.shape == (2, 1, 1)
+    assert torch.allclose(scale[:, 0, 0], torch.tensor([0.5, 1.0]))
+
+
+def test_sqrt_keff_detach_keeps_gate_contribution_gradient():
+    gates = torch.tensor(
+        [[[0.8, 0.4]]],
+        requires_grad=True,
+    )
+    basis = torch.tensor([[[[2.0, -1.0], [1.0, 3.0]]]])
+    scale = PaTHAttention._get_sqrt_keff_detach_scale(
+        gates,
+        eps=1e-6,
+        K=2,
+    )
+    bias = (gates.unsqueeze(-1) * basis).sum(dim=-2)
+
+    (bias * scale).sum().backward()
+
+    assert not scale.requires_grad
+    assert gates.grad is not None
+    assert torch.count_nonzero(gates.grad) == gates.numel()
+
+
+@pytest.mark.parametrize(
+    "router_mode",
+    ["softmax", "sigmoid_with_null", "sigmoid_no_null", "sigmoid_signed"],
+)
+def test_sqrt_keff_detach_rejects_non_independent_router(
+    router_mode: str,
+):
+    with pytest.raises(
+        ValueError,
+        match="only supported for with_null_independent_scales routing",
+    ):
+        PaTHAttention._validate_dynamic_multiscale_norm_router(
+            "sqrt_keff_detach",
+            router_mode,
+        )
+
+
+def test_ctxscale_intervention_keeps_shared_router_shape():
+    attention = PaTHAttention.__new__(PaTHAttention)
+    torch.nn.Module.__init__(attention)
+    attention.num_heads = 4
+    attention._ctxscale_do_spec = {
+        "enabled": True,
+        "mode": "uniform",
+        "target_layer": 0,
+        "target_heads": "all",
+    }
+    pi = torch.softmax(torch.randn(2, 3, 5), dim=-1)
+
+    actual = attention._apply_ctxscale_do_intervention(pi=pi, layer_idx=0)
+
+    assert actual.shape == pi.shape
+    assert actual.dim() == 3
+    assert torch.count_nonzero(actual[..., 0]) == 0
+    assert torch.allclose(actual[..., 1:], torch.full_like(actual[..., 1:], 0.25))
+
+
+def test_ctxscale_intervention_rejects_per_head_target():
+    attention = PaTHAttention.__new__(PaTHAttention)
+    torch.nn.Module.__init__(attention)
+    attention.num_heads = 4
+    attention._ctxscale_do_spec = {
+        "enabled": True,
+        "mode": "null",
+        "target_layer": 0,
+        "target_head": 1,
+    }
+
+    with pytest.raises(ValueError, match="Per-head ctxscale intervention has been removed"):
+        attention._apply_ctxscale_do_intervention(
+            pi=torch.softmax(torch.randn(2, 3, 5), dim=-1),
+            layer_idx=0,
+        )
+
+
 def naive_path_attn(q, k, v, w, beta, g, scale, BT=64):
     original_dtype = q.dtype
     HQ = q.shape[2]
