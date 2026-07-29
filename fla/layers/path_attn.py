@@ -50,41 +50,12 @@ import os
 import torch
 from tqdm import tqdm
 
-def _tensor_stats(x: torch.Tensor, name: str):
-    if x is None:
-        return {f"{name}_is_none": True}
-    x_fp = x.detach()
-    finite = torch.isfinite(x_fp)
-    numel = x_fp.numel()
-    n_finite = int(finite.sum().item())
-    n_bad = int(numel - n_finite)
-    # use finite values for stats to avoid nan pollution
-    if n_finite > 0:
-        xf = x_fp[finite]
-        return {
-            f"{name}_shape": tuple(x_fp.shape),
-            f"{name}_dtype": str(x_fp.dtype),
-            f"{name}_device": str(x_fp.device),
-            f"{name}_numel": int(numel),
-            f"{name}_n_bad": n_bad,
-            f"{name}_mean": float(xf.mean().item()),
-            f"{name}_std": float(xf.std(unbiased=False).item()),
-            f"{name}_min": float(xf.min().item()),
-            f"{name}_max": float(xf.max().item()),
-        }
-    else:
-        return {
-            f"{name}_shape": tuple(x_fp.shape),
-            f"{name}_dtype": str(x_fp.dtype),
-            f"{name}_device": str(x_fp.device),
-            f"{name}_numel": int(numel),
-            f"{name}_n_bad": n_bad,
-        }
-
-def _log_stats(stats: dict, prefix: str = "[rel_record]"):
-    # keep it single-line-ish for grep
-    msg = prefix + " " + " ".join([f"{k}={v}" for k, v in stats.items()])
-    print(msg)
+SCALE_MULTIPLIER_DICT = {
+    'wavelet': 1.0,
+    'morlet': 3.0249,
+    'gaussian': 0.5316,
+    'linear': 0.7228
+}
 
 
 def _tensor_debug_summary_json(name: str, x: Optional[torch.Tensor]) -> Optional[dict]:
@@ -3141,7 +3112,6 @@ class PaTHAttention(nn.Module):
             self._capture_wavelet_gate_grad
         )
         self._wavelet_gate_grad_hook_param_id = id(self.wavelet_logit_bias_a)
-        _scale_multiplier = float(getattr(config, "wavelet_ctxscale_scale_multiplier", 1.0))
         # PAT-225: fixed-support log-uniform grid over [2^0, 2^14] for any K.
         # K=8 -> exponents 14*i/7 == 2*i, i.e. the production grid [2^0,2^2,...,2^14]
         # reproduced bit-exactly. K=1 -> geometric center of the support, 2^7 = 128
@@ -3193,13 +3163,13 @@ class PaTHAttention(nn.Module):
 
         self.register_buffer(
             "wavelet_ctxscale_scales",
-            torch.tensor([2.0 ** e * _scale_multiplier for e in _scale_exps], dtype=torch.float32),
+            torch.tensor([2.0 ** e * SCALE_MULTIPLIER_DICT[self.bias_type] for e in _scale_exps], dtype=torch.float32),
             persistent=False,
         )
         if layer_idx in (0, None):
             print(
                 f"[PAT-225] wavelet_ctxscale_k={_K} effective scales="
-                f"{[float(2.0 ** e * _scale_multiplier) for e in _scale_exps]}",
+                f"{[float(2.0 ** e * SCALE_MULTIPLIER_DICT[self.bias_type]) for e in _scale_exps]}",
                 flush=True,
             )
         self.wavelet_ctx_feat_ln = nn.LayerNorm(self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
@@ -7669,6 +7639,7 @@ class PaTHAttention(nn.Module):
                     "router_jitter_injected": int(router_jitter_injected),
                     "router_jitter_target_flip_probability": float(router_jitter_target_flip_probability),
                     "use_relative_position": int(bool(getattr(self, "wavelet_ctxscale_use_relative_position", False))),
+                    "center_pos_ratio": float(getattr(self, "wavelet_ctxscale_center_pos_ratio", 0.0)),
                     "scale_values": [float(scales[i].item()) for i in range(K)],
                     "scales": [float(scales[i].item()) for i in range(K)],
                     "K": int(K),
@@ -7919,6 +7890,7 @@ class PaTHAttention(nn.Module):
                 "cfg_disable_layer_gate": int(bool(getattr(self, "wavelet_ctxscale_disable_layer_gate", False))),
                 "cfg_use_head_gate": int(bool(getattr(self, "wavelet_ctxscale_use_head_gate", False))),
                 "use_relative_position": int(bool(getattr(self, "wavelet_ctxscale_use_relative_position", False))),
+                "center_pos_ratio": float(getattr(self, "wavelet_ctxscale_center_pos_ratio", 0.0)),
                 "scale_coupled_shift": int(use_scale_coupled_shift),
                 "abs_shift_causal": int(use_abs_shift_causal),
                 "shift_T_mode": str(shift_t_mode),
