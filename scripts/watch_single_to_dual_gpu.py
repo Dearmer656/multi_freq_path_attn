@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Watch a running 1-GPU fallback job and cancel it when 2-GPU placement is possible.
+"""Watch a 1-GPU fallback job and cancel it when 2-GPU placement is possible.
 
 Typical use:
 
@@ -12,8 +12,11 @@ Typical use:
 The script is intentionally conservative:
   - It only cancels the explicit fallback job id.
   - By default it requires a preferred pending job to exist.
-  - It requires the fallback job's node to have at least one additional free GPU
-    of the same type, so the preferred 2-GPU job can run on that node.
+  - If the preferred job is already active, it cancels the fallback immediately
+    to avoid two jobs writing the same output directory.
+  - Otherwise it requires the fallback job's node to have at least one
+    additional free GPU of the same type, so the preferred 2-GPU job can run on
+    that node.
   - Without --execute it is dry-run only.
 """
 
@@ -26,6 +29,19 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+
+
+ACTIVE_FALLBACK_STATES = {"PENDING", "RUNNING", "CONFIGURING", "COMPLETING", "SUSPENDED"}
+PREFERRED_ACTIVE_STATES = {"RUNNING", "CONFIGURING", "COMPLETING", "SUSPENDED"}
+PREFERRED_DONE_STATES = {
+    "COMPLETED",
+    "CANCELLED",
+    "FAILED",
+    "TIMEOUT",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+}
 
 
 GPU_ALIASES = {
@@ -207,21 +223,58 @@ def expand_simple_node_expr(expr: str) -> set[str]:
     return result
 
 
+def cancel_fallback_if_active(
+    args: argparse.Namespace,
+    fallback: Job | None,
+    *,
+    reason: str,
+) -> bool:
+    if fallback is None:
+        log(f"fallback job {args.fallback_job} no longer exists; {reason}; exiting")
+        return True
+    if fallback.state not in ACTIVE_FALLBACK_STATES:
+        log(
+            f"fallback job {fallback.job_id} state={fallback.state}; "
+            f"{reason}; exiting"
+        )
+        return True
+
+    action = f"cancel fallback job {fallback.job_id} state={fallback.state}: {reason}"
+    if args.execute:
+        log(f"EXECUTE: {action}")
+        run_cmd(["scancel", str(fallback.job_id)])
+    else:
+        log(f"DRY-RUN: would {action}. Add --execute to actually scancel.")
+    return bool(args.exit_after_cancel)
+
+
 def check_once(args: argparse.Namespace) -> bool:
+    fallback = get_job(args.fallback_job)
     preferred = None
     if args.preferred_job:
         preferred = get_job(args.preferred_job)
         if preferred is None:
             log(f"preferred job {args.preferred_job} no longer exists; exiting")
             return True
-        if preferred.state != "PENDING":
-            log(
-                f"preferred job {preferred.job_id} state={preferred.state}; "
-                "preferred is no longer pending, exiting"
+        if preferred.state in PREFERRED_ACTIVE_STATES:
+            return cancel_fallback_if_active(
+                args,
+                fallback,
+                reason=f"preferred job {preferred.job_id} is already {preferred.state}",
             )
-            return True
+        if preferred.state in PREFERRED_DONE_STATES:
+            return cancel_fallback_if_active(
+                args,
+                fallback,
+                reason=(
+                    f"preferred job {preferred.job_id} already ended with "
+                    f"state={preferred.state}"
+                ),
+            )
+        if preferred.state != "PENDING":
+            log(f"preferred job {preferred.job_id} state={preferred.state}; waiting")
+            return False
 
-    fallback = get_job(args.fallback_job)
     if fallback is None:
         log(f"fallback job {args.fallback_job} no longer exists; exiting")
         return True

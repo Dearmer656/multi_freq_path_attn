@@ -2647,9 +2647,6 @@ class PaTHAttention(nn.Module):
         self.wavelet_logit_bias_debug_assert = self._as_bool(
             getattr(config, "wavelet_logit_bias_debug_assert", False), default=False
         )
-        self.wavelet_logit_bias_clamp_enable = self._as_bool(
-            getattr(config, "wavelet_logit_bias_clamp_enable", True), default=False
-        )
         self.wavelet_logit_bias_rms_scope = str(
             getattr(config, "wavelet_logit_bias_rms_scope", "context")
         ).strip().lower()
@@ -2678,9 +2675,6 @@ class PaTHAttention(nn.Module):
         self.wavelet_logit_bias_norm_disable = self._as_bool(
             getattr(config, "wavelet_logit_bias_norm_disable", False), default=False
         )
-        self.wavelet_logit_bias_clamp_quantile = float(getattr(config, "wavelet_logit_bias_clamp_quantile", 0.99))
-        self.wavelet_logit_bias_clamp_min = float(getattr(config, "wavelet_logit_bias_clamp_min", 0.0))
-        self.wavelet_logit_bias_clamp_scale = float(getattr(config, "wavelet_logit_bias_clamp_scale", 1.0))
         self.wavelet_logit_bias_log_sample_tokens = max(
             1, int(getattr(config, "wavelet_logit_bias_log_sample_tokens", 64))
         )
@@ -3197,7 +3191,7 @@ class PaTHAttention(nn.Module):
             getattr(
                 config,
                 "wavelet_ctxscale_amplitude_multiplier",
-                getattr(config, "amplitude_multiplier", 1.0),
+                getattr(config, "amplitude_multiplier", -1.0),
             )
         )
         if not math.isfinite(self.wavelet_ctxscale_amplitude_multiplier):
@@ -3206,7 +3200,7 @@ class PaTHAttention(nn.Module):
                 f"must be finite, got {self.wavelet_ctxscale_amplitude_multiplier}"
             )
         self.wavelet_ctxscale_amplitude_multiplier_override = (
-            self.wavelet_ctxscale_amplitude_multiplier != 1.0
+            self.wavelet_ctxscale_amplitude_multiplier != -1.0
         )
 
         self.multiscale_sum_scale = self._get_multiscale_sum_scale(
@@ -3528,6 +3522,9 @@ class PaTHAttention(nn.Module):
             multiscale_sum_scale = 1.0 / float(K)
         elif multiscale_norm in ("sqrt_keff_detach", "keff_detach"):
             # Runtime-dependent normalization is applied in forward.
+            multiscale_sum_scale = 1.0
+        elif multiscale_norm == "rms":
+            # Runtime context-length RMS over the already summed multi-scale bias.
             multiscale_sum_scale = 1.0
         elif multiscale_norm == "gram":
             multiscale_sum_scale = float(
@@ -5745,16 +5742,6 @@ class PaTHAttention(nn.Module):
             wavelet_dtt=wavelet_dtt,
         )
         delta_table_hat = self.rms_normalize(delta_table_raw, eps=float(self.wavelet_logit_bias_eps))
-        if self.wavelet_logit_bias_clamp_enable:
-            abs_vals = delta_table_hat.abs().reshape(-1)
-            q = float(self.wavelet_logit_bias_clamp_quantile)
-            q = min(max(q, 0.5), 0.9999)
-            clamp_ref = torch.quantile(abs_vals, q)
-            clamp_v = torch.clamp(
-                clamp_ref * float(self.wavelet_logit_bias_clamp_scale),
-                min=float(self.wavelet_logit_bias_clamp_min),
-            )
-            delta_table_hat = delta_table_hat.clamp(min=-clamp_v, max=clamp_v)
         delta_index = self._get_delta_index_matrix(T, device)
         b_hat = self.apply_causal_indexing(delta_table_hat, delta_index, future_2d)  # [T,T]
         g_layer = F.softplus(self.wavelet_logit_bias_a).to(device=device, dtype=torch.float32)
@@ -5889,28 +5876,6 @@ class PaTHAttention(nn.Module):
         u: torch.Tensor,
     ) -> torch.Tensor:
         return (1.0 - u.abs() / math.sqrt(3.0)).clamp_min(0.0)
-
-    def _maybe_clamp_p99(self, x: torch.Tensor):
-        if not self.wavelet_logit_bias_clamp_enable:
-            return x.to(dtype=torch.float32)
-        x32 = x.to(dtype=torch.float32)
-        abs_flat = x32.detach().abs().reshape(-1)
-        if abs_flat.numel() == 0:
-            return x32
-        q = float(self.wavelet_logit_bias_clamp_quantile)
-        q = min(max(q, 0.5), 0.9999)
-        max_samples = max(128, int(self.wavelet_ctxscale_max_log_samples))
-        if abs_flat.numel() > max_samples:
-            idx = torch.linspace(0, abs_flat.numel() - 1, steps=max_samples, device=abs_flat.device).long()
-            abs_eval = abs_flat.index_select(0, idx)
-        else:
-            abs_eval = abs_flat
-        clamp_ref = torch.quantile(abs_eval, q)
-        clamp_v = torch.clamp(
-            clamp_ref * float(self.wavelet_logit_bias_clamp_scale),
-            min=float(self.wavelet_logit_bias_clamp_min),
-        )
-        return x32.clamp(min=-clamp_v, max=clamp_v)
 
     def _resolve_router_jitter_std(
         self,
@@ -6659,11 +6624,15 @@ class PaTHAttention(nn.Module):
         g0_gate = None
         alpha_gate = None
         sum_g = None
+        pi_scale_without_null_gate = None
+        nonnull_gate = None
         if router_sigmoid_mode == "softmax":
             # All options compete together: [null, scale1, ..., scaleK]
             pi = torch.softmax(router_logits / tau, dim=-1)
             pi_scale = pi[..., 1:]
             pi_null = pi[..., 0:1]
+            nonnull_gate = (1.0 - pi_null).clamp(min=0.0, max=1.0)
+            pi_scale_without_null_gate = pi_scale / nonnull_gate.clamp_min(eps)
             router_mode = "softmax"
 
         elif router_sigmoid_mode == "with_null":
@@ -6675,6 +6644,8 @@ class PaTHAttention(nn.Module):
             w = g / sum_g                                                        # conditional scale distribution
 
             g0_gate = torch.sigmoid(router_logits[..., 0:1] / tau)               # non-null mass
+            nonnull_gate = g0_gate
+            pi_scale_without_null_gate = w
             pi_scale = g0_gate * w                                               # total non-null mass = g0_gate
             pi_null = (1.0 - g0_gate).clamp(min=0.0, max=1.0)
             pi = torch.cat([pi_null, pi_scale], dim=-1)
@@ -6689,6 +6660,8 @@ class PaTHAttention(nn.Module):
             w = g / sum_g
 
             alpha_gate = g.mean(dim=-1, keepdim=True)                            # non-null mass
+            nonnull_gate = alpha_gate
+            pi_scale_without_null_gate = w
             pi_scale = alpha_gate * w
             pi_null = (1.0 - alpha_gate).clamp(min=0.0, max=1.0)
             pi = torch.cat([pi_null, pi_scale], dim=-1)
@@ -6705,6 +6678,8 @@ class PaTHAttention(nn.Module):
             # This mode should be used only if downstream logic does not require pi to be a normalized distribution.
             g = torch.sigmoid(router_logits[..., 1:] / tau)                      # [..., K]
             g0_gate = torch.sigmoid(router_logits[..., 0:1] / tau)               # non-null gate
+            nonnull_gate = g0_gate
+            pi_scale_without_null_gate = g
 
             pi_scale = g0_gate * g                                               # independent multi-scale activation
             pi_null = (1.0 - g0_gate).clamp(min=0.0, max=1.0)
@@ -6716,6 +6691,8 @@ class PaTHAttention(nn.Module):
             # (pi=0 is the natural "off"). pi is NOT a probability simplex (like the
             # independent_scales mode). Negative pi flips the ricker's sign at inference.
             g = 2.0 * torch.sigmoid(router_logits[..., 1:] / tau) - 1.0
+            nonnull_gate = torch.ones_like(router_logits[..., 0:1])
+            pi_scale_without_null_gate = g
             pi_scale = g
             pi_null = torch.zeros_like(router_logits[..., 0:1])
             pi = torch.cat([pi_null, pi_scale], dim=-1)
@@ -6737,6 +6714,10 @@ class PaTHAttention(nn.Module):
                 f"router probabilities must be 3D, got {tuple(pi.shape)}."
             )
         router_mode_is_signed = router_mode == "sigmoid_signed"
+        multiscale_rms_after_sum = (
+            self.multiscale_norm_requested == "rms"
+            and int(self.wavelet_ctxscale_k) > 1
+        )
 
         def _router_diag_prob_dist(pi_tensor: torch.Tensor) -> torch.Tensor:
             if router_mode_is_signed:
@@ -6781,6 +6762,11 @@ class PaTHAttention(nn.Module):
             except Exception:
                 do_target_heads = []
             do_target_head_for_check = int(do_stat.get("target_head_for_check", -1))
+            if multiscale_rms_after_sum:
+                # Intervention edits pi directly, so rebuild the separated
+                # scale-mix and non-null gate from the post-intervention pi.
+                nonnull_gate = (1.0 - pi[..., 0:1]).clamp(min=0.0, max=1.0)
+                pi_scale_without_null_gate = pi_scale / nonnull_gate.clamp_min(eps)
             if do_target_head_for_check >= 0 and do_target_head_for_check not in do_target_heads:
                 do_target_heads = [do_target_head_for_check] + do_target_heads
             H_for_do = int(E_base_raw.shape[1])
@@ -7184,6 +7170,14 @@ class PaTHAttention(nn.Module):
             bias_chunk = torch.zeros((B, q1 - q0, T), device=device, dtype=torch.float32)
             if self.wavelet_logit_bias_debug_assert:
                 assert bias_chunk.shape == (B, q1 - q0, T)
+            nonnull_gate_chunk = None
+            pi_scale_for_sum = pi_scale[:, q0:q1, :]
+            if multiscale_rms_after_sum:
+                # For post-sum RMS, keep the null/non-null gate outside the RMS.
+                # First sum conditional scale contributions, RMS over full context,
+                # then multiply by the post-intervention non-null gate.
+                nonnull_gate_chunk = nonnull_gate[:, q0:q1, :]
+                pi_scale_for_sum = pi_scale_without_null_gate[:, q0:q1, :]
             if use_mlp_bias_baseline:
                 # Param-matched non-wavelet baseline: low-rank U@V^T without pi-mixture.
                 u_q = torch.tanh(router_logits[:, q0:q1, 1:] / tau)
@@ -7197,7 +7191,6 @@ class PaTHAttention(nn.Module):
                 v_k = self.mlp_bias_basis_mlp(key_pos)
                 v_k = self.mlp_bias_basis_ln(v_k)
                 v_k = self._rms_norm_last_dim(v_k, eps=eps)
-                v_k = self._maybe_clamp_p99(v_k)
                 bias_chunk = torch.einsum("bqk,tk->bqt", u_q, v_k)
                 if analysis_enabled and analysis_q_local is not None and analysis_q_abs is not None:
                     k_mlp = min(K, int(u_q.shape[-1]), int(v_k.shape[-1]))
@@ -7295,31 +7288,14 @@ class PaTHAttention(nn.Module):
 
                     if (
                         not skip_common_basis_center_norm
-                        and getattr(self, "wavelet_logit_bias_center", False)
-                        and self.bias_type != "rotary"
-                    ):
-                        # PAT-234 C: remove softmax-invisible key-independent component over
-                        # causal keys (k <= query) before normalization. basis_table: [B, q_chunk, T].
-                        _qc = basis_table.shape[-2]
-                        _Tk = basis_table.shape[-1]
-                        _qabs = torch.arange(q0, q0 + _qc, device=basis_table.device).view(1, _qc, 1)
-                        _kidx = torch.arange(_Tk, device=basis_table.device).view(1, 1, _Tk)
-                        _causal = (_kidx <= _qabs).to(basis_table.dtype)
-                        _cnt = _causal.sum(dim=-1, keepdim=True).clamp_min(1.0)
-                        _mean_k = (basis_table * _causal).sum(dim=-1, keepdim=True) / _cnt
-                        basis_table = basis_table - _mean_k
-                    if (
-                        not skip_common_basis_center_norm
                         and not getattr(self, "wavelet_logit_bias_norm_disable", False)
+                        and not multiscale_rms_after_sum
                     ):
                         basis_table = self._rms_norm_wavelet_basis(basis_table, q0=q0, eps=eps)
                     if getattr(self, "_pat234_cap", None) is not None:  # PAT-234 stage probe (default off)
                         self._pat234_cap.setdefault("S1_postnorm", []).append((int(lid), int(scale_idx), int(q0), basis_table.detach().float().cpu()))
-                    basis_table = self._maybe_clamp_p99(basis_table)
-                    if getattr(self, "_pat234_cap", None) is not None:
-                        self._pat234_cap.setdefault("S2_postp99", []).append((int(lid), int(scale_idx), int(q0), basis_table.detach().float().cpu()))
 
-                    contrib_i = pi_scale[:, q0:q1, i].unsqueeze(-1) * basis_table ### weight * wavelet basis
+                    contrib_i = pi_scale_for_sum[..., i].unsqueeze(-1) * basis_table ### weight * wavelet basis
 
                     if getattr(self, "_pat234_cap", None) is not None:  # PAT-234: post-gain per scale
                         self._pat234_cap.setdefault("S3_postgain", []).append((int(lid), int(scale_idx), int(q0), contrib_i.detach().float().cpu()))
@@ -7347,6 +7323,28 @@ class PaTHAttention(nn.Module):
                                 device=device,
                                 dtype=torch.float32,
                             )
+                        )
+                elif multiscale_rms_after_sum:
+                    # Context-length RMS over the post-scale-sum bias pattern.
+                    # This intentionally uses the full key/context axis, not a causal prefix.
+                    bias_chunk_f = bias_chunk.to(torch.float32)
+                    multiscale_denom = torch.sqrt(
+                        bias_chunk_f.pow(2).mean(dim=-1, keepdim=True).clamp_min(0.0)
+                        + float(eps)
+                    )
+                    bias_chunk = (bias_chunk_f / multiscale_denom).to(
+                        dtype=bias_chunk.dtype
+                    )
+                    if nonnull_gate_chunk is not None:
+                        bias_chunk = bias_chunk * nonnull_gate_chunk.to(
+                            dtype=bias_chunk.dtype
+                        )
+                    if need_log:
+                        norm_scale_vals.append(
+                            multiscale_denom.detach()
+                            .reciprocal()
+                            .to(torch.float32)
+                            .reshape(-1)
                         )
                 elif self.multiscale_norm_requested in (
                     "sqrt_keff_detach",
