@@ -2482,7 +2482,7 @@ class PaTHAttention(nn.Module):
         # NEW ↓↓↓
         num_harmonics: int = 1,   # rank 数，=1 退化为原版
         use_wavelet_beta: bool = False,
-        wavelet_mode: str = "additive",   # off | router_rel | key_inject | logit_bias | logit_bias_ctxscale_shift_v0 | logit_bias_ctxscale_shift_v0_film | cond_film_v2
+        wavelet_mode: str = "additive",   # off | router_rel | logit_bias | logit_bias_ctxscale_shift_v0 | logit_bias_ctxscale_shift_v0_film | cond_film_v2
         logging_steps: int = 1000,
         wavelet_baseline_use: bool = False,
         attn_pdrop=0.1,
@@ -2499,6 +2499,27 @@ class PaTHAttention(nn.Module):
         self._eval_batch_step = 0
         self._eval_stats_logged_once = False
         self.bias_type = getattr(config, "bias_type", "wavelet")
+        self.wavelet_ctxscale_pattern_mode = str(
+            getattr(config, "wavelet_ctxscale_pattern_mode", getattr(config, "pattern_mode", "ricker"))
+        ).strip().lower()
+        if self.wavelet_ctxscale_pattern_mode not in ("ricker", "pl4", "restore"):
+            raise ValueError(
+                "wavelet_ctxscale_pattern_mode/pattern_mode must be one of "
+                f"'ricker', 'pl4', or 'restore', got {self.wavelet_ctxscale_pattern_mode!r}"
+            )
+        self.wavelet_ctxscale_restore_bin = int(
+            getattr(config, "wavelet_ctxscale_restore_bin", getattr(config, "restore_bin", -1))
+        )
+        if self.wavelet_ctxscale_pattern_mode == "restore" and not (0 <= self.wavelet_ctxscale_restore_bin < 4):
+            raise ValueError(
+                "wavelet_ctxscale_restore_bin/restore_bin must be in [0, 3] "
+                f"when pattern_mode='restore', got {self.wavelet_ctxscale_restore_bin}"
+            )
+        if self.wavelet_ctxscale_pattern_mode != "ricker" and self.bias_type != "wavelet":
+            raise ValueError(
+                "PL4/restoration pattern ablations are defined only for bias_type='wavelet', "
+                f"got bias_type={self.bias_type!r}"
+            )
         self.eval_stats_enabled = self._as_bool(getattr(config, "eval_rel_stats_enabled", True), default=True)
         self.eval_stats_layers = self._parse_layer_set(getattr(config, "eval_rel_stats_layers", "0"))
         self.eval_stats_bin_size = max(1, int(getattr(config, "eval_rel_stats_bin_size", 256)))
@@ -2622,11 +2643,6 @@ class PaTHAttention(nn.Module):
         self.use_wavelet_beta = use_wavelet_beta
         self.wavelet_mode = wavelet_mode
         self.wavelet_mode_resolved = self._normalize_wavelet_mode(getattr(config, "wavelet_mode", wavelet_mode))
-        self.wavelet_k1_debug_assert = self._as_bool(getattr(config, "wavelet_k1_debug_assert", False), default=False)
-        self.wavelet_k1_rms_eps = float(getattr(config, "wavelet_k1_rms_eps", 1e-6))
-        self.wavelet_k1_log_sample_tokens = max(1, int(getattr(config, "wavelet_k1_log_sample_tokens", 64)))
-        self.wavelet_k1_log_sample_heads = max(1, int(getattr(config, "wavelet_k1_log_sample_heads", 4)))
-        self.wavelet_k1_local_step = 0
         self.wavelet_logit_bias_eps = float(getattr(config, "wavelet_logit_bias_eps", 1e-6))
         self.wavelet_logit_bias_debug_assert = self._as_bool(
             getattr(config, "wavelet_logit_bias_debug_assert", False), default=False
@@ -2639,9 +2655,14 @@ class PaTHAttention(nn.Module):
         ).strip().lower()
         if self.wavelet_logit_bias_rms_scope in ("full", "all", "all_context", "context_length"):
             self.wavelet_logit_bias_rms_scope = "context"
-        if self.wavelet_logit_bias_rms_scope not in ("context", "causal"):
+        if self.wavelet_logit_bias_rms_scope == "causal":
             raise ValueError(
-                "wavelet_logit_bias_rms_scope must be 'context' or 'causal', "
+                "wavelet_logit_bias_rms_scope='causal' is disabled for PAT-234: "
+                "causal RMS changes the waveform scale row-by-row. Use 'context'."
+            )
+        if self.wavelet_logit_bias_rms_scope != "context":
+            raise ValueError(
+                "wavelet_logit_bias_rms_scope must be 'context', "
                 f"got {self.wavelet_logit_bias_rms_scope!r}"
             )
         # PAT-234 variant C: center the per-scale basis over causal keys before RMS-norm,
@@ -2779,6 +2800,57 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctxscale_center_pos_ratio = max(
             0.0, min(1.0, self.wavelet_ctxscale_center_pos_ratio)
         )
+        # PAT-234 dual-center ablation: one per-scale waveform is the sum of the
+        # absolute-key Ricker pattern and the query-centered Ricker pattern, then
+        # the existing per-scale centering/RMS is applied to the summed waveform.
+        self.wavelet_ctxscale_dual_center_enable = self._as_bool(
+            getattr(
+                config,
+                "wavelet_ctxscale_dual_center_enable",
+                getattr(config, "wavelet_ctxscale_dual_center", False),
+            ),
+            default=False,
+        )
+        self.wavelet_ctxscale_dual_center_norm_mode = str(
+            getattr(config, "wavelet_ctxscale_dual_center_norm_mode", "sum_then_rms")
+        ).strip().lower()
+        if self.wavelet_ctxscale_dual_center_norm_mode in ("sum", "summed"):
+            self.wavelet_ctxscale_dual_center_norm_mode = "sum_then_rms"
+        if self.wavelet_ctxscale_dual_center_norm_mode in (
+            "separate",
+            "separate_norm",
+            "separate_rms_sqrt2",
+        ):
+            self.wavelet_ctxscale_dual_center_norm_mode = "separate_rms"
+        if self.wavelet_ctxscale_dual_center_norm_mode not in ("sum_then_rms", "separate_rms"):
+            raise ValueError(
+                "wavelet_ctxscale_dual_center_norm_mode must be 'sum_then_rms' "
+                f"or 'separate_rms', got {self.wavelet_ctxscale_dual_center_norm_mode!r}"
+            )
+        if self.wavelet_ctxscale_dual_center_enable:
+            if self.bias_type != "wavelet" or self.wavelet_ctxscale_pattern_mode != "ricker":
+                raise ValueError(
+                    "wavelet_ctxscale_dual_center_enable requires bias_type='wavelet' "
+                    "and wavelet_ctxscale_pattern_mode='ricker'."
+                )
+            if self.wavelet_ctxscale_use_relative_position:
+                raise ValueError(
+                    "wavelet_ctxscale_dual_center_enable is incompatible with "
+                    "wavelet_ctxscale_use_relative_position; it explicitly builds "
+                    "absolute and query-centered coordinates."
+                )
+        if (
+            self.wavelet_ctxscale_pattern_mode != "ricker"
+            and (
+                self.wavelet_ctxscale_dual_center_enable
+                or self.wavelet_ctxscale_use_relative_position
+                or self.wavelet_ctxscale_center_pos_ratio > 0.0
+            )
+        ):
+            raise ValueError(
+                "PL4/restoration pattern ablations are only supported for the "
+                "absolute center-0 coordinate."
+            )
         # E3 ablation: learnable global anchor offset for wavelet position reference
         self.wavelet_ctxscale_learnable_anchor = self._as_bool(
             getattr(config, "wavelet_ctxscale_learnable_anchor", False), default=False
@@ -2795,6 +2867,11 @@ class PaTHAttention(nn.Module):
         self.wavelet_basis_control = str(getattr(config, "wavelet_basis_control", "none")).strip().lower()
         if self.wavelet_basis_control not in ("none", "permute_scales", "random_basis"):
             self.wavelet_basis_control = "none"
+        if self.wavelet_ctxscale_pattern_mode != "ricker" and self.wavelet_basis_control == "random_basis":
+            raise ValueError(
+                "PL4/restoration pattern ablations require the generated Ricker basis; "
+                "wavelet_basis_control='random_basis' is incompatible."
+            )
         self.wavelet_router_sigmoid_mode = str(getattr(config, "wavelet_router_sigmoid_mode", "softmax")).strip().lower()
         if self.wavelet_router_sigmoid_mode not in ("softmax", "with_null", "no_null", "with_null_independent_scales", "signed"):
             self.wavelet_router_sigmoid_mode = "softmax"
@@ -3009,7 +3086,6 @@ class PaTHAttention(nn.Module):
             default=False,
         )
         self.eval_attn_mech_eps = float(getattr(config, "eval_attn_mech_eps", 1e-12))
-        self._eval_attn_mech_last = None
         self.wavelet_ctxscale_abs_shift_causal = self._as_bool(
             getattr(config, "wavelet_ctxscale_abs_shift_causal", False), default=False
         )
@@ -3079,10 +3155,6 @@ class PaTHAttention(nn.Module):
             self.num_kv_heads = num_kv_heads
         self.head_dim = self.hidden_size // self.num_heads
         self.kv_dim = self.num_kv_heads * self.head_dim
-        k1_gain_init = float(getattr(config, "wavelet_k1_gain_init", 0.0))
-        self.wavelet_k1_gain = nn.Parameter(
-            torch.full((self.num_kv_heads,), k1_gain_init, dtype=torch.float32)
-        )
         logit_bias_a_init = float(getattr(config, "wavelet_logit_bias_a_init", -5.0))
         self.wavelet_logit_bias_a = nn.Parameter(torch.tensor(logit_bias_a_init, dtype=torch.float32))
         if self.wavelet_ctxscale_use_head_gate:
@@ -3121,21 +3193,24 @@ class PaTHAttention(nn.Module):
         self.multiscale_norm_requested = str(
             getattr(config, "multiscale_norm", "none")
         ).strip().lower()
-        self.wavelet_ctxscale_allow_with_null_multiscale_norm = self._as_bool(
+        self.wavelet_ctxscale_amplitude_multiplier = float(
             getattr(
                 config,
-                "wavelet_ctxscale_allow_with_null_multiscale_norm",
-                False,
-            ),
-            default=False,
+                "wavelet_ctxscale_amplitude_multiplier",
+                getattr(config, "amplitude_multiplier", 1.0),
+            )
         )
-        self.multiscale_norm = self._resolve_multiscale_norm(
-            self.multiscale_norm_requested,
-            self.wavelet_router_sigmoid_mode,
-            self.wavelet_ctxscale_allow_with_null_multiscale_norm,
+        if not math.isfinite(self.wavelet_ctxscale_amplitude_multiplier):
+            raise ValueError(
+                "wavelet_ctxscale_amplitude_multiplier/amplitude_multiplier "
+                f"must be finite, got {self.wavelet_ctxscale_amplitude_multiplier}"
+            )
+        self.wavelet_ctxscale_amplitude_multiplier_override = (
+            self.wavelet_ctxscale_amplitude_multiplier != 1.0
         )
+
         self.multiscale_sum_scale = self._get_multiscale_sum_scale(
-            self.multiscale_norm,
+            self.multiscale_norm_requested,
             _K,
         )
         # PAT-227: support upper bound is configurable (log2 exponent; default 14
@@ -3685,8 +3760,6 @@ class PaTHAttention(nn.Module):
             return "logit_bias_ctxscale_shift_v0_film"
         if m in ("mlp_bias_baseline_v0", "mlp_bias_baseline", "ctxscale_mlp_bias_baseline_v0"):
             return "mlp_bias_baseline_v0"
-        if m in ("key_inject", "k1", "key", "key_side"):
-            return "key_inject"
         if m in ("logit_bias", "bias", "exp_a"):
             return "logit_bias"
         if m in ("logit_bias_ctxscale_shift_v0", "ctxscale_shift_v0", "ctxscale_shift"):
@@ -3697,27 +3770,6 @@ class PaTHAttention(nn.Module):
         if m.startswith("db") or m.startswith("coif") or m.startswith("sym") or m == "haar":
             return "router_rel"
         return "router_rel"
-
-    def _k1_should_log(self, *, global_step=None, config=None) -> tuple[bool, int]:
-        step_val = self._to_int_or_none(global_step)
-        if step_val is None and config is not None:
-            step_val = self._to_int_or_none(getattr(config, "router_global_step", None))
-        if step_val is None:
-            self.wavelet_k1_local_step += 1
-            step_val = int(self.wavelet_k1_local_step)
-        log_every = None
-        if config is not None:
-            log_every = self._to_int_or_none(getattr(config, "wavelet_k1_log_every", None))
-            if log_every is None:
-                log_every = self._to_int_or_none(getattr(config, "router_log_every", 500))
-        if log_every is None:
-            log_every = 500
-        should_log = (
-            log_every > 0
-            and step_val >= 0
-            and (step_val % log_every == 0)
-        )
-        return bool(should_log), int(step_val)
 
     def _k1_emit_log(self, msg: str):
         # Avoid duplicated logs across DDP ranks.
@@ -3859,64 +3911,6 @@ class PaTHAttention(nn.Module):
             "delta_o_cosine_flat": float(cos.item()),
             "delta_o_rel_token_head_mean": [float(x.item()) for x in rel_tok_head],
         }
-
-    @torch.no_grad()
-    def _record_eval_attn_mech_stats(
-        self,
-        *,
-        layer_idx: Optional[int],
-        out_base: Optional[torch.Tensor],  # [B,T,H,d]
-        out_wav: Optional[torch.Tensor],   # [B,T,H,d]
-        global_step=None,
-        rel_applied: bool = False,
-        has_wavelet: bool = False,
-        wavelet_mode: Optional[str] = None,
-    ):
-        if not bool(getattr(self, "eval_attn_mech_enabled", False)):
-            return
-        if self.training:
-            return
-        if out_base is None or out_wav is None:
-            return
-        if out_base.dim() != 4 or out_wav.dim() != 4:
-            return
-        if out_base.shape != out_wav.shape:
-            return
-
-        lid = int(self.layer_idx if layer_idx is None else layer_idx)
-        B, T, H, _ = out_wav.shape
-        if B <= 0 or T <= 0 or H <= 0:
-            return
-        bidx = min(int(self.eval_attn_heatmap_case_index), B - 1)
-        t_take = int(T)
-        if int(getattr(self, "eval_attn_heatmap_max_seq", 0)) > 0:
-            t_take = min(t_take, int(getattr(self, "eval_attn_heatmap_max_seq", 0)))
-        h_take = H if int(self.eval_attn_heatmap_head_limit) <= 0 else min(H, int(self.eval_attn_heatmap_head_limit))
-
-        out_base_b = out_base[bidx, :t_take, :h_take, :]
-        out_wav_b = out_wav[bidx, :t_take, :h_take, :]
-        stats = self._compute_output_delta_stats(out_base_bt_hd=out_base_b, out_wave_bt_hd=out_wav_b)
-        if stats is None:
-            return
-        step_val = self._to_int_or_none(global_step)
-        if step_val is None:
-            step_val = -1
-        stats.update(
-            {
-                "layer": int(lid),
-                "step": int(step_val),
-                "batch_index": int(bidx),
-                "q_len": int(t_take),
-                "num_heads_saved": int(h_take),
-                "num_heads_total": int(H),
-                "wavelet_mode": str(
-                    wavelet_mode if wavelet_mode is not None else getattr(self, "wavelet_mode_resolved", "unknown")
-                ),
-                "rel_applied": bool(rel_applied),
-                "has_wavelet": bool(has_wavelet),
-            }
-        )
-        self._eval_attn_mech_last = stats
 
     @torch.no_grad()
     def _eval_attn_get_tokenizer(self):
@@ -5588,11 +5582,7 @@ class PaTHAttention(nn.Module):
             self._wavelet_gate_hist.append(
                 {
                     "sat_extreme": int(sat_extreme),
-                    "grad_abs": float(grad_abs),
                     "grad_abs_p50": float(grad_p50),
-                    "grad_finite_ratio": float(grad_finite_ratio),
-                    "grad_nonfinite": int(grad_nonfinite),
-                    "grad_missing": int(grad_missing),
                     "update_ratio": float(update_ratio),
                 }
             )
@@ -5842,18 +5832,45 @@ class PaTHAttention(nn.Module):
         return xf / denom
 
     def _rms_norm_wavelet_basis(self, basis_table: torch.Tensor, *, q0: int, eps: float):
-        if self.wavelet_logit_bias_rms_scope == "context":
-            return self._rms_norm_last_dim(basis_table, eps=eps)
-        q_len = int(basis_table.shape[-2])
-        T = int(basis_table.shape[-1])
-        q_abs = torch.arange(q0, q0 + q_len, device=basis_table.device).view(q_len, 1)
-        k_idx = torch.arange(T, device=basis_table.device).view(1, T)
-        causal = k_idx <= q_abs
-        return self._rms_norm_last_dim(basis_table, eps=eps, mask=causal)
+        return self._rms_norm_last_dim(basis_table, eps=eps)
 
     @staticmethod
     def _ricker_wavelet(u: torch.Tensor):
         return (1.0 - u.pow(2)) * torch.exp(-0.5 * u.pow(2))
+
+    def _apply_ricker_pl4_pattern(
+        self,
+        basis_table: torch.Tensor,
+        base_x: torch.Tensor,
+        beta_i: torch.Tensor,
+        scale: torch.Tensor,
+    ) -> torch.Tensor:
+        mode = str(getattr(self, "wavelet_ctxscale_pattern_mode", "ricker"))
+        if mode == "ricker":
+            return basis_table
+
+        scale_f = torch.as_tensor(scale, device=basis_table.device, dtype=torch.float32).clamp_min(1e-12)
+        beta = beta_i.unsqueeze(-1)
+        out = basis_table
+        bin_width = 128.0
+        restore_bin = int(getattr(self, "wavelet_ctxscale_restore_bin", -1))
+
+        for bin_idx in range(4):
+            if mode == "restore" and bin_idx == restore_bin:
+                continue
+            left = float(bin_idx) * bin_width
+            right = left + bin_width
+
+            mask = (base_x >= left) & (base_x < right)
+
+            left_t = left - beta
+            right_t = right - beta
+            y_left = self._ricker_wavelet(left_t / scale_f)
+            y_right = self._ricker_wavelet(right_t / scale_f)
+            alpha = ((base_x - left) / bin_width).clamp(0.0, 1.0)
+            linear = y_left + (y_right - y_left) * alpha
+            out = torch.where(mask, linear.to(dtype=out.dtype), out)
+        return out
 
     @staticmethod
     def _sine_basis(u: torch.Tensor) -> torch.Tensor:
@@ -5869,7 +5886,6 @@ class PaTHAttention(nn.Module):
 
     @staticmethod
     def _linear_basis(
-        self,
         u: torch.Tensor,
     ) -> torch.Tensor:
         return (1.0 - u.abs() / math.sqrt(3.0)).clamp_min(0.0)
@@ -6537,7 +6553,6 @@ class PaTHAttention(nn.Module):
         self._last_ctxscale_non_null_mass = None
         self._last_ctxscale_null_mass = None
         self._last_ctxscale_monitor_payload = None
-        self._last_ctxscale_num_scales = int(K)
         wavelet_mode_resolved = self._normalize_wavelet_mode(getattr(self.config, "wavelet_mode", self.wavelet_mode))
         use_mlp_bias_baseline = bool(wavelet_mode_resolved == "mlp_bias_baseline_v0")
         basis_control = str(getattr(self, "wavelet_basis_control", "none")).strip().lower()
@@ -6577,7 +6592,6 @@ class PaTHAttention(nn.Module):
                 f"got {tuple(x_feat.shape)}."
             )
         router_logits = router_mod(x_feat)
-        router_logits = self._rms_norm_last_dim(router_logits, eps=float(self.wavelet_ctxscale_router_rms_eps))
         # E2b ablation: replace with globally-learned static logits (not query-conditioned)
         if getattr(self, "wavelet_router_static_learned", False) and self.wavelet_static_router_logits is not None:
             static = self.wavelet_static_router_logits.to(dtype=router_logits.dtype, device=router_logits.device)
@@ -7224,25 +7238,48 @@ class PaTHAttention(nn.Module):
                         beta_i = beta_m[:, q0:q1] * s_i
                     else:
                         beta_i = beta_m[:, q0:q1]
-                    if basis_control == "random_basis":
-                        basis_table = self._random_basis_table(
-                            q_len=int(q1 - q0),
-                            T=int(T),
-                            scale_idx=int(scale_idx),
-                            layer_idx=int(lid),
-                            device=device,
-                        ).unsqueeze(0).expand(B, -1, -1)
-                    else:
-                        if use_relative_position:
-                            rel_delta = q_abs_chunk - diff.view(1, 1, T)
-                            u_i = (rel_delta - beta_i.unsqueeze(-1)) / s_i
-                        elif key_anchor_pos is not None:
-                            u_i = (key_anchor_pos - beta_i.unsqueeze(-1)) / s_i
+
+                    base_x_i = diff.view(1, 1, T)
+                    if getattr(self, "wavelet_ctxscale_dual_center_enable", False):
+                        q_abs_chunk = torch.arange(q0, q1, device=device, dtype=torch.float32).view(1, q1 - q0, 1)
+                        abs_u_i = (base_x_i - beta_i.unsqueeze(-1)) / s_i
+                        query_u_i = ((q_abs_chunk - base_x_i) - beta_i.unsqueeze(-1)) / s_i
+                        if self.bias_type != "wavelet":
+                            raise ValueError("dual-center wavelet basis requires bias_type='wavelet'")
+                        abs_basis = self._ricker_wavelet(abs_u_i)
+                        query_basis = self._ricker_wavelet(query_u_i)
+                        if getattr(self, "wavelet_ctxscale_dual_center_norm_mode", "sum_then_rms") == "separate_rms":
+                            if getattr(self, "wavelet_logit_bias_center", False):
+                                _qc = abs_basis.shape[-2]
+                                _Tk = abs_basis.shape[-1]
+                                _qabs = torch.arange(q0, q0 + _qc, device=abs_basis.device).view(1, _qc, 1)
+                                _kidx = torch.arange(_Tk, device=abs_basis.device).view(1, 1, _Tk)
+                                _causal = (_kidx <= _qabs).to(abs_basis.dtype)
+                                _cnt = _causal.sum(dim=-1, keepdim=True).clamp_min(1.0)
+                                abs_basis = abs_basis - (abs_basis * _causal).sum(dim=-1, keepdim=True) / _cnt
+                                query_basis = query_basis - (query_basis * _causal).sum(dim=-1, keepdim=True) / _cnt
+                            if not getattr(self, "wavelet_logit_bias_norm_disable", False):
+                                abs_basis = self._rms_norm_wavelet_basis(abs_basis, q0=q0, eps=eps)
+                                query_basis = self._rms_norm_wavelet_basis(query_basis, q0=q0, eps=eps)
+                            basis_table = (abs_basis + query_basis) / math.sqrt(2.0)
+                            skip_common_basis_center_norm = True
                         else:
-                            u_i = (diff.view(1, 1, T) - beta_i.unsqueeze(-1)) / s_i
+                            basis_table = abs_basis + query_basis
+                            skip_common_basis_center_norm = False
+                    else:
+                        skip_common_basis_center_norm = False
+                        if use_relative_position:
+                            coord_x_i = q_abs_chunk - base_x_i
+                        elif key_anchor_pos is not None:
+                            coord_x_i = key_anchor_pos
+                        else:
+                            coord_x_i = base_x_i
+                        token_x_i = coord_x_i - beta_i.unsqueeze(-1)
+                        u_i = token_x_i / s_i
 
                         if self.bias_type == "wavelet":
                             basis_table = self._ricker_wavelet(u_i)
+                            basis_table = self._apply_ricker_pl4_pattern(basis_table, base_x_i, beta_i, s_i)
                         elif self.bias_type == "sine":
                             basis_table = self._sine_basis(u_i)
                         elif self.bias_type == "morlet":
@@ -7256,7 +7293,11 @@ class PaTHAttention(nn.Module):
                         else:
                             raise ValueError(f"Unsupported bias_type: {self.bias_type}")
 
-                    if getattr(self, "wavelet_logit_bias_center", False) and self.bias_type != "rotary":
+                    if (
+                        not skip_common_basis_center_norm
+                        and getattr(self, "wavelet_logit_bias_center", False)
+                        and self.bias_type != "rotary"
+                    ):
                         # PAT-234 C: remove softmax-invisible key-independent component over
                         # causal keys (k <= query) before normalization. basis_table: [B, q_chunk, T].
                         _qc = basis_table.shape[-2]
@@ -7267,14 +7308,19 @@ class PaTHAttention(nn.Module):
                         _cnt = _causal.sum(dim=-1, keepdim=True).clamp_min(1.0)
                         _mean_k = (basis_table * _causal).sum(dim=-1, keepdim=True) / _cnt
                         basis_table = basis_table - _mean_k
-                    if not getattr(self, "wavelet_logit_bias_norm_disable", False):
+                    if (
+                        not skip_common_basis_center_norm
+                        and not getattr(self, "wavelet_logit_bias_norm_disable", False)
+                    ):
                         basis_table = self._rms_norm_wavelet_basis(basis_table, q0=q0, eps=eps)
                     if getattr(self, "_pat234_cap", None) is not None:  # PAT-234 stage probe (default off)
                         self._pat234_cap.setdefault("S1_postnorm", []).append((int(lid), int(scale_idx), int(q0), basis_table.detach().float().cpu()))
                     basis_table = self._maybe_clamp_p99(basis_table)
                     if getattr(self, "_pat234_cap", None) is not None:
                         self._pat234_cap.setdefault("S2_postp99", []).append((int(lid), int(scale_idx), int(q0), basis_table.detach().float().cpu()))
-                    contrib_i = pi_scale[:, q0:q1, i].unsqueeze(-1) * basis_table
+
+                    contrib_i = pi_scale[:, q0:q1, i].unsqueeze(-1) * basis_table ### weight * wavelet basis
+
                     if getattr(self, "_pat234_cap", None) is not None:  # PAT-234: post-gain per scale
                         self._pat234_cap.setdefault("S3_postgain", []).append((int(lid), int(scale_idx), int(q0), contrib_i.detach().float().cpu()))
                     if far_mask is not None:
@@ -7292,12 +7338,22 @@ class PaTHAttention(nn.Module):
                     bias_pre_norm = bias_chunk.detach().to(torch.float32)
                     norm_pre_sum_sq = norm_pre_sum_sq + bias_pre_norm.square().sum()
                     norm_elem_count += int(bias_pre_norm.numel())
-                if self.multiscale_norm in (
+                if self.wavelet_ctxscale_amplitude_multiplier_override:
+                    bias_chunk = bias_chunk * self.wavelet_ctxscale_amplitude_multiplier
+                    if need_log:
+                        norm_scale_vals.append(
+                            torch.tensor(
+                                [self.wavelet_ctxscale_amplitude_multiplier],
+                                device=device,
+                                dtype=torch.float32,
+                            )
+                        )
+                elif self.multiscale_norm_requested in (
                     "sqrt_keff_detach",
                     "keff_detach",
                 ):
                     self._validate_dynamic_multiscale_norm_router(
-                        self.multiscale_norm,
+                        self.multiscale_norm_requested,
                         router_mode,
                         intervention_active=do_active,
                     )
@@ -7640,6 +7696,9 @@ class PaTHAttention(nn.Module):
                     "router_jitter_target_flip_probability": float(router_jitter_target_flip_probability),
                     "use_relative_position": int(bool(getattr(self, "wavelet_ctxscale_use_relative_position", False))),
                     "center_pos_ratio": float(getattr(self, "wavelet_ctxscale_center_pos_ratio", 0.0)),
+                    "dual_center": int(bool(getattr(self, "wavelet_ctxscale_dual_center_enable", False))),
+                    "pattern_mode": str(getattr(self, "wavelet_ctxscale_pattern_mode", "ricker")),
+                    "restore_bin": int(getattr(self, "wavelet_ctxscale_restore_bin", -1)),
                     "scale_values": [float(scales[i].item()) for i in range(K)],
                     "scales": [float(scales[i].item()) for i in range(K)],
                     "K": int(K),
@@ -7891,6 +7950,9 @@ class PaTHAttention(nn.Module):
                 "cfg_use_head_gate": int(bool(getattr(self, "wavelet_ctxscale_use_head_gate", False))),
                 "use_relative_position": int(bool(getattr(self, "wavelet_ctxscale_use_relative_position", False))),
                 "center_pos_ratio": float(getattr(self, "wavelet_ctxscale_center_pos_ratio", 0.0)),
+                "dual_center": int(bool(getattr(self, "wavelet_ctxscale_dual_center_enable", False))),
+                "pattern_mode": str(getattr(self, "wavelet_ctxscale_pattern_mode", "ricker")),
+                "restore_bin": int(getattr(self, "wavelet_ctxscale_restore_bin", -1)),
                 "scale_coupled_shift": int(use_scale_coupled_shift),
                 "abs_shift_causal": int(use_abs_shift_causal),
                 "shift_T_mode": str(shift_t_mode),
@@ -7934,7 +7996,11 @@ class PaTHAttention(nn.Module):
                 "g0_p90": float(g0_p90),
                 "alpha_mean": float(alpha_mean),
                 "alpha_p90": float(alpha_p90),
-                "multiscale_norm": str(self.multiscale_norm),
+                "multiscale_norm": str(self.multiscale_norm_requested),
+                "amplitude_multiplier": float(self.wavelet_ctxscale_amplitude_multiplier),
+                "amplitude_multiplier_override": int(
+                    bool(self.wavelet_ctxscale_amplitude_multiplier_override)
+                ),
                 "multiscale_k": int(self.wavelet_ctxscale_k),
                 "norm_scale_mean": (
                     float(norm_scale_sample.mean().item())
@@ -8311,94 +8377,6 @@ class PaTHAttention(nn.Module):
         )
         self._k1_emit_log(msg)
         self._update_router_global_stats(step=int(step), layer_idx=lid, payload=payload)
-
-    def _k1_gain_for_heads(self, target_h: int, *, device, dtype):
-        g = self.wavelet_k1_gain.to(device=device, dtype=dtype)
-        if g.numel() != int(target_h):
-            if g.numel() == 1:
-                g = g.expand(target_h)
-            elif target_h % g.numel() == 0:
-                g = g.repeat_interleave(target_h // g.numel())
-            else:
-                reps = (target_h + g.numel() - 1) // g.numel()
-                g = g.repeat(reps)[:target_h]
-        return g.view(1, 1, target_h, 1)
-
-    def _wavelet_key_inject(
-        self,
-        *,
-        k: torch.Tensor,
-        wavelet_dtt: torch.Tensor,
-        compute_dtype: torch.dtype = torch.float32,
-        d_chunk: int = 8,
-    ):
-        B, T, H, D = k.shape
-        assert wavelet_dtt.shape == (D, T, T), (wavelet_dtt.shape, (D, T, T))
-
-        kf = k.to(dtype=compute_dtype)
-        wav = wavelet_dtt.to(dtype=compute_dtype)
-        delta_k = torch.empty_like(kf)
-        for d0 in range(0, D, d_chunk):
-            d1 = min(D, d0 + d_chunk)
-            delta_k[..., d0:d1] = torch.einsum(
-                "b n h c, c t n -> b t h c",
-                kf[..., d0:d1],
-                wav[d0:d1],
-            )
-
-        rms = torch.sqrt(delta_k.pow(2).mean(dim=-1, keepdim=True) + float(self.wavelet_k1_rms_eps))
-        delta_k_hat = delta_k / rms
-        g = self._k1_gain_for_heads(H, device=delta_k_hat.device, dtype=delta_k_hat.dtype)
-        inject = g * delta_k_hat
-        k_injected = kf + inject
-
-        if self.wavelet_k1_debug_assert:
-            assert delta_k.shape == k.shape
-            assert delta_k_hat.shape == k.shape
-            assert inject.shape == k.shape
-            if not torch.isfinite(delta_k_hat).all():
-                raise FloatingPointError("wavelet_k1: delta_k_hat has non-finite values")
-            if not torch.isfinite(k_injected).all():
-                raise FloatingPointError("wavelet_k1: k_injected has non-finite values")
-
-        return k_injected, delta_k, delta_k_hat, inject, g
-
-    def _log_key_inject_monitor(
-        self,
-        *,
-        layer_idx: Optional[int],
-        step: int,
-        delta_k: torch.Tensor,
-        g: torch.Tensor,
-        inject: torch.Tensor,
-        attn_probs: torch.Tensor,
-    ):
-        max_tokens = int(self.wavelet_k1_log_sample_tokens)
-        max_heads = int(self.wavelet_k1_log_sample_heads)
-        delta_stats = _monitor_tensor_stats_bthd(delta_k, max_tokens=max_tokens, max_heads=max_heads)
-        inject_stats = _monitor_tensor_stats_bthd(inject, max_tokens=max_tokens, max_heads=max_heads)
-        g_stats = _monitor_scalar_stats(g)
-        attn_stats = _monitor_attn_prob_stats(attn_probs, max_queries=max_tokens, max_heads=max_heads)
-        lid = int(self.layer_idx if layer_idx is None else layer_idx)
-        msg = (
-            f"[wavelet K1 stats] layer={lid} step={int(step)} "
-            f"delta_k mean={delta_stats['mean']:.6e} std={delta_stats['std']:.6e} "
-            f"abs_p99={delta_stats['abs_p99']:.6e} "
-            f"norm_p50={delta_stats['norm_p50']:.6e} norm_p90={delta_stats['norm_p90']:.6e} "
-            f"norm_p99={delta_stats['norm_p99']:.6e} | "
-            f"g mean={g_stats['mean']:.6e} p50={g_stats['p50']:.6e} p90={g_stats['p90']:.6e} p99={g_stats['p99']:.6e} | "
-            f"inject mean={inject_stats['mean']:.6e} std={inject_stats['std']:.6e} "
-            f"abs_p99={inject_stats['abs_p99']:.6e} "
-            f"norm_p50={inject_stats['norm_p50']:.6e} norm_p90={inject_stats['norm_p90']:.6e} "
-            f"norm_p99={inject_stats['norm_p99']:.6e} | "
-            f"attn_entropy mean={attn_stats['entropy_mean']:.6e} p50={attn_stats['entropy_p50']:.6e} "
-            f"p90={attn_stats['entropy_p90']:.6e} p99={attn_stats['entropy_p99']:.6e} | "
-            f"attn_top1 mean={attn_stats['top1_mean']:.6e} p50={attn_stats['top1_p50']:.6e} "
-            f"p90={attn_stats['top1_p90']:.6e} p99={attn_stats['top1_p99']:.6e} | "
-            f"attn_margin mean={attn_stats['margin_mean']:.6e} p50={attn_stats['margin_p50']:.6e} "
-            f"p90={attn_stats['margin_p90']:.6e} p99={attn_stats['margin_p99']:.6e}"
-        )
-        self._k1_emit_log(msg)
 
     @staticmethod
     def _parse_int_list(v, default=None):
@@ -9063,7 +9041,6 @@ class PaTHAttention(nn.Module):
         self._eval_stats_logged_once = False
         if not bool(getattr(self, "eval_attn_heatmap_keep_counter", False)):
             self._eval_attn_heatmap_export_count = 0
-        self._eval_attn_mech_last = None
 
     @torch.no_grad()
     def update_stats(self, z_base: torch.Tensor, rel: torch.Tensor, layer_idx: int, rel_alpha: float = 1.0):
@@ -9579,8 +9556,6 @@ class PaTHAttention(nn.Module):
             wavelet_mode in ("logit_bias_ctxscale_shift_v0", "logit_bias_ctxscale_shift_v0_film", "mlp_bias_baseline_v0")
             or wavelet_dtt is not None
         )
-        k1_log_payload = None
-        k1_log_step = None
         logit_bias_payload = None
         logit_bias_step = None
         ctxscale_shift_payload = None
@@ -9613,33 +9588,7 @@ class PaTHAttention(nn.Module):
         rel_alpha = float(getattr(config, "rel_alpha", getattr(config, "attn_rel_alpha", self.rel_alpha)))
         rel_logits_raw = None
         coe_layer = None
-        if rel_enabled and wavelet_mode == "key_inject":
-            k_injected, delta_k, delta_k_hat, inject, g = self._wavelet_key_inject(
-                k=k,
-                wavelet_dtt=wavelet_dtt,
-                compute_dtype=compute_dtype,
-                d_chunk=d_chunk,
-            )
-            # Key-side wavelet injection:
-            # z = q @ (k + g * RMSNorm(delta_k))^T, so the extra term is <q, g * delta_k_hat>.
-            E_base_raw, M_base, strict_WK, A = path_ut_base_raw(
-                q, k_injected, w, beta, compute_dtype=compute_dtype
-            )
-            if use_wavelet_fused_H:
-                M_used = path_ut_M_wave_fused(q, w, beta, A, wavelet_dtt, d_chunk=d_chunk, compute_dtype=compute_dtype)
-            else:
-                M_used = M_base
-            rel = None
-            E_wav_raw = E_base_raw
-            if self.training:
-                should_log_k1, k1_log_step = self._k1_should_log(global_step=global_step, config=config)
-                if should_log_k1:
-                    k1_log_payload = {
-                        "delta_k": delta_k_hat.detach(),
-                        "inject": inject.detach(),
-                        "g": g.detach(),
-                    }
-        elif rel_enabled and wavelet_mode == "logit_bias":
+        if rel_enabled and wavelet_mode == "logit_bias":
             # Exp-A logit-bias:
             # z = z_path + g_layer * B_hat(delta), delta=(key_pos-query_pos)=(n-m).
             b_hat, eff_bias, g_layer, causal_2d = self._build_logit_bias_term(
@@ -9833,13 +9782,9 @@ class PaTHAttention(nn.Module):
             # Trigger rows → path logits; non-trigger rows → standard QK^T logits
             E_wav_raw = torch.where(_trigger_mask, E_wav_raw, _E_std_raw)
 
-        if getattr(self, '_nmf_capture', False):
-            self._nmf_last_base_logits = (E_base_raw * scale).detach().to(torch.float32).cpu()
-
         P_base = None
         heatmap_enabled = bool(getattr(self, "eval_attn_heatmap_enabled", False)) or bool(getattr(self, "_debug_enabled", False))
-        mech_enabled = bool((not self.training) and getattr(self, "eval_attn_mech_enabled", False))
-        need_base_softmax = bool((analyzer is not None and rel is not None) or ((not self.training) and heatmap_enabled) or mech_enabled)
+        need_base_softmax = bool((analyzer is not None and rel is not None) or ((not self.training) and heatmap_enabled))
         if need_base_softmax:
             E_base = E_base_raw * scale
             base_fill = causal_mask_fill_value(E_base.dtype)
@@ -9847,10 +9792,6 @@ class PaTHAttention(nn.Module):
             P_base = torch.softmax(E_base, dim=-1)
 
         E_wav = E_wav_raw * scale
-        if getattr(self, '_nmf_capture_total', False):
-            # Capture softmax-input logits including wavelet bias (E_wav_raw * scale, before masking).
-            # For PaTH-only this equals E_base_raw * scale; for QWAB it includes the wavelet logit bias.
-            self._nmf_last_total_logits = E_wav_raw.detach().mul(scale).to(torch.float32).cpu()
         wave_fill = causal_mask_fill_value(E_wav.dtype)
         E_wav = E_wav.masked_fill(future, wave_fill)
         self._log_attn_margin_distance(
@@ -9869,15 +9810,6 @@ class PaTHAttention(nn.Module):
             )
         else:
             self._wavelet_condfilm_v2_last_attn_stats = None
-        if k1_log_payload is not None and k1_log_step is not None:
-            self._log_key_inject_monitor(
-                layer_idx=layer_idx,
-                step=int(k1_log_step),
-                delta_k=k1_log_payload["delta_k"],
-                g=k1_log_payload["g"],
-                inject=k1_log_payload["inject"],
-                attn_probs=P_wav,
-            )
         if logit_bias_payload is not None and logit_bias_step is not None:
             self._log_logit_bias_monitor(
                 layer_idx=layer_idx,
@@ -9907,22 +9839,12 @@ class PaTHAttention(nn.Module):
         self._debug_update_eval_stats(layer_idx, E_base_raw, rel, attn_weights=P_wav)
         self.update_stats(E_base_raw, rel, layer_idx, rel_alpha=rel_alpha)
         out_base = None
-        if P_base is not None and (mech_enabled or (analyzer is not None and rel is not None)):
+        if P_base is not None and analyzer is not None and rel is not None:
             out_base = torch.einsum("b h i j, b j h d -> b i h d", P_base, v.to(compute_dtype))
         out_wav = torch.einsum("b h i j, b j h d -> b i h d", P_wav, v.to(compute_dtype))
         if getattr(self, "_mask_heads", None):
             for h in self._mask_heads:
                 out_wav[:, :, h, :].zero_()
-        if out_base is not None:
-            self._record_eval_attn_mech_stats(
-                layer_idx=layer_idx,
-                out_base=out_base,
-                out_wav=out_wav,
-                global_step=global_step,
-                rel_applied=bool(rel_enabled),
-                has_wavelet=bool(wavelet_dtt is not None),
-                wavelet_mode=wavelet_mode,
-            )
         if P_base is not None and (not only_rel_layers or bool(rel_enabled)):
             self._export_eval_attn_heatmaps(
                 layer_idx=layer_idx,
