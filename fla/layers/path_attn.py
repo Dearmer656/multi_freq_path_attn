@@ -6701,6 +6701,12 @@ class PaTHAttention(nn.Module):
         else:
             raise ValueError(f"Unknown router_sigmoid_mode: {router_sigmoid_mode}")
 
+        if getattr(self, "_pat_g0_cap", None) is not None:  # PAT-243 g0_gate-by-position probe (default off)
+            _g0_for_cap = g0_gate if g0_gate is not None else nonnull_gate
+            self._pat_g0_cap.setdefault("g0_gate", []).append(
+                (int(lid), _g0_for_cap.detach().float().cpu())
+            )
+
         pi = self._apply_ctxscale_do_intervention(
             pi=pi,
             layer_idx=lid,
