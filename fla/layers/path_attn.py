@@ -6557,6 +6557,10 @@ class PaTHAttention(nn.Module):
                 f"got {tuple(x_feat.shape)}."
             )
         router_logits = router_mod(x_feat)
+        if getattr(self, "_pat_g0_cap", None) is not None:  # PAT-243 raw pre-sigmoid router_logits probe (default off)
+            self._pat_g0_cap.setdefault("router_logits_raw", []).append(
+                (int(lid), router_logits.detach().float().cpu())
+            )
         # E2b ablation: replace with globally-learned static logits (not query-conditioned)
         if getattr(self, "wavelet_router_static_learned", False) and self.wavelet_static_router_logits is not None:
             static = self.wavelet_static_router_logits.to(dtype=router_logits.dtype, device=router_logits.device)
