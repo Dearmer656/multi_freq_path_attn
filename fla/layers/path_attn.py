@@ -6862,8 +6862,13 @@ class PaTHAttention(nn.Module):
         g_max = float(getattr(self.config, "wavelet_ctxscale_g_max", self.wavelet_ctxscale_g_max))
         gate_param = self.mlp_bias_logit_bias_a if use_mlp_bias_baseline else self.wavelet_logit_bias_a
         gate_head_param = self.mlp_bias_logit_bias_a_head if use_mlp_bias_baseline else self.wavelet_logit_bias_a_head
-        use_head_gate = bool(getattr(self, "wavelet_ctxscale_use_head_gate", False)) and (gate_head_param is not None)
-        disable_layer_gate = bool(getattr(self, "wavelet_ctxscale_disable_layer_gate", False)) and (not use_head_gate)
+        # g_layer removed (2026-08-01): the learnable layer/head gate was a source of
+        # silent inconsistency across PAT-234 configs (K1 configs had it disabled,
+        # K2-K5 independent_rms configs had it active). Force g_layer=1.0 unconditionally
+        # so wavelet_ctxscale_disable_layer_gate/wavelet_ctxscale_use_head_gate no longer
+        # have any effect, regardless of what a supply_model.cfg requests.
+        use_head_gate = False
+        disable_layer_gate = True
         gate_branch = "layer_gate_active"
         if use_head_gate:
             gate_branch = "head_gate_active"
