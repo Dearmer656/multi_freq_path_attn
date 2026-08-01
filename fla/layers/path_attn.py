@@ -6100,8 +6100,22 @@ class PaTHAttention(nn.Module):
         delta = qf - q_corr
         if self.wavelet_ctx_feat_detach_delta:
             delta = delta.detach()
+        if getattr(self, "_pat_g0_cap", None) is not None:  # PAT-243 q-q_corr cross-head disagreement probe (default off)
+            # Per (batch, position): variance of (q - q_corr) across heads, averaged over
+            # head_dim -- a "how much do heads disagree" scalar. The router only ever sees
+            # the head-mean (d_mean below), so this measures information the router's own
+            # feature discards, to test whether gate strength correlates with head disagreement.
+            head_disagreement = delta.var(dim=2, unbiased=False).mean(dim=-1)  # [B, T]
+            self._pat_g0_cap.setdefault("qcorr_head_disagreement", []).append(
+                (int(self.layer_idx), head_disagreement.detach().float().cpu())
+            )
         q_mean = qf.mean(dim=2)
         d_mean = delta.mean(dim=2)
+        if getattr(self, "_pat_g0_cap", None) is not None:  # PAT-243: magnitude of the router's actual input feature
+            d_mean_norm = d_mean.detach().float().norm(dim=-1)  # [B, T]
+            self._pat_g0_cap.setdefault("qcorr_dmean_norm", []).append(
+                (int(self.layer_idx), d_mean_norm.cpu())
+            )
         if mode == "q_minus_qcorr_meanh":
             return feat_ln(d_mean.to(ln_dtype))
         if mode == "q_minus_qcorr_rmsh":
