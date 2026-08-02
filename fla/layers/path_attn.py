@@ -6571,6 +6571,12 @@ class PaTHAttention(nn.Module):
                 f"got {tuple(x_feat.shape)}."
             )
         router_logits = router_mod(x_feat)
+        if getattr(self, "_pat_restore_router_logits_rms", False):
+            # Opt-in restoration (default off) of the router_logits RMS-norm that was
+            # removed in commit 968a971f81 (2026-07-31), for faithfully re-analyzing
+            # checkpoints that were actually trained with this step active. Does not
+            # affect training or any default forward pass.
+            router_logits = self._rms_norm_last_dim(router_logits, eps=float(self.wavelet_ctxscale_router_rms_eps))
         if getattr(self, "_pat_g0_cap", None) is not None:  # PAT-243 raw pre-sigmoid router_logits probe (default off)
             self._pat_g0_cap.setdefault("router_logits_raw", []).append(
                 (int(lid), router_logits.detach().float().cpu())
