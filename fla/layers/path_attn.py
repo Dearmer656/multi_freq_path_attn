@@ -2759,7 +2759,7 @@ class PaTHAttention(nn.Module):
         # every logit (null + scales) is a cosine in [-1,1]. Composes with norm_mode:
         # cosine + dual_temp = the well-posed learnable-temperature design; cosine + none
         # = fixed cosine router. Default off (raw logits).
-        self.wavelet_router_cosine = bool(getattr(config, "wavelet_router_cosine", False))
+        self.wavelet_router_cosine = self._as_bool(getattr(config, "wavelet_router_cosine", False), default=False)
         if self.wavelet_router_norm_mode in ("dual_temp", "dual_temp_scale_rms", "dual_temp_scale_none"):
             # Bounded log-sigmoid temperature: tau = tau_min * (tau_max/tau_min)^sigmoid(raw).
             # Keeps tau in [tau_min, tau_max] with a smooth (never-zero) gradient, preventing
