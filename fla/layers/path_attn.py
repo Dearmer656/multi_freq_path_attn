@@ -6694,6 +6694,10 @@ class PaTHAttention(nn.Module):
         else:
             tau_null = tau
             tau_scale = tau
+        # PAT-244: stash effective router temperatures for the per-layer stats line.
+        self._last_router_norm_mode = _router_norm_mode
+        self._last_router_tau_null = float(tau_null.detach()) if torch.is_tensor(tau_null) else float(tau_null)
+        self._last_router_tau_scale = float(tau_scale.detach()) if torch.is_tensor(tau_scale) else float(tau_scale)
         if router_sigmoid_mode == "softmax":
             # All options compete together: [null, scale1, ..., scaleK]
             pi = torch.softmax(router_logits / tau, dim=-1)
@@ -8072,6 +8076,9 @@ class PaTHAttention(nn.Module):
                 "wavelet_mode": str(wavelet_mode_resolved),
                 "basis_control": str(basis_control),
                 "router_mode": str(router_mode),
+                "router_norm_mode": str(getattr(self, "_last_router_norm_mode", "none")),
+                "router_tau_null": float(getattr(self, "_last_router_tau_null", float("nan"))),
+                "router_tau_scale": float(getattr(self, "_last_router_tau_scale", float("nan"))),
                 "router_jitter_style": str(router_jitter_style),
                 "router_jitter_style_resolved": str(router_jitter_style_resolved),
                 "router_jitter_std": float(router_jitter_std),
@@ -8431,6 +8438,9 @@ class PaTHAttention(nn.Module):
             f"wavelet_mode={payload.get('wavelet_mode', 'na')} "
             f"basis_ctrl={payload.get('basis_control', 'none')} "
             f"router_mode={payload.get('router_mode', 'softmax')} "
+            f"router_norm_mode={payload.get('router_norm_mode', 'none')} "
+            f"router_tau_null={payload.get('router_tau_null', float('nan')):.6e} "
+            f"router_tau_scale={payload.get('router_tau_scale', float('nan')):.6e} "
             f"{jitter_stats}"
             f"{router_gate_stats}"
             f"{norm_stats}"
