@@ -2756,17 +2756,25 @@ class PaTHAttention(nn.Module):
         ):
             self.wavelet_router_norm_mode = "none"
         if self.wavelet_router_norm_mode in ("dual_temp", "dual_temp_scale_rms", "dual_temp_scale_none"):
-            # softplus-parameterized so the effective temperature stays strictly positive;
-            # init raw via inverse-softplus so softplus(raw) == the requested effective tau.
+            # Bounded log-sigmoid temperature: tau = tau_min * (tau_max/tau_min)^sigmoid(raw).
+            # Keeps tau in [tau_min, tau_max] with a smooth (never-zero) gradient, preventing
+            # the unbounded-softplus instability where per-layer temps diverged to ~1e31 or
+            # collapsed to ~1e-4. Init raw via the inverse map so tau starts at tau_*_init.
+            self.router_tau_min = float(getattr(config, "wavelet_router_tau_min", 0.1))
+            self.router_tau_max = float(getattr(config, "wavelet_router_tau_max", 10.0))
             _tau_null_init = float(getattr(config, "wavelet_router_tau_null_init", 1.0))
             _tau_scale_init = float(getattr(config, "wavelet_router_tau_scale_init", 1.0))
-            def _inv_softplus(t):
-                return math.log(math.expm1(max(float(t), 1e-4)))
+            def _inv_bounded_tau(t):
+                lo, hi = self.router_tau_min, self.router_tau_max
+                t = min(max(float(t), lo * (1.0 + 1e-4)), hi * (1.0 - 1e-4))
+                frac = math.log(t / lo) / math.log(hi / lo)
+                frac = min(max(frac, 1e-4), 1.0 - 1e-4)
+                return math.log(frac / (1.0 - frac))  # logit
             self.router_tau_null_raw = nn.Parameter(
-                torch.tensor(_inv_softplus(_tau_null_init), dtype=torch.float32)
+                torch.tensor(_inv_bounded_tau(_tau_null_init), dtype=torch.float32)
             )
             self.router_tau_scale_raw = nn.Parameter(
-                torch.tensor(_inv_softplus(_tau_scale_init), dtype=torch.float32)
+                torch.tensor(_inv_bounded_tau(_tau_scale_init), dtype=torch.float32)
             )
         self.wavelet_ctxscale_chunk_q = max(1, int(getattr(config, "wavelet_ctxscale_chunk_q", 128)))
         self.wavelet_ctxscale_max_log_samples = max(
@@ -6686,11 +6694,15 @@ class PaTHAttention(nn.Module):
             )
         _is_dual_temp = _router_norm_mode in ("dual_temp", "dual_temp_scale_rms", "dual_temp_scale_none")
         if _is_dual_temp:
-            tau_null = F.softplus(self.router_tau_null_raw).to(router_logits.dtype) + 1e-4
+            # bounded log-sigmoid temperature (see __init__): tau in [tau_min, tau_max]
+            _tmin = float(getattr(self, "router_tau_min", 0.1))
+            _tmax = float(getattr(self, "router_tau_max", 10.0))
+            _tratio = _tmax / _tmin
+            tau_null = (_tmin * _tratio ** torch.sigmoid(self.router_tau_null_raw)).to(router_logits.dtype)
             if _router_norm_mode == "dual_temp_scale_none":
                 tau_scale = router_logits.new_tensor(1.0)
             else:
-                tau_scale = F.softplus(self.router_tau_scale_raw).to(router_logits.dtype) + 1e-4
+                tau_scale = (_tmin * _tratio ** torch.sigmoid(self.router_tau_scale_raw)).to(router_logits.dtype)
         else:
             tau_null = tau
             tau_scale = tau
