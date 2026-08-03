@@ -2745,8 +2745,8 @@ class PaTHAttention(nn.Module):
         # PAT-244: router-logit normalization mode + decoupled learnable temperatures.
         #   "none"                 -> current behavior (single shared tau, no norm)
         #   "rms_joint"            -> re-add the removed joint RMS over [null, scales] (baseline-rms)
-        #   "dual_temp"            -> tau_null on g0 (sigmoid); tau_scale via softmax(s/tau_scale)
-        #   "dual_temp_scale_rms"  -> tau_null on g0; RMS-norm scale logits (null excluded) then softmax(s/tau_scale)
+        #   "dual_temp"            -> tau_null on g0; tau_scale on scale branch (with_null: sigmoid-normalize w=g/sum(g); independent: sigmoid). SOFTMAX FORBIDDEN.
+        #   "dual_temp_scale_rms"  -> as dual_temp, but RMS-norm the scale logits (null excluded) first
         #   "dual_temp_scale_none" -> tau_null on g0; scale branch has no temperature (raw)
         self.wavelet_router_norm_mode = str(
             getattr(config, "wavelet_router_norm_mode", "none")
@@ -6740,20 +6740,19 @@ class PaTHAttention(nn.Module):
             # 1) null vs non-null compete through g0_gate (temperature tau_null)
             # 2) scales compete conditionally inside non-null (temperature tau_scale)
             g0_gate = torch.sigmoid(router_logits[..., 0:1] / tau_null)          # non-null mass
-            if _is_dual_temp:
-                # PAT-244: decoupled scale competition via softmax(s / tau_scale),
-                # optionally RMS-normalizing ONLY the scale logits (null excluded) first.
-                # At K==1 this softmax over a length-1 axis is 1.0 -> pi_scale == g0_gate.
-                s_logits = router_logits[..., 1:]
-                if _router_norm_mode == "dual_temp_scale_rms":
-                    s_logits = self._rms_norm_last_dim(
-                        s_logits, eps=float(self.wavelet_ctxscale_router_rms_eps)
-                    )
-                w = torch.softmax(s_logits / tau_scale, dim=-1)                  # conditional scale distribution
-            else:
-                g = torch.sigmoid(router_logits[..., 1:] / tau_scale)           # [..., K]
-                sum_g = g.sum(dim=-1, keepdim=True).clamp_min(eps)
-                w = g / sum_g                                                    # conditional scale distribution
+            # PAT-244: SOFTMAX IS FORBIDDEN here. Keep the original sigmoid-normalize
+            # (w = g/sum(g)); dual_temp only (a) applies the decoupled tau_scale and
+            # (b) optionally RMS-normalizes the scale logits first. This keeps the
+            # normalization FUNCTION identical to the baseline so dual_temp differs
+            # from baseline only by the temperature (no softmax-vs-sigmoid confound).
+            s_logits = router_logits[..., 1:]
+            if _is_dual_temp and _router_norm_mode == "dual_temp_scale_rms":
+                s_logits = self._rms_norm_last_dim(
+                    s_logits, eps=float(self.wavelet_ctxscale_router_rms_eps)
+                )
+            g = torch.sigmoid(s_logits / tau_scale)                             # [..., K]
+            sum_g = g.sum(dim=-1, keepdim=True).clamp_min(eps)
+            w = g / sum_g                                                       # conditional scale distribution
             nonnull_gate = g0_gate
             pi_scale_without_null_gate = w
             pi_scale = g0_gate * w                                               # total non-null mass = g0_gate
