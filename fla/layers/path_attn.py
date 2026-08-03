@@ -2755,6 +2755,11 @@ class PaTHAttention(nn.Module):
             "none", "rms_joint", "dual_temp", "dual_temp_scale_rms", "dual_temp_scale_none"
         ):
             self.wavelet_router_norm_mode = "none"
+        # PAT-244 unified cosine router: L2-normalize router feature + each weight row so
+        # every logit (null + scales) is a cosine in [-1,1]. Composes with norm_mode:
+        # cosine + dual_temp = the well-posed learnable-temperature design; cosine + none
+        # = fixed cosine router. Default off (raw logits).
+        self.wavelet_router_cosine = bool(getattr(config, "wavelet_router_cosine", False))
         if self.wavelet_router_norm_mode in ("dual_temp", "dual_temp_scale_rms", "dual_temp_scale_none"):
             # Bounded log-sigmoid temperature: tau = tau_min * (tau_max/tau_min)^sigmoid(raw).
             # Keeps tau in [tau_min, tau_max] with a smooth (never-zero) gradient, preventing
@@ -6605,6 +6610,16 @@ class PaTHAttention(nn.Module):
                 f"got {tuple(x_feat.shape)}."
             )
         router_logits = router_mod(x_feat)
+        if getattr(self, "wavelet_router_cosine", False):
+            # PAT-244 unified cosine router (CLIP / QK-norm template): gauge-fix EVERY
+            # logit (null + all K scales) by L2-normalizing the router feature and each
+            # router-weight row, so logit_j = cos(x_feat, w_j) in [-1,1]. This removes the
+            # z/tau scale redundancy that made a raw-logit learnable temperature ill-posed
+            # (see issue PAT-244). Bias is dropped (a cosine has no additive offset).
+            _rw = router_mod.weight  # [K+1, head_dim]
+            _xhat = F.normalize(x_feat.to(torch.float32), dim=-1, eps=1e-6)
+            _what = F.normalize(_rw.to(torch.float32), dim=-1, eps=1e-6)
+            router_logits = F.linear(_xhat, _what).to(router_logits.dtype)  # cosine in [-1,1]
         if getattr(self, "_pat_g0_cap", None) is not None:  # PAT-243 raw pre-sigmoid router_logits probe (default off)
             self._pat_g0_cap.setdefault("router_logits_raw", []).append(
                 (int(lid), router_logits.detach().float().cpu())
@@ -6708,6 +6723,7 @@ class PaTHAttention(nn.Module):
             tau_scale = tau
         # PAT-244: stash effective router temperatures for the per-layer stats line.
         self._last_router_norm_mode = _router_norm_mode
+        self._last_router_cosine = int(bool(getattr(self, "wavelet_router_cosine", False)))
         self._last_router_tau_null = float(tau_null.detach()) if torch.is_tensor(tau_null) else float(tau_null)
         self._last_router_tau_scale = float(tau_scale.detach()) if torch.is_tensor(tau_scale) else float(tau_scale)
         if router_sigmoid_mode == "softmax":
@@ -8089,6 +8105,7 @@ class PaTHAttention(nn.Module):
                 "basis_control": str(basis_control),
                 "router_mode": str(router_mode),
                 "router_norm_mode": str(getattr(self, "_last_router_norm_mode", "none")),
+                "router_cosine": int(getattr(self, "_last_router_cosine", 0)),
                 "router_tau_null": float(getattr(self, "_last_router_tau_null", float("nan"))),
                 "router_tau_scale": float(getattr(self, "_last_router_tau_scale", float("nan"))),
                 "router_jitter_style": str(router_jitter_style),
@@ -8451,6 +8468,7 @@ class PaTHAttention(nn.Module):
             f"basis_ctrl={payload.get('basis_control', 'none')} "
             f"router_mode={payload.get('router_mode', 'softmax')} "
             f"router_norm_mode={payload.get('router_norm_mode', 'none')} "
+            f"router_cosine={payload.get('router_cosine', 0)} "
             f"router_tau_null={payload.get('router_tau_null', float('nan')):.6e} "
             f"router_tau_scale={payload.get('router_tau_scale', float('nan')):.6e} "
             f"{jitter_stats}"
