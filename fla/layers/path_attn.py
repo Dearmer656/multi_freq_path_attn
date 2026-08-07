@@ -2815,6 +2815,21 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctxscale_scale_dependent_shift = self._as_bool(
             getattr(config, "wavelet_ctxscale_scale_dependent_shift", False), default=False
         )
+        self.wavelet_ctxscale_shift_legacy_symmetric = self._as_bool(
+            getattr(config, "wavelet_ctxscale_shift_legacy_symmetric", False), default=False
+        )
+        # PAT-244: opt-in independent per-scale shift head. Default (False) keeps the
+        # original single shared shift_proj (1 output, same beta_m applied to every
+        # scale index, just rescaled by each scale's own rho_i under
+        # scale_dependent_shift=true, or literally identical under
+        # scale_dependent_shift=false). True gives each of the K scales its own
+        # learned shift decision (shift_proj outputs K values instead of 1) --
+        # required for a true "same scale, independently-learned shift" test.
+        # Changes wavelet_shift_proj's output shape, so checkpoints trained with
+        # this flag are NOT loadable under the default (and vice versa).
+        self.wavelet_ctxscale_shift_per_scale = self._as_bool(
+            getattr(config, "wavelet_ctxscale_shift_per_scale", False), default=False
+        )
         if self._as_bool(getattr(config, "lw_residual_hw_enable", False), default=False):
             raise ValueError(
                 "Head-wise wavelet routing has been removed; "
@@ -3302,7 +3317,8 @@ class PaTHAttention(nn.Module):
         else:
             self.wavelet_static_router_logits = None
         self.wavelet_shift_ln = nn.LayerNorm(self.hidden_size, eps=getattr(config, "layer_norm_epsilon", 1e-5))
-        self.wavelet_shift_proj = nn.Linear(self.hidden_size, 1, bias=True)
+        _shift_proj_out = self.wavelet_ctxscale_k if self.wavelet_ctxscale_shift_per_scale else 1
+        self.wavelet_shift_proj = nn.Linear(self.hidden_size, _shift_proj_out, bias=True)
         film_in_dim = self.wavelet_ctxscale_k + 2
         self.wavelet_bias_film_ln = nn.LayerNorm(film_in_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
         self.wavelet_bias_film = nn.Sequential(
@@ -6923,7 +6939,13 @@ class PaTHAttention(nn.Module):
         shift_ln = self.mlp_bias_shift_ln if use_mlp_bias_baseline else self.wavelet_shift_ln
         shift_proj = self.mlp_bias_shift_proj if use_mlp_bias_baseline else self.wavelet_shift_proj
         h_ln = shift_ln(hidden_states.to(device=device, dtype=shift_ln.weight.dtype))
-        rho = torch.sigmoid(shift_proj(h_ln).squeeze(-1))
+        shift_per_scale = bool(getattr(self, "wavelet_ctxscale_shift_per_scale", False)) and not use_mlp_bias_baseline
+        if shift_per_scale:
+            # [B, T, K] -- one independently-learned shift decision per scale index,
+            # instead of one shared decision broadcast to every scale.
+            rho = torch.sigmoid(shift_proj(h_ln))
+        else:
+            rho = torch.sigmoid(shift_proj(h_ln).squeeze(-1))
         # Causal rho intervention: override rho to a fixed constant for ablation studies.
         # Set wavelet_ctxscale_rho_override=<float in [0,1]> in supply_model.cfg to activate.
         _rho_override = getattr(self, "wavelet_ctxscale_rho_override", None)
@@ -6952,13 +6974,21 @@ class PaTHAttention(nn.Module):
         else:
             if use_abs_shift_causal:
                 # Causal absolute-position shift: each query q selects center from [0, q].
-                q_pos = torch.arange(T_test, device=device, dtype=torch.float32).view(1, T_test)
+                q_pos = torch.arange(T_test, device=device, dtype=torch.float32).view(1, T_test, 1) if shift_per_scale else torch.arange(T_test, device=device, dtype=torch.float32).view(1, T_test)
                 beta_m = torch.round(rho * q_pos)
                 beta_m = torch.minimum(beta_m, q_pos).clamp_min_(0.0)
             else:
                 # Legacy token-index shift.
                 beta_upper = max(1, int(T_used - 1)) if apply_shift_t_scaling else max(1, int(T_test - 1))
-                beta_m = torch.round(rho * float(beta_upper)).clamp_(0.0, float(beta_upper))
+                if bool(getattr(self, "wavelet_ctxscale_shift_legacy_symmetric", False)):
+                    # PAT-244: opt-in symmetric variant, range [-beta_upper, +beta_upper] instead of
+                    # the default one-directional [0, beta_upper]. Combine with wavelet_shift_T_mode=
+                    # train_ref + wavelet_shift_T_ref=L_train to keep beta_upper fixed to training
+                    # length regardless of L_test, instead of the legacy default (T_test-1, which
+                    # implicitly grows the shift range at longer test lengths).
+                    beta_m = (2.0 * rho - 1.0) * float(beta_upper)
+                else:
+                    beta_m = torch.round(rho * float(beta_upper)).clamp_(0.0, float(beta_upper))
 
         if self.wavelet_logit_bias_debug_assert:
             if not torch.isfinite(pi).all():
@@ -7353,10 +7383,14 @@ class PaTHAttention(nn.Module):
                 for i in range(K):
                     scale_idx = int(perm[i].item()) if perm is not None else int(i)
                     s_i = scales[scale_idx]
+                    # PAT-244: beta_m is [B,T,K] when wavelet_ctxscale_shift_per_scale is
+                    # enabled (each scale index has its own independently-learned shift
+                    # decision); otherwise [B,T] (one shared decision broadcast to all K).
+                    beta_m_i = beta_m[:, q0:q1, scale_idx] if shift_per_scale else beta_m[:, q0:q1]
                     if use_scale_coupled_shift:
-                        beta_i = beta_m[:, q0:q1] * s_i
+                        beta_i = beta_m_i * s_i
                     else:
-                        beta_i = beta_m[:, q0:q1]
+                        beta_i = beta_m_i
 
                     base_x_i = diff.view(1, 1, T)
                     if getattr(self, "wavelet_ctxscale_dual_center_enable", False):
