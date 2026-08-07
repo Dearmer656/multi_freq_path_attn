@@ -7973,7 +7973,14 @@ class PaTHAttention(nn.Module):
             rho_q = _quantiles_flat(rho_sample, qs=(0.5, 0.9, 0.99))
 
             beta_sample = torch.nan_to_num(beta_m.index_select(1, sample_q_idx).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+            beta_per_scale_mean_str = ""
             if shift_per_scale:
+                # PAT-244: capture the per-scale breakdown BEFORE collapsing to [B,T]
+                # for the (K-agnostic) quantile block below -- otherwise there is no
+                # way to see whether the K independently-learned shift heads have
+                # actually diverged from each other.
+                _beta_per_scale_mean = beta_sample.mean(dim=(0, 1)).tolist()
+                beta_per_scale_mean_str = "beta_per_scale_mean=[" + ",".join(f"{v:.4e}" for v in _beta_per_scale_mean) + "] "
                 beta_sample = beta_sample.mean(dim=-1)
             beta_q = _quantiles_flat(beta_sample, qs=(0.5, 0.9, 0.99))
             if use_scale_coupled_shift:
@@ -8108,6 +8115,7 @@ class PaTHAttention(nn.Module):
                 "beta_p90": float(beta_q["p90"]),
                 "beta_p99": float(beta_q["p99"]),
                 "beta_clamp_frac": beta_clamped,
+                "beta_per_scale_mean_str": beta_per_scale_mean_str,
                 "far_only": int(far_only),
                 "far_min_delta": int(self.wavelet_ctxscale_far_min_delta),
                 "head_frac": float(head_mask.mean().item()) if head_mask is not None else 1.0,
@@ -8529,7 +8537,8 @@ class PaTHAttention(nn.Module):
             f"null_mean={payload['pi_null_mean']:.6e} | "
             f"rho p50={payload['rho_p50']:.6e} p90={payload['rho_p90']:.6e} p99={payload['rho_p99']:.6e} | "
             f"beta p50={payload['beta_p50']:.6e} p90={payload['beta_p90']:.6e} "
-            f"p99={payload['beta_p99']:.6e} clamp_frac={payload['beta_clamp_frac']:.6e} | "
+            f"p99={payload['beta_p99']:.6e} clamp_frac={payload['beta_clamp_frac']:.6e} "
+            f"{payload.get('beta_per_scale_mean_str', '')}| "
             f"far_only={int(payload.get('far_only', 0))} far_min_delta={int(payload.get('far_min_delta', 0))} "
             f"head_frac={payload.get('head_frac', 1.0):.6e} head_count={int(payload.get('head_count', 0))} | "
             f"gate_branch={payload.get('gate_branch', 'na')} "
