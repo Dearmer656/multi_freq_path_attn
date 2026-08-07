@@ -7771,6 +7771,10 @@ class PaTHAttention(nn.Module):
                 posinf=0.0,
                 neginf=0.0,
             )
+            if shift_per_scale:
+                # PAT-244: same trailing-K-dim issue as beta_sample above -- this
+                # analysis block predates per-scale shift and expects [B,T].
+                beta_sample_a = beta_sample_a.mean(dim=-1)
             beta_over_t_a = beta_sample_a / float(max(1, int(T - 1)))
             beta_over_t_q_a = _quantiles_flat(beta_over_t_a, qs=(0.5, 0.9, 0.99))
             if use_scale_coupled_shift:
@@ -7961,9 +7965,16 @@ class PaTHAttention(nn.Module):
                 alpha_p90 = float(alpha_q["p90"])
 
             rho_sample = torch.nan_to_num(rho.index_select(1, sample_q_idx).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+            if shift_per_scale:
+                # PAT-244: rho/beta_m carry a trailing K dim when per-scale shift is
+                # enabled; this diagnostic block predates that and expects [B,T].
+                # Mean over K for logging purposes only -- does not affect training.
+                rho_sample = rho_sample.mean(dim=-1)
             rho_q = _quantiles_flat(rho_sample, qs=(0.5, 0.9, 0.99))
 
             beta_sample = torch.nan_to_num(beta_m.index_select(1, sample_q_idx).detach().float(), nan=0.0, posinf=0.0, neginf=0.0)
+            if shift_per_scale:
+                beta_sample = beta_sample.mean(dim=-1)
             beta_q = _quantiles_flat(beta_sample, qs=(0.5, 0.9, 0.99))
             if use_scale_coupled_shift:
                 shift_unit_max = max(float(getattr(self, "wavelet_ctxscale_shift_unit_max", 1.0)), 1e-6)
