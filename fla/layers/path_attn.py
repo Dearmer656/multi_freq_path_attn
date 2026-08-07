@@ -2830,6 +2830,29 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctxscale_shift_per_scale = self._as_bool(
             getattr(config, "wavelet_ctxscale_shift_per_scale", False), default=False
         )
+        # PAT-244: shift_number (S) generates S independently-learnable-shift
+        # copies of EACH distinct scale in wavelet_ctxscale_scale_max_exp, while
+        # the router still makes only ONE weighting decision per distinct scale
+        # (all S copies of a given scale share the same router gate). This is
+        # architecturally different from just listing the same scale K times in
+        # wavelet_ctxscale_scale_max_exp, which forces the router to separately
+        # (and redundantly) learn to weight near-identical candidates. Requires
+        # wavelet_ctxscale_shift_per_scale=true (otherwise the S copies of a
+        # scale would share not just the router gate but also the shift decision,
+        # making them literally identical). Default 1 is a no-op, bit-identical
+        # to not having this flag at all.
+        self.wavelet_ctxscale_shift_number = int(getattr(config, "wavelet_ctxscale_shift_number", 1))
+        if self.wavelet_ctxscale_shift_number < 1:
+            raise ValueError(
+                f"wavelet_ctxscale_shift_number must be >= 1, got {self.wavelet_ctxscale_shift_number}"
+            )
+        if self.wavelet_ctxscale_shift_number > 1 and not self.wavelet_ctxscale_shift_per_scale:
+            raise ValueError(
+                "wavelet_ctxscale_shift_number > 1 requires wavelet_ctxscale_shift_per_scale=true "
+                "(otherwise the shift-number copies of a scale would share the same shift decision "
+                "too, making them literally identical, not just router-tied)."
+            )
+        self.wavelet_ctxscale_k_total = self.wavelet_ctxscale_k * self.wavelet_ctxscale_shift_number
         if self._as_bool(getattr(config, "lw_residual_hw_enable", False), default=False):
             raise ValueError(
                 "Head-wise wavelet routing has been removed; "
@@ -3284,15 +3307,23 @@ class PaTHAttention(nn.Module):
             _max_exp = float(_max_exp)
             _scale_exps = [_max_exp / 2.0]
 
+        # PAT-244: expand each distinct scale into shift_number consecutive
+        # copies (repeat, not tile: [e0,e0,e0,e1,e1,e1] for K=2,S=3) -- the
+        # forward-pass router-output expansion below uses repeat_interleave
+        # with the same consecutive-block ordering, so this buffer's layout
+        # must match it exactly for the pi<->scale correspondence to hold.
+        _shift_number = self.wavelet_ctxscale_shift_number
+        _scale_exps_expanded = [e for e in _scale_exps for _ in range(_shift_number)]
+
         self.register_buffer(
             "wavelet_ctxscale_scales",
-            torch.tensor([2.0 ** e * SCALE_MULTIPLIER_DICT[self.bias_type] for e in _scale_exps], dtype=torch.float32),
+            torch.tensor([2.0 ** e * SCALE_MULTIPLIER_DICT[self.bias_type] for e in _scale_exps_expanded], dtype=torch.float32),
             persistent=False,
         )
         if layer_idx in (0, None):
             print(
-                f"[PAT-225] wavelet_ctxscale_k={_K} effective scales="
-                f"{[float(2.0 ** e * SCALE_MULTIPLIER_DICT[self.bias_type]) for e in _scale_exps]}",
+                f"[PAT-225] wavelet_ctxscale_k={_K} shift_number={_shift_number} effective scales="
+                f"{[float(2.0 ** e * SCALE_MULTIPLIER_DICT[self.bias_type]) for e in _scale_exps_expanded]}",
                 flush=True,
             )
         self.wavelet_ctx_feat_ln = nn.LayerNorm(self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
@@ -3317,7 +3348,11 @@ class PaTHAttention(nn.Module):
         else:
             self.wavelet_static_router_logits = None
         self.wavelet_shift_ln = nn.LayerNorm(self.hidden_size, eps=getattr(config, "layer_norm_epsilon", 1e-5))
-        _shift_proj_out = self.wavelet_ctxscale_k if self.wavelet_ctxscale_shift_per_scale else 1
+        # PAT-244: shift_proj needs one output per actual wavelet slot
+        # (k_total = k_distinct * shift_number), not per distinct scale --
+        # router sizing above stays k_distinct+1 since the router only makes
+        # one decision per distinct scale.
+        _shift_proj_out = self.wavelet_ctxscale_k_total if self.wavelet_ctxscale_shift_per_scale else 1
         self.wavelet_shift_proj = nn.Linear(self.hidden_size, _shift_proj_out, bias=True)
         film_in_dim = self.wavelet_ctxscale_k + 2
         self.wavelet_bias_film_ln = nn.LayerNorm(film_in_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
@@ -6850,10 +6885,25 @@ class PaTHAttention(nn.Module):
                 "Head-wise wavelet routing has been removed; "
                 f"router probabilities must be 3D, got {tuple(pi.shape)}."
             )
+        # PAT-244: expand from K_distinct (one router decision per distinct
+        # scale in wavelet_ctxscale_scale_max_exp) to K_total = K_distinct *
+        # shift_number (one wavelet slot per independently-learned-shift copy)
+        # via repeat_interleave -- same consecutive-block ordering as the
+        # scales buffer built in __init__, so slot i's router weight always
+        # matches slot i's scale/shift. do(scale) intervention above still
+        # operates in K_distinct-space (unchanged semantics for existing
+        # do-intervention callers); every copy of an intervened-on scale
+        # inherits the same forced weight through this expansion.
+        _shift_number = int(getattr(self, "wavelet_ctxscale_shift_number", 1))
+        if _shift_number > 1:
+            pi_scale = pi_scale.repeat_interleave(_shift_number, dim=-1)
+            pi = torch.cat([pi[..., 0:1], pi_scale], dim=-1)
+            if pi_scale_without_null_gate is not None:
+                pi_scale_without_null_gate = pi_scale_without_null_gate.repeat_interleave(_shift_number, dim=-1)
         router_mode_is_signed = router_mode == "sigmoid_signed"
         multiscale_rms_after_sum = (
             self.multiscale_norm_requested == "rms"
-            and int(self.wavelet_ctxscale_k) > 1
+            and int(self.wavelet_ctxscale_k_total) > 1
         )
 
         def _router_diag_prob_dist(pi_tensor: torch.Tensor) -> torch.Tensor:
@@ -8182,7 +8232,7 @@ class PaTHAttention(nn.Module):
                 "amplitude_multiplier_override": int(
                     bool(self.wavelet_ctxscale_amplitude_multiplier_override)
                 ),
-                "multiscale_k": int(self.wavelet_ctxscale_k),
+                "multiscale_k": int(self.wavelet_ctxscale_k_total),
                 "norm_scale_mean": (
                     float(norm_scale_sample.mean().item())
                     if norm_scale_sample.numel() > 0
