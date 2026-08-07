@@ -6988,7 +6988,14 @@ class PaTHAttention(nn.Module):
 
         shift_ln = self.mlp_bias_shift_ln if use_mlp_bias_baseline else self.wavelet_shift_ln
         shift_proj = self.mlp_bias_shift_proj if use_mlp_bias_baseline else self.wavelet_shift_proj
-        h_ln = shift_ln(hidden_states.to(device=device, dtype=shift_ln.weight.dtype))
+        # PAT-244: reuse wavelet_ctx_feat_detach_delta (the router feature's detach
+        # switch) for the shift path too, instead of a separate flag -- same
+        # gradient-isolation intent (this module's own weights still train, but
+        # don't reshape the backbone), one knob controls both consistently.
+        _shift_input = hidden_states
+        if bool(getattr(self, "wavelet_ctx_feat_detach_delta", False)) and not use_mlp_bias_baseline:
+            _shift_input = _shift_input.detach()
+        h_ln = shift_ln(_shift_input.to(device=device, dtype=shift_ln.weight.dtype))
         shift_per_scale = bool(getattr(self, "wavelet_ctxscale_shift_per_scale", False)) and not use_mlp_bias_baseline
         if shift_per_scale:
             # [B, T, K] -- one independently-learned shift decision per scale index,
