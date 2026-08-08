@@ -10404,90 +10404,14 @@ class PaTHAttention(nn.Module):
                 analyzer['token_scale_dumper'].close()
                 os._exit(0)
             # pdb.set_trace()
-            if (self.layer_idx < self.config.distill_in_which_layers) and self.training:
-                if self.config.temp_loss_coe != 0:
-                    i_idx, j_idx, delta = sample_index_pairs(self.config.block_size, self.config.sample_num)
-                    batch_idx = torch.randint(
-                        low=0,
-                        high=q.size(0),
-                        size=(self.config.sample_num,),
-                        device=q.device,
-                    )
-                with torch.no_grad():
-                    if self.config.distill_teacher == 'rotary':
-                        rot_q, rot_k = self.rotary_emb.rotate_queries_or_keys(q.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3), self.rotary_emb.rotate_queries_or_keys(k.permute(0, 2, 1, 3).contiguous()).permute(0, 2, 1, 3)
-                        if self.config.temp_loss_coe != 0:
-                            temp_teacher_scores = rot_q[batch_idx, j_idx, ...] * rot_k[batch_idx, i_idx, ...]
-                        spectral_teacher_scores = rot_q[:, -1:, ...] * rot_k
-                    elif self.config.distill_teacher == 'wavelet':
-                        spectral_teacher_scores = compute_wavelet_scores_batched(q[:, -1, ...], k, wavelet_decay_table[:, -1, :])
-                        if self.config.temp_loss_coe != 0:
-                            temp_teacher_scores = compute_pair_wavelet_scores_batched(
-                                q[batch_idx, j_idx, ...],
-                                k[batch_idx, i_idx, ...],
-                                wavelet_decay_table[batch_idx, i_idx, :],
-                            )
-                    elif self.config.distill_teacher == 'shrink':
-                        with torch.no_grad():
-                            spectral_teacher_scores = (q[:, -1:, ...] * k)
-                            norm = spectral_teacher_scores.norm(dim=1, keepdim=True) + 1e-12
-                            spectral_teacher_scores = spectral_teacher_scores / norm
-                    elif self.config.distill_teacher == 'shrink_w_shuffle':
-                        with torch.no_grad():
-                            spectral_teacher_scores = (q[:, -1:, ...] * k)
-                            norm = spectral_teacher_scores.norm(dim=1, keepdim=True) + 1e-12
-                            spectral_teacher_scores = spectral_teacher_scores / norm
-                            spectral_teacher_scores = make_randomized_teacher_T(spectral_teacher_scores)
-                    elif self.config.distill_teacher == 'mean_wavelet_pe':
-                        spectral_teacher_scores = self.teacher_mean_spec[None, :, :, :]
-
-                    else:
-                        raise ValueError(f"Unknown distill_teacher: {self.config.distill_teacher}")
-                if self.config.temp_loss_coe != 0:
-                    temp_path_attn_scores = compute_path_score_multi(
-                                                                        q, k, w, beta,
-                                                                        i_idx=i_idx,
-                                                                        j_idx=j_idx,
-                                                                        batch_idx=batch_idx,
-                                                                    )
-                    temp_loss = self.config.temp_loss_coe * F.mse_loss(temp_path_attn_scores, temp_teacher_scores)
-                else:
-                    temp_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
-                path_attn_scores = path_attn_last_query_elementwise(q[:, -1:, ...], k, w, beta)
-                K = q.size(1) // 2 + 1
-                if self.config.weight_alpha > 0.0:
-                    w = make_highfreq_weight(K, alpha=self.config.weight_alpha, device=q.device)
-                    w = w[None, :, None, None]  # [1, K, 1, 1]
-                else:
-                    w = 1.0
-                if self.config.distill_teacher == "mean_wavelet_pe":
-                    if self.config.wavelet_pe_softmax_use:
-                        path_attn_scores = F.softmax(path_attn_scores, dim=1)
-
-                    # A_s: power spectrum, A_s_log: log spectrum
-                    A_s, A_s_log = spectrum_over_T_multi(path_attn_scores.unsqueeze(1))
-                    A_s_log_T = A_s_log.squeeze(1).transpose(1, 2)  # 和 teacher 对齐
-
-                    eps = 1e-8
-                    # teacher 从文件读的是 power mean_spectrum
-                    # -> 在这里转成 log 频谱
-                    A_t = spectral_teacher_scores  # [1, H, K, D]
-                    A_t_log = torch.log(A_t + eps)
-
-                    spectral_loss = self.config.spectral_loss_coe * F.mse_loss(
-                        A_s_log_T, A_t_log
-                    )
-                else:
-                    if self.config.loss_type == 'mse':
-                        spectral_loss = self.config.spectral_loss_coe * spectral_distill_over_L_mse(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1) if spectral_teacher_scores.dim() == 4 else spectral_teacher_scores, w=w,lambda_kl=0.0, lambda_mse=1.0)
-                    elif self.config.loss_type == 'cos':
-                        spectral_loss = self.config.spectral_loss_coe * spectral_distill_over_L_cos(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1) if spectral_teacher_scores.dim() == 4 else spectral_teacher_scores, w=w)
-                    elif self.config.loss_type == 'band_seperate_cos':
-                        spectral_loss = self.config.spectral_loss_coe * spectral_distill_over_L_cos_3bands(path_attn_scores.unsqueeze(1), spectral_teacher_scores.unsqueeze(1) if spectral_teacher_scores.dim() == 4 else spectral_teacher_scores)
-                dis_loss = temp_loss + spectral_loss
-            else:
-                dis_loss = q.sum() * 0.0
-                # dis_loss = torch.tensor(0.0, device=q.device, dtype=q.dtype)
+            # PAT-244: removed the temp/spectral distillation branch (dead in every
+            # PAT-244/PAT-225 checkpoint this session -- distill_in_which_layers=0
+            # made `self.layer_idx < self.config.distill_in_which_layers` false for
+            # every layer, so dis_loss was always q.sum()*0.0 regardless of
+            # spectral_loss_coe/distill_teacher). Still genuinely used by older
+            # scripts with distill_in_which_layers>0 (train_*_distil_in_layer*.sh);
+            # removing it means those are no longer reproducible as-is.
+            dis_loss = q.sum() * 0.0
             # Keep the regularizer path minimal and easy to rollback: add weak entropy-floor
             # term directly into auxiliary loss used by the existing training objective.
             if self.training:
