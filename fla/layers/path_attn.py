@@ -54,7 +54,10 @@ SCALE_MULTIPLIER_DICT = {
     'wavelet': 1.0,
     'morlet': 3.0249,
     'gaussian': 0.5316,
-    'linear': 0.7228
+    'linear': 0.7228,
+    # PAT-164 basis ablation never calibrated a half-life multiplier for sine
+    # (periodic, no natural width to match) -- left unscaled at 1.0.
+    'sine': 1.0,
 }
 
 
@@ -2818,6 +2821,15 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctxscale_shift_legacy_symmetric = self._as_bool(
             getattr(config, "wavelet_ctxscale_shift_legacy_symmetric", False), default=False
         )
+        # PAT-244: unconditional-RMS mode -- bypass the router entirely (no null gate,
+        # no scale selection). The single wavelet basis (K must be 1) is still built,
+        # RMS-normalized, and shift-applied exactly as usual, but the per-token routing
+        # weight that normally multiplies it (pi_scale, incorporating the null gate) is
+        # replaced with a constant 1.0, so the bias is always added at full strength.
+        # wavelet_ctx_router is still constructed but receives no gradient in this mode.
+        self.wavelet_ctxscale_unconditional_rms = self._as_bool(
+            getattr(config, "wavelet_ctxscale_unconditional_rms", False), default=False
+        )
         # PAT-244: opt-in independent per-scale shift head. Default (False) keeps the
         # original single shared shift_proj (1 output, same beta_m applied to every
         # scale index, just rescaled by each scale's own rho_i under
@@ -2931,6 +2943,9 @@ class PaTHAttention(nn.Module):
         else:
             self.wavelet_anchor_offset = None
         self.wavelet_ctxscale_shift_unit_max = float(getattr(config, "wavelet_ctxscale_shift_unit_max", 1.0))
+        # PAT-244: morlet's internal oscillation frequency (cos(freq*u) inside the
+        # envelope) was hardcoded at 5.0; exposed as a config knob for a frequency sweep.
+        self.wavelet_morlet_freq = float(getattr(config, "wavelet_morlet_freq", 5.0))
         self.wavelet_shift_T_mode = str(getattr(config, "wavelet_shift_T_mode", "legacy")).strip().lower()
         if self.wavelet_shift_T_mode not in ("legacy", "runtime", "train_ref"):
             self.wavelet_shift_T_mode = "legacy"
@@ -3315,14 +3330,29 @@ class PaTHAttention(nn.Module):
         _shift_number = self.wavelet_ctxscale_shift_number
         _scale_exps_expanded = [e for e in _scale_exps for _ in range(_shift_number)]
 
-        self.register_buffer(
-            "wavelet_ctxscale_scales",
-            torch.tensor([2.0 ** e * SCALE_MULTIPLIER_DICT[self.bias_type] for e in _scale_exps_expanded], dtype=torch.float32),
-            persistent=False,
+        # PAT-244: optionally make the scale exponent itself a learned parameter
+        # instead of a fixed buffer. Parametrized in log2-exponent space (not
+        # raw scale) so positivity is automatic (2**x > 0 for any real x) and
+        # gradient steps stay consistent with how this session's whole
+        # scale-sweep analysis operates (u_edge, half-life multipliers, etc.
+        # are all reasoned about in exponent/log2 space).
+        self.wavelet_ctxscale_learnable_scale = self._as_bool(
+            getattr(config, "wavelet_ctxscale_learnable_scale", False), default=False
         )
+        if self.wavelet_ctxscale_learnable_scale:
+            self.wavelet_ctxscale_scale_exp = nn.Parameter(
+                torch.tensor(_scale_exps_expanded, dtype=torch.float32)
+            )
+        else:
+            self.register_buffer(
+                "wavelet_ctxscale_scales",
+                torch.tensor([2.0 ** e * SCALE_MULTIPLIER_DICT[self.bias_type] for e in _scale_exps_expanded], dtype=torch.float32),
+                persistent=False,
+            )
         if layer_idx in (0, None):
             print(
-                f"[PAT-225] wavelet_ctxscale_k={_K} shift_number={_shift_number} effective scales="
+                f"[PAT-225] wavelet_ctxscale_k={_K} shift_number={_shift_number} "
+                f"learnable_scale={self.wavelet_ctxscale_learnable_scale} effective scales="
                 f"{[float(2.0 ** e * SCALE_MULTIPLIER_DICT[self.bias_type]) for e in _scale_exps_expanded]}",
                 flush=True,
             )
@@ -5426,11 +5456,22 @@ class PaTHAttention(nn.Module):
                     f"[wavelet_export warn] kind={export_kind} layer={lid} write_failed=1 err={str(exc)} out={str(out_file)}"
                 )
 
+    def _wavelet_ctxscale_current_scales(self, device=None, dtype=torch.float32) -> torch.Tensor:
+        if getattr(self, "wavelet_ctxscale_learnable_scale", False):
+            scales = 2.0 ** self.wavelet_ctxscale_scale_exp * SCALE_MULTIPLIER_DICT[self.bias_type]
+        else:
+            scales = self.wavelet_ctxscale_scales
+        if device is not None:
+            scales = scales.to(device=device, dtype=dtype)
+        else:
+            scales = scales.to(dtype=dtype)
+        return scales
+
     def _wavelet_analysis_emit_pa_baseline(self, *, layer_idx: Optional[int], step: Optional[int], T: int, B: int):
         lid = int(self.layer_idx if layer_idx is None else layer_idx)
         if not self._wavelet_analysis_enabled_for_layer(layer_idx=lid, need_log=False):
             return
-        scales = self.wavelet_ctxscale_scales.detach().to(dtype=torch.float32)
+        scales = self._wavelet_ctxscale_current_scales().detach()
         K = int(scales.numel())
         zeros = [0.0 for _ in range(K)]
         pi_pa = [1.0] + [0.0 for _ in range(K)]
@@ -5953,9 +5994,9 @@ class PaTHAttention(nn.Module):
     def _sine_basis(u: torch.Tensor) -> torch.Tensor:
         return torch.sin(math.pi * u)
 
-    @staticmethod
-    def _morlet_basis(u: torch.Tensor) -> torch.Tensor:
-        return torch.exp(-0.5 * u.pow(2)) * torch.cos(5.0 * u)
+    def _morlet_basis(self, u: torch.Tensor) -> torch.Tensor:
+        freq = float(getattr(self, "wavelet_morlet_freq", 5.0))
+        return torch.exp(-0.5 * u.pow(2)) * torch.cos(freq * u)
 
     @staticmethod
     def _gaussian_basis(u: torch.Tensor) -> torch.Tensor:
@@ -6615,7 +6656,7 @@ class PaTHAttention(nn.Module):
         qf = q.to(device=device, dtype=torch.float32)
         wf = w.to(device=device, dtype=torch.float32)
         mf = M_used.to(device=device, dtype=torch.float32)
-        scales = self.wavelet_ctxscale_scales.to(device=device, dtype=torch.float32)
+        scales = self._wavelet_ctxscale_current_scales(device=device, dtype=torch.float32)
         K = int(scales.numel())
         # Expose per-token scale mixture for external analysis (same forward pass).
         self._last_ctxscale_router_prob = None
@@ -6866,6 +6907,26 @@ class PaTHAttention(nn.Module):
 
         else:
             raise ValueError(f"Unknown router_sigmoid_mode: {router_sigmoid_mode}")
+
+        if bool(getattr(self, "wavelet_ctxscale_unconditional_rms", False)) and not use_mlp_bias_baseline:
+            # PAT-244: unconditional RMS wavelet -- override whatever the router branch
+            # above computed. No selection (K must be 1, enforced below), no null gate:
+            # the single scale's weight is a constant 1.0, so the (still RMS-normalized,
+            # still shift-applied) basis is added to the logits unconditionally. The
+            # router module ran above (router_logits computed) but its output is
+            # discarded here, so wavelet_ctx_router receives zero gradient in this mode.
+            if K != 1:
+                raise ValueError(
+                    "wavelet_ctxscale_unconditional_rms requires wavelet_ctxscale_k==1 "
+                    f"(no scale selection is defined for K>1); got K={K}."
+                )
+            pi_null = torch.zeros_like(router_logits[..., 0:1])
+            pi_scale = torch.ones_like(router_logits[..., 1:2])
+            pi = torch.cat([pi_null, pi_scale], dim=-1)
+            g0_gate = torch.ones_like(pi_null)
+            nonnull_gate = torch.ones_like(pi_null)
+            pi_scale_without_null_gate = pi_scale
+            router_mode = "unconditional_rms"
 
         if getattr(self, "_pat_g0_cap", None) is not None:  # PAT-243 g0_gate-by-position probe (default off)
             _g0_for_cap = g0_gate if g0_gate is not None else nonnull_gate
