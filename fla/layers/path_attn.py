@@ -3675,7 +3675,7 @@ class PaTHAttention(nn.Module):
         elif multiscale_norm in ("sqrt_keff_detach", "keff_detach"):
             # Runtime-dependent normalization is applied in forward.
             multiscale_sum_scale = 1.0
-        elif multiscale_norm == "rms":
+        elif multiscale_norm in ("rms", "rms_both"):
             # Runtime context-length RMS over the already summed multi-scale bias.
             multiscale_sum_scale = 1.0
         elif multiscale_norm == "gram":
@@ -7027,8 +7027,18 @@ class PaTHAttention(nn.Module):
             if pi_scale_without_null_gate is not None:
                 pi_scale_without_null_gate = pi_scale_without_null_gate.repeat_interleave(_shift_number, dim=-1)
         router_mode_is_signed = router_mode == "sigmoid_signed"
-        multiscale_rms_after_sum = (
+        # "rms_both": per-scale RMS-normalize each basis (like "none"/"sqrt"/"k"),
+        # THEN weighted-sum, THEN ALSO apply the outer joint RMS over the sum (like
+        # "rms"). Isolates cross-scale raw-amplitude fairness (different rho values
+        # have different raw RMS over a fixed causal window -- see PAT-225 comment)
+        # from the "rms" mode's separate auto-gain/shrink-to-zero issue, which this
+        # mode does NOT fix (outer RMS still reinflates a near-zero weighted sum).
+        skip_per_scale_basis_norm = (
             self.multiscale_norm_requested == "rms"
+            and int(self.wavelet_ctxscale_k_total) > 1
+        )
+        multiscale_rms_after_sum = (
+            self.multiscale_norm_requested in ("rms", "rms_both")
             and int(self.wavelet_ctxscale_k_total) > 1
         )
 
@@ -7637,7 +7647,7 @@ class PaTHAttention(nn.Module):
                     if (
                         not skip_common_basis_center_norm
                         and not getattr(self, "wavelet_logit_bias_norm_disable", False)
-                        and not multiscale_rms_after_sum
+                        and not skip_per_scale_basis_norm
                     ):
                         basis_table = self._rms_norm_wavelet_basis(basis_table, q0=q0, eps=eps)
                     if getattr(self, "_pat234_cap", None) is not None:  # PAT-234 stage probe (default off)
