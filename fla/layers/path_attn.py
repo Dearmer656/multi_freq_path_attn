@@ -2830,6 +2830,9 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctxscale_unconditional_rms = self._as_bool(
             getattr(config, "wavelet_ctxscale_unconditional_rms", False), default=False
         )
+        self.wavelet_ctxscale_fixed_scale_ratio = getattr(
+            config, "wavelet_ctxscale_fixed_scale_ratio", None
+        )
         # PAT-244: opt-in independent per-scale shift head. Default (False) keeps the
         # original single shared shift_proj (1 output, same beta_m applied to every
         # scale index, just rescaled by each scale's own rho_i under
@@ -3349,6 +3352,29 @@ class PaTHAttention(nn.Module):
                 torch.tensor([2.0 ** e * SCALE_MULTIPLIER_DICT[self.bias_type] for e in _scale_exps_expanded], dtype=torch.float32),
                 persistent=False,
             )
+        if self.wavelet_ctxscale_fixed_scale_ratio is not None:
+            if len(self.wavelet_ctxscale_fixed_scale_ratio) != _K:
+                raise ValueError(
+                    f"wavelet_ctxscale_fixed_scale_ratio must have {_K} elements, "
+                    f"not {len(self.wavelet_ctxscale_fixed_scale_ratio)}: {self.wavelet_ctxscale_fixed_scale_ratio}"
+                )
+            _fixed_scale_ratio = torch.tensor(
+                self.wavelet_ctxscale_fixed_scale_ratio, dtype=torch.float32
+            )
+            _fixed_scale_ratio_sum = float(_fixed_scale_ratio.sum().item())
+            if (not math.isfinite(_fixed_scale_ratio_sum)) or _fixed_scale_ratio_sum <= 0.0:
+                raise ValueError(
+                    "wavelet_ctxscale_fixed_scale_ratio must sum to a positive finite value, "
+                    f"got {_fixed_scale_ratio_sum} from {self.wavelet_ctxscale_fixed_scale_ratio}"
+                )
+            _fixed_scale_ratio = _fixed_scale_ratio / _fixed_scale_ratio_sum
+            self.register_buffer(
+                "wavelet_ctxscale_fixed_scale_ratio_buf",
+                _fixed_scale_ratio,
+                persistent=False,
+            )
+        else:
+            self.wavelet_ctxscale_fixed_scale_ratio_buf = None
         if layer_idx in (0, None):
             print(
                 f"[PAT-225] wavelet_ctxscale_k={_K} shift_number={_shift_number} "
@@ -3356,6 +3382,12 @@ class PaTHAttention(nn.Module):
                 f"{[float(2.0 ** e * SCALE_MULTIPLIER_DICT[self.bias_type]) for e in _scale_exps_expanded]}",
                 flush=True,
             )
+            if self.wavelet_ctxscale_fixed_scale_ratio_buf is not None:
+                print(
+                    f"[PAT-225] wavelet_ctxscale_fixed_scale_ratio="
+                    f"{self.wavelet_ctxscale_fixed_scale_ratio_buf.detach().cpu().tolist()}",
+                    flush=True,
+                )
         self.wavelet_ctx_feat_ln = nn.LayerNorm(self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
         self.wavelet_ctx_path_ln = nn.LayerNorm(3 * self.head_dim, eps=getattr(config, "layer_norm_epsilon", 1e-5))
         self.wavelet_ctx_path_proj = nn.Linear(3 * self.head_dim, self.head_dim, bias=True)
@@ -6905,6 +6937,22 @@ class PaTHAttention(nn.Module):
             pi = torch.cat([pi_null, pi_scale], dim=-1)
             router_mode = "sigmoid_signed"
 
+        elif router_sigmoid_mode == "positive":
+            # Non-negative analog of "signed": pi_scale = sigmoid(logit) in (0,1),
+            # per scale independently, no shared g0_gate and no null branch (pi=0 is
+            # the natural "off" per scale, via gradient pressure alone). Unlike
+            # with_null_independent_scales there is no separate g0_gate factor
+            # multiplying every scale together -- each scale's weight is a single,
+            # unshared quantity, so it can be interpreted directly as that scale's
+            # own usefulness (no cross-scale coupling through a shared gate).
+            g = torch.sigmoid(router_logits[..., 1:] / tau)
+            nonnull_gate = torch.ones_like(router_logits[..., 0:1])
+            pi_scale_without_null_gate = g
+            pi_scale = g
+            pi_null = torch.zeros_like(router_logits[..., 0:1])
+            pi = torch.cat([pi_null, pi_scale], dim=-1)
+            router_mode = "sigmoid_positive"
+
         else:
             raise ValueError(f"Unknown router_sigmoid_mode: {router_sigmoid_mode}")
 
@@ -6927,6 +6975,23 @@ class PaTHAttention(nn.Module):
             nonnull_gate = torch.ones_like(pi_null)
             pi_scale_without_null_gate = pi_scale
             router_mode = "unconditional_rms"
+
+        if getattr(self, "wavelet_ctxscale_fixed_scale_ratio_buf", None) is not None and not use_mlp_bias_baseline:
+            # Keep g0 learnable/query-conditioned exactly as with_null_independent_scales,
+            # but replace the learned per-scale mixture with a fixed constant ratio.
+            if router_sigmoid_mode != "with_null_independent_scales":
+                raise ValueError(
+                    "wavelet_ctxscale_fixed_scale_ratio requires "
+                    f"wavelet_router_sigmoid_mode='with_null_independent_scales', got {router_sigmoid_mode!r}."
+                )
+            fixed_ratio = self.wavelet_ctxscale_fixed_scale_ratio_buf.to(dtype=g0_gate.dtype, device=g0_gate.device)
+            fixed_ratio = fixed_ratio.view(*([1] * (g0_gate.dim() - 1)), fixed_ratio.shape[-1])
+            pi_scale = g0_gate * fixed_ratio
+            pi_null = (1.0 - g0_gate).clamp(min=0.0, max=1.0)
+            pi = torch.cat([pi_null, pi_scale], dim=-1)
+            nonnull_gate = g0_gate
+            pi_scale_without_null_gate = fixed_ratio.expand_as(pi_scale)
+            router_mode = "sigmoid_with_null_fixed_scale_ratio"
 
         if getattr(self, "_pat_g0_cap", None) is not None:  # PAT-243 g0_gate-by-position probe (default off)
             _g0_for_cap = g0_gate if g0_gate is not None else nonnull_gate
@@ -7107,6 +7172,11 @@ class PaTHAttention(nn.Module):
                     beta_m = (2.0 * rho - 1.0) * float(beta_upper)
                 else:
                     beta_m = torch.round(rho * float(beta_upper)).clamp_(0.0, float(beta_upper))
+
+        self._last_ctxscale_rho = rho.detach().to(dtype=torch.float32)
+        self._last_ctxscale_beta_m = beta_m.detach().to(dtype=torch.float32)
+        self._last_ctxscale_shift_unit_max = float(getattr(self, "wavelet_ctxscale_shift_unit_max", 1.0))
+        self._last_ctxscale_use_scale_coupled_shift = bool(use_scale_coupled_shift)
 
         if self.wavelet_logit_bias_debug_assert:
             if not torch.isfinite(pi).all():
