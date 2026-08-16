@@ -2723,6 +2723,15 @@ class PaTHAttention(nn.Module):
                 "qwab_groups_per_layer must be 1."
             )
         self.wavelet_ctxscale_tau = float(getattr(config, "wavelet_ctxscale_tau", getattr(config, "tau", 1.0)))
+        # PAT-225: fixed (non-learnable) bandwidth for router_sigmoid_mode="gaussian_kernel"
+        # -- a single per-query "focus" scalar mapped through a FIXED unimodal Gaussian
+        # kernel in log2(scale) space, as opposed to K independent per-scale weights
+        # (signed/positive). Per-query DOF = 2 (g0 + focus), matching K1's DOF=1 plus
+        # exactly one new knob. sigma stays a fixed hyperparameter (not learned, not
+        # per-query) so it doesn't add a third per-query degree of freedom.
+        self.wavelet_ctxscale_kernel_sigma = float(
+            getattr(config, "wavelet_ctxscale_kernel_sigma", 0.5)
+        )
         self.wavelet_ctxscale_tau_schedule = str(
             getattr(config, "wavelet_ctxscale_tau_schedule", "none")
         ).strip().lower()
@@ -6952,6 +6961,37 @@ class PaTHAttention(nn.Module):
             pi_null = torch.zeros_like(router_logits[..., 0:1])
             pi = torch.cat([pi_null, pi_scale], dim=-1)
             router_mode = "sigmoid_positive"
+
+        elif router_sigmoid_mode == "gaussian_kernel":
+            # Single-decision-maker scale composition: ONE per-query "focus" scalar
+            # (not K independent weights) maps through a FIXED, unimodal Gaussian
+            # kernel in log2(scale) space to produce the K scale weights, then g0
+            # gates overall apply/no-apply exactly as in "with_null". Per-query DOF
+            # is 2 (g0 + focus) -- matching K1's DOF=1 plus exactly one new knob,
+            # NOT K independent weights like signed/positive. Only router_logits[...,1]
+            # (one scalar) is read as the focus logit; router_logits[...,2:] (if K>1)
+            # are computed by the router MLP but intentionally unused here, same
+            # "computed-but-discarded" pattern as K1's degenerate w or fixedratio's
+            # overridden g. sigma is a FIXED hyperparameter (wavelet_ctxscale_kernel_sigma),
+            # not learned and not per-query, so it doesn't add a third per-query DOF.
+            g0_gate = torch.sigmoid(router_logits[..., 0:1] / tau_null)
+            focus_logit = router_logits[..., 1:2]
+            scales_k = self.wavelet_ctxscale_scales.to(
+                device=focus_logit.device, dtype=focus_logit.dtype
+            )
+            log_scales = torch.log2(scales_k)
+            log_min = log_scales.min()
+            log_max = log_scales.max()
+            mu = torch.sigmoid(focus_logit) * (log_max - log_min) + log_min  # [...,1]
+            sigma = float(self.wavelet_ctxscale_kernel_sigma)
+            log_scales_b = log_scales.view(*([1] * (mu.dim() - 1)), -1)  # [1,...,1,K]
+            g = torch.exp(-(log_scales_b - mu).pow(2) / (2.0 * sigma * sigma))  # [...,K]
+            nonnull_gate = g0_gate
+            pi_scale_without_null_gate = g
+            pi_scale = g0_gate * g
+            pi_null = (1.0 - g0_gate).clamp(min=0.0, max=1.0)
+            pi = torch.cat([pi_null, pi_scale], dim=-1)
+            router_mode = "sigmoid_gaussian_kernel"
 
         else:
             raise ValueError(f"Unknown router_sigmoid_mode: {router_sigmoid_mode}")
