@@ -2842,6 +2842,21 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctxscale_fixed_scale_ratio = getattr(
             config, "wavelet_ctxscale_fixed_scale_ratio", None
         )
+        # PAT-225: query-INDEPENDENT but LEARNED per-scale ratio -- a single nn.Parameter
+        # per layer, shared across every query/token (not derived from router_logits at
+        # all), optimized by gradient descent like any other weight. Sits between
+        # "fixed_scale_ratio" (hand-set constant, never learned) and
+        # "with_null_independent_scales" (learned AND query-conditioned): isolates
+        # whether query-conditioning itself matters, vs. just learning a better-than-1/3
+        # static mixture. Mutually exclusive with wavelet_ctxscale_fixed_scale_ratio.
+        self.wavelet_ctxscale_ratio_learnable = self._as_bool(
+            getattr(config, "wavelet_ctxscale_ratio_learnable", False), default=False
+        )
+        if self.wavelet_ctxscale_ratio_learnable and self.wavelet_ctxscale_fixed_scale_ratio is not None:
+            raise ValueError(
+                "wavelet_ctxscale_ratio_learnable and wavelet_ctxscale_fixed_scale_ratio "
+                "are mutually exclusive."
+            )
         # PAT-244: opt-in independent per-scale shift head. Default (False) keeps the
         # original single shared shift_proj (1 output, same beta_m applied to every
         # scale index, just rescaled by each scale's own rho_i under
@@ -3384,6 +3399,12 @@ class PaTHAttention(nn.Module):
             )
         else:
             self.wavelet_ctxscale_fixed_scale_ratio_buf = None
+        if self.wavelet_ctxscale_ratio_learnable:
+            # Raw logits (not the ratio itself), passed through sigmoid at use-site --
+            # same non-negative-independent-per-scale parameterization as
+            # with_null_independent_scales' g_l, just query-independent (init 0 ->
+            # sigmoid(0)=0.5 each, unbiased starting point).
+            self.wavelet_ctxscale_ratio_param = nn.Parameter(torch.zeros(_K))
         if layer_idx in (0, None):
             print(
                 f"[PAT-225] wavelet_ctxscale_k={_K} shift_number={_shift_number} "
@@ -6946,6 +6967,21 @@ class PaTHAttention(nn.Module):
             pi = torch.cat([pi_null, pi_scale], dim=-1)
             router_mode = "sigmoid_signed"
 
+        elif router_sigmoid_mode == "signed_with_null":
+            # Signed per-scale weight (can flip sign, unlike with_null_independent_scales'
+            # non-negative g), but WITH a shared g0 null/apply gate multiplying every
+            # scale -- the signed analog of with_null_independent_scales. Requested to
+            # test whether adding g0 back to signed changes its (currently worse-than-K1)
+            # result.
+            g0_gate = torch.sigmoid(router_logits[..., 0:1] / tau_null)
+            g = 2.0 * torch.sigmoid(router_logits[..., 1:] / tau_scale) - 1.0
+            nonnull_gate = g0_gate
+            pi_scale_without_null_gate = g
+            pi_scale = g0_gate * g
+            pi_null = (1.0 - g0_gate).clamp(min=0.0, max=1.0)
+            pi = torch.cat([pi_null, pi_scale], dim=-1)
+            router_mode = "sigmoid_signed_with_null"
+
         elif router_sigmoid_mode == "positive":
             # Non-negative analog of "signed": pi_scale = sigmoid(logit) in (0,1),
             # per scale independently, no shared g0_gate and no null branch (pi=0 is
@@ -7032,6 +7068,27 @@ class PaTHAttention(nn.Module):
             nonnull_gate = g0_gate
             pi_scale_without_null_gate = fixed_ratio.expand_as(pi_scale)
             router_mode = "sigmoid_with_null_fixed_scale_ratio"
+
+        if getattr(self, "wavelet_ctxscale_ratio_learnable", False) and not use_mlp_bias_baseline:
+            # Query-INDEPENDENT but LEARNED per-scale ratio: same structural role as the
+            # fixed_scale_ratio override above (g0 stays learnable/query-conditioned,
+            # only the scale-mixture is replaced), except the mixture is a single
+            # nn.Parameter optimized by gradient descent rather than a hand-set constant.
+            if router_sigmoid_mode != "with_null_independent_scales":
+                raise ValueError(
+                    "wavelet_ctxscale_ratio_learnable requires "
+                    f"wavelet_router_sigmoid_mode='with_null_independent_scales', got {router_sigmoid_mode!r}."
+                )
+            learned_ratio = torch.sigmoid(self.wavelet_ctxscale_ratio_param).to(
+                dtype=g0_gate.dtype, device=g0_gate.device
+            )
+            learned_ratio = learned_ratio.view(*([1] * (g0_gate.dim() - 1)), learned_ratio.shape[-1])
+            pi_scale = g0_gate * learned_ratio
+            pi_null = (1.0 - g0_gate).clamp(min=0.0, max=1.0)
+            pi = torch.cat([pi_null, pi_scale], dim=-1)
+            nonnull_gate = g0_gate
+            pi_scale_without_null_gate = learned_ratio.expand_as(pi_scale)
+            router_mode = "sigmoid_with_null_learnable_static_ratio"
 
         if getattr(self, "_pat_g0_cap", None) is not None:  # PAT-243 g0_gate-by-position probe (default off)
             _g0_for_cap = g0_gate if g0_gate is not None else nonnull_gate
