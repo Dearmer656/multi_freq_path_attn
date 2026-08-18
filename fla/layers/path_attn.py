@@ -7458,6 +7458,7 @@ class PaTHAttention(nn.Module):
                     neginf=0.0,
                 )
         logits_out = E_base_raw.to(dtype=torch.float32).clone()
+        self._last_logits_pa_only = E_base_raw.detach().to(dtype=torch.float32)
         if self.wavelet_logit_bias_debug_assert:
             assert E_base_raw.dim() == 4
 
@@ -7997,6 +7998,7 @@ class PaTHAttention(nn.Module):
                 if not torch.isfinite(eff_chunk).all():
                     raise FloatingPointError("ctxscale_shift_v0: non-finite effective bias chunk")
 
+        self._last_logits_full = logits_out.detach().to(dtype=torch.float32)
         if self.wavelet_logit_bias_debug_assert and not torch.isfinite(logits_out).all():
             raise FloatingPointError("ctxscale_shift_v0: non-finite logits after bias injection")
 
