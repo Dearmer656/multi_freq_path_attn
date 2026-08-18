@@ -2892,6 +2892,14 @@ class PaTHAttention(nn.Module):
                 "too, making them literally identical, not just router-tied)."
             )
         self.wavelet_ctxscale_k_total = self.wavelet_ctxscale_k * self.wavelet_ctxscale_shift_number
+        # PAT-225: cap RMS-statistics window during eval; 0 keeps prior full-width behavior.
+        self.wavelet_ctxscale_rms_train_window = int(
+            getattr(config, "wavelet_ctxscale_rms_train_window", 0)
+        )
+        if self.wavelet_ctxscale_rms_train_window < 0:
+            raise ValueError(
+                f"wavelet_ctxscale_rms_train_window must be >= 0, got {self.wavelet_ctxscale_rms_train_window}"
+            )
         if self._as_bool(getattr(config, "lw_residual_hw_enable", False), default=False):
             raise ValueError(
                 "Head-wise wavelet routing has been removed; "
@@ -5999,6 +6007,13 @@ class PaTHAttention(nn.Module):
         self._k1_emit_log(msg)
 
     @staticmethod
+    def _windowed_mean_sq(x: torch.Tensor, window_cap: int) -> torch.Tensor:
+        """Mean of x**2 over the last dim, optionally capped to the first window_cap entries."""
+        if window_cap > 0 and window_cap < x.shape[-1]:
+            x = x[..., :window_cap]
+        return x.pow(2).mean(dim=-1, keepdim=True)
+
+    @staticmethod
     def _rms_norm_last_dim(x: torch.Tensor, eps: float = 1e-6, mask: Optional[torch.Tensor] = None):
         xf = x.to(dtype=torch.float32)
         if mask is None:
@@ -6012,7 +6027,14 @@ class PaTHAttention(nn.Module):
         return xf / denom
 
     def _rms_norm_wavelet_basis(self, basis_table: torch.Tensor, *, q0: int, eps: float):
-        return self._rms_norm_last_dim(basis_table, eps=eps)
+        # PAT-225 causal/window-cap ablation: 0 keeps prior full-width RMS behavior.
+        basis_table_f = basis_table.to(dtype=torch.float32)
+        mean_sq = self._windowed_mean_sq(
+            basis_table_f,
+            int(getattr(self, "wavelet_ctxscale_rms_train_window", 0)),
+        )
+        denom = torch.sqrt(mean_sq.clamp_min(0.0) + float(eps))
+        return basis_table_f / denom
 
     @staticmethod
     def _ricker_wavelet(u: torch.Tensor):
@@ -7780,11 +7802,13 @@ class PaTHAttention(nn.Module):
                             )
                         )
                 elif multiscale_rms_after_sum:
-                    # Context-length RMS over the post-scale-sum bias pattern.
-                    # This intentionally uses the full key/context axis, not a causal prefix.
+                    # PAT-225 causal/window-cap ablation: 0 keeps prior full-width RMS behavior.
                     bias_chunk_f = bias_chunk.to(torch.float32)
                     multiscale_denom = torch.sqrt(
-                        bias_chunk_f.pow(2).mean(dim=-1, keepdim=True).clamp_min(0.0)
+                        self._windowed_mean_sq(
+                            bias_chunk_f,
+                            int(getattr(self, "wavelet_ctxscale_rms_train_window", 0)),
+                        ).clamp_min(0.0)
                         + float(eps)
                     )
                     bias_chunk = (bias_chunk_f / multiscale_denom).to(
