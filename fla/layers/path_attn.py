@@ -7294,10 +7294,10 @@ class PaTHAttention(nn.Module):
             # currently in effect (default per-query g, fixed_scale_ratio, or
             # ratio_learnable) via pi_scale_without_null_gate, which each of those
             # branches already sets -- this override only replaces g0_gate itself.
-            if router_sigmoid_mode != "with_null_independent_scales":
+            if router_sigmoid_mode not in ("with_null_independent_scales", "with_null"):
                 raise ValueError(
-                    "wavelet_ctxscale_g0_learnable requires "
-                    f"wavelet_router_sigmoid_mode='with_null_independent_scales', got {router_sigmoid_mode!r}."
+                    "wavelet_ctxscale_g0_learnable requires wavelet_router_sigmoid_mode "
+                    f"in ('with_null_independent_scales', 'with_null'), got {router_sigmoid_mode!r}."
                 )
             g0_gate = torch.sigmoid(self.wavelet_ctxscale_g0_param).to(
                 dtype=router_logits.dtype, device=router_logits.device
@@ -7316,10 +7316,10 @@ class PaTHAttention(nn.Module):
             # for this decision. Same composition pattern as g0_learnable above --
             # reuses whatever pi_scale_without_null_gate the mixture branch set --
             # except g0_gate is a literal constant, not even an nn.Parameter.
-            if router_sigmoid_mode != "with_null_independent_scales":
+            if router_sigmoid_mode not in ("with_null_independent_scales", "with_null"):
                 raise ValueError(
-                    "wavelet_ctxscale_g0_fixed_value requires "
-                    f"wavelet_router_sigmoid_mode='with_null_independent_scales', got {router_sigmoid_mode!r}."
+                    "wavelet_ctxscale_g0_fixed_value requires wavelet_router_sigmoid_mode "
+                    f"in ('with_null_independent_scales', 'with_null'), got {router_sigmoid_mode!r}."
                 )
             g0_gate = torch.full_like(
                 router_logits[..., 0:1], float(self.wavelet_ctxscale_g0_fixed_value)
