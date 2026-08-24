@@ -2981,6 +2981,25 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctxscale_g0_learnable = self._as_bool(
             getattr(config, "wavelet_ctxscale_g0_learnable", False), default=False
         )
+        # PAT-253: hand-set constant null/apply gate -- e.g. 1.0 means "always fully
+        # apply the wavelet bias branch, no gating at all". Zero learnable parameters
+        # for this decision (unlike g0_learnable's per-layer nn.Parameter), the true
+        # "everything fixed" endpoint paired with fixed_scale_ratio, so a
+        # fixed_scale_ratio + g0_fixed_value=1.0 config has NO learned routing
+        # parameters whatsoever. Mutually exclusive with g0_learnable.
+        self.wavelet_ctxscale_g0_fixed_value = getattr(config, "wavelet_ctxscale_g0_fixed_value", None)
+        if self.wavelet_ctxscale_g0_fixed_value is not None:
+            self.wavelet_ctxscale_g0_fixed_value = float(self.wavelet_ctxscale_g0_fixed_value)
+            if not (0.0 <= self.wavelet_ctxscale_g0_fixed_value <= 1.0):
+                raise ValueError(
+                    "wavelet_ctxscale_g0_fixed_value must be in [0,1], got "
+                    f"{self.wavelet_ctxscale_g0_fixed_value}."
+                )
+        if self.wavelet_ctxscale_g0_learnable and self.wavelet_ctxscale_g0_fixed_value is not None:
+            raise ValueError(
+                "wavelet_ctxscale_g0_learnable and wavelet_ctxscale_g0_fixed_value "
+                "are mutually exclusive."
+            )
         # PAT-244: opt-in independent per-scale shift head. Default (False) keeps the
         # original single shared shift_proj (1 output, same beta_m applied to every
         # scale index, just rescaled by each scale's own rho_i under
@@ -7291,6 +7310,25 @@ class PaTHAttention(nn.Module):
             pi = torch.cat([pi_null, pi_scale], dim=-1)
             nonnull_gate = g0_gate
             router_mode = router_mode + "_g0static"
+
+        if getattr(self, "wavelet_ctxscale_g0_fixed_value", None) is not None and not use_mlp_bias_baseline:
+            # PAT-253: hand-set constant null/apply gate, zero learnable parameters
+            # for this decision. Same composition pattern as g0_learnable above --
+            # reuses whatever pi_scale_without_null_gate the mixture branch set --
+            # except g0_gate is a literal constant, not even an nn.Parameter.
+            if router_sigmoid_mode != "with_null_independent_scales":
+                raise ValueError(
+                    "wavelet_ctxscale_g0_fixed_value requires "
+                    f"wavelet_router_sigmoid_mode='with_null_independent_scales', got {router_sigmoid_mode!r}."
+                )
+            g0_gate = torch.full_like(
+                router_logits[..., 0:1], float(self.wavelet_ctxscale_g0_fixed_value)
+            )
+            pi_scale = g0_gate * pi_scale_without_null_gate
+            pi_null = (1.0 - g0_gate).clamp(min=0.0, max=1.0)
+            pi = torch.cat([pi_null, pi_scale], dim=-1)
+            nonnull_gate = g0_gate
+            router_mode = router_mode + "_g0fixed"
 
         # Apply layer/query knockout to the final router weights. Doing this to
         # raw router logits is incorrect for rms_joint because normalization
