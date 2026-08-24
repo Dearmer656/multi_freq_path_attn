@@ -58,6 +58,20 @@ SCALE_MULTIPLIER_DICT = {
     # PAT-164 basis ablation never calibrated a half-life multiplier for sine
     # (periodic, no natural width to match) -- left unscaled at 1.0.
     'sine': 1.0,
+    # Deliberately left at 1.0 (same as 'wavelet'), NOT re-derived like morlet's
+    # 3.0249 -- ricker_cos reuses the Ricker envelope verbatim and only adds a
+    # cos carrier on top, so it must share Ricker's exact effective scale to
+    # isolate "does the oscillation help" from "does the envelope width differ".
+    'ricker_cos': 1.0,
+    # PAT-225: morlet's 3.0249 multiplier is calibrated by matching the FULL
+    # function's (envelope * cos) zero-crossing to Ricker's zero at u=1 -- but
+    # morlet's envelope alone (exp(-0.5u^2)) is identical to 'gaussian', whose
+    # own multiplier is 0.5316. Using morlet's 3.0249 makes its envelope ~5.7x
+    # WIDER than a same-named Ricker/gaussian config (verified: rho=256 Ricker
+    # -> effective 256.0, rho=256 Morlet -> effective 774.4). morlet_gaussamp
+    # reuses morlet's exact basis fn (envelope * cos) but with gaussian's
+    # multiplier, so the envelope half-life matches Ricker's at the same exp.
+    'morlet_gaussamp': 0.5316,
 }
 
 
@@ -2220,6 +2234,8 @@ def path_ut_base_raw(
     w: torch.Tensor,        # [B,T,H,d]
     beta: torch.Tensor,     # [B,T,H]
     compute_dtype: torch.dtype = torch.float32,
+    drift_dampen_ltrain: int = 0,
+    drift_dampen_alpha: float = 1.0,
 ):
     """
     returns:
@@ -2227,6 +2243,18 @@ def path_ut_base_raw(
       M_base:     [B,H,T,T]
       strict_WK:  [B,H,T,T]
       A:          [B,H,T,T]
+      lower_QK:   [B,H,T,T]   plain content-matching term (pre-subtraction)
+      correction: [B,H,T,T]   M_base @ strict_WK, state-transition term (pre-subtraction,
+                               post drift-dampen if requested)
+
+    drift_dampen_ltrain/alpha: state-transition-drift test. M_base is the cumulative
+    Householder-transition-derived correction coefficient; M_base @ strict_WK is the
+    actual state-transition contribution to the logit (as opposed to lower_QK, the
+    plain content-matching term). When ltrain>0 and alpha!=1.0, this dampens the
+    transition CORRECTION term only (not the content term), for queries in the last
+    L_train rows (q >= T-L_train) and keys reaching back further than the extrapolation
+    overhang (dist > T-L_train) -- i.e. restricts the parameter matrix that encodes the
+    transition itself, rather than post-hoc rescaling the already-combined logit.
     """
     B, T, H, d = w.shape
     q0 = q.to(compute_dtype)
@@ -2251,8 +2279,20 @@ def path_ut_base_raw(
     M_base = path_ut_M_from_S(A, S_base, b0, compute_dtype=compute_dtype)
     del S_base
 
-    E_base_raw = lower_QK - (M_base @ strict_WK)
-    return E_base_raw, M_base, strict_WK, A
+    correction = M_base @ strict_WK
+    if drift_dampen_ltrain > 0 and drift_dampen_alpha != 1.0:
+        overhang = T - drift_dampen_ltrain
+        if overhang > 0:
+            q_pos = torch.arange(T, device=correction.device, dtype=torch.long).view(1, 1, -1, 1)
+            k_pos = torch.arange(T, device=correction.device, dtype=torch.long).view(1, 1, 1, -1)
+            last_ltrain_query_mask = q_pos >= overhang
+            dist = q_pos - k_pos
+            beyond_overhang_mask = dist > overhang
+            drift_mask = last_ltrain_query_mask & beyond_overhang_mask
+            correction = torch.where(drift_mask, correction * drift_dampen_alpha, correction)
+
+    E_base_raw = lower_QK - correction
+    return E_base_raw, M_base, strict_WK, A, lower_QK, correction
 
 # ---------------------------
 # optional: wavelet fused S_wave => M_wave (no OOM, d-chunk)
@@ -2650,6 +2690,55 @@ class PaTHAttention(nn.Module):
         self.wavelet_logit_bias_debug_assert = self._as_bool(
             getattr(config, "wavelet_logit_bias_debug_assert", False), default=False
         )
+        self.wavelet_logit_bias_eval_mult = float(getattr(config, "wavelet_logit_bias_eval_mult", 1.0))
+        self.wavelet_ctxscale_gain_st = self._as_bool(
+            getattr(config, "wavelet_ctxscale_gain_st", False), default=False
+        )
+        self._last_pa_raw_logits_unconditional = None
+        self._last_pa_lower_QK = None
+        self._last_pa_correction = None
+        # Opt-in only: storing these keeps 2 extra [B,H,T,T] float32 tensors alive per
+        # layer past when the forward pass would otherwise free them (they're consumed
+        # into E_base_raw = lower_QK - correction). At L4096 that's ~1.5GiB each --
+        # enough to OOM eval jobs that don't need them. Only the interference-probe
+        # scripts (PAT-251) should turn this on.
+        self.wavelet_pa_debug_store_correction_terms = self._as_bool(
+            getattr(config, "wavelet_pa_debug_store_correction_terms", False), default=False
+        )
+        self.wavelet_pa_beyond_dampen_threshold = int(
+            getattr(config, "wavelet_pa_beyond_dampen_threshold", 0)
+        )
+        self.wavelet_pa_beyond_dampen_alpha = float(
+            getattr(config, "wavelet_pa_beyond_dampen_alpha", 1.0)
+        )
+        self.wavelet_qwab_beyond_dampen_threshold = int(
+            getattr(config, "wavelet_qwab_beyond_dampen_threshold", 0)
+        )
+        self.wavelet_qwab_beyond_dampen_alpha = float(
+            getattr(config, "wavelet_qwab_beyond_dampen_alpha", 1.0)
+        )
+        self.wavelet_qwab_within_dampen_threshold = int(
+            getattr(config, "wavelet_qwab_within_dampen_threshold", 0)
+        )
+        self.wavelet_qwab_within_dampen_alpha = float(
+            getattr(config, "wavelet_qwab_within_dampen_alpha", 1.0)
+        )
+        self.wavelet_pa_within_dampen_threshold = int(
+            getattr(config, "wavelet_pa_within_dampen_threshold", 0)
+        )
+        self.wavelet_pa_within_dampen_alpha = float(
+            getattr(config, "wavelet_pa_within_dampen_alpha", 1.0)
+        )
+        # State-transition-drift test: for queries in the LAST L_train rows only
+        # (the ones that have accumulated the full T-L_train extrapolation overhang),
+        # dampen keys reaching back further than that same overhang (T-L_train).
+        # Both the query scope and the distance threshold derive from L_train alone.
+        self.wavelet_pa_state_drift_dampen_ltrain = int(
+            getattr(config, "wavelet_pa_state_drift_dampen_ltrain", 0)
+        )
+        self.wavelet_pa_state_drift_dampen_alpha = float(
+            getattr(config, "wavelet_pa_state_drift_dampen_alpha", 1.0)
+        )
         self.wavelet_logit_bias_rms_scope = str(
             getattr(config, "wavelet_logit_bias_rms_scope", "context")
         ).strip().lower()
@@ -2710,10 +2799,34 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctxscale_ko_layers_idx = tuple(
             int(x) for x in _ko_layers_raw.split(",") if x.strip() != ""
         ) if _ko_layers_raw else ()
+        _ko_query_raw = str(
+            getattr(config, "wavelet_ctxscale_ko_query_ranges", "") or ""
+        ).strip()
+        _ko_query_ranges = []
+        if _ko_query_raw:
+            for _item in re.split(r"[;,]", _ko_query_raw):
+                _item = _item.strip()
+                if not _item:
+                    continue
+                if ":" not in _item:
+                    raise ValueError(
+                        "wavelet_ctxscale_ko_query_ranges must contain half-open "
+                        f"start:end ranges, got {_item!r}."
+                    )
+                _start_raw, _end_raw = _item.split(":", 1)
+                _start, _end = int(_start_raw), int(_end_raw)
+                if _start < 0 or _end <= _start:
+                    raise ValueError(
+                        "wavelet_ctxscale_ko_query_ranges requires 0 <= start < end, "
+                        f"got {_item!r}."
+                    )
+                _ko_query_ranges.append((_start, _end))
+        self.wavelet_ctxscale_ko_query_ranges_idx = tuple(_ko_query_ranges)
         if self.wavelet_ctxscale_ko_layers_idx and layer_idx in (0, None):
             print(
                 f"[PAT-225] layer-knockout active: forcing layers "
-                f"{list(self.wavelet_ctxscale_ko_layers_idx)} to null (wavelet bias off)",
+                f"{list(self.wavelet_ctxscale_ko_layers_idx)} to null (wavelet bias off); "
+                f"query_ranges={list(self.wavelet_ctxscale_ko_query_ranges_idx) or 'all'}",
                 flush=True,
             )
         qwab_groups_per_layer = max(1, int(getattr(config, "qwab_groups_per_layer", 1)))
@@ -2857,6 +2970,17 @@ class PaTHAttention(nn.Module):
                 "wavelet_ctxscale_ratio_learnable and wavelet_ctxscale_fixed_scale_ratio "
                 "are mutually exclusive."
             )
+        # PAT-253: query-INDEPENDENT but LEARNED null/apply gate -- single nn.Parameter
+        # per layer, shared across every query/token, replacing g0_gate's dependence on
+        # router_logits[...,0:1] entirely. Plays the same structural role for the
+        # null/apply decision that wavelet_ctxscale_ratio_learnable plays for the
+        # scale-mixture: isolates whether query-conditioning of *this* decision matters,
+        # independent of whatever scale-mixture mode (default/fixed/ratio_learnable) is
+        # active. Only meaningful under wavelet_router_sigmoid_mode=
+        # "with_null_independent_scales" (enforced at use-site).
+        self.wavelet_ctxscale_g0_learnable = self._as_bool(
+            getattr(config, "wavelet_ctxscale_g0_learnable", False), default=False
+        )
         # PAT-244: opt-in independent per-scale shift head. Default (False) keeps the
         # original single shared shift_proj (1 output, same beta_m applied to every
         # scale index, just rescaled by each scale's own rho_i under
@@ -2940,10 +3064,14 @@ class PaTHAttention(nn.Module):
             "separate_rms_sqrt2",
         ):
             self.wavelet_ctxscale_dual_center_norm_mode = "separate_rms"
-        if self.wavelet_ctxscale_dual_center_norm_mode not in ("sum_then_rms", "separate_rms"):
+        if self.wavelet_ctxscale_dual_center_norm_mode not in (
+            "sum_then_rms",
+            "separate_rms",
+            "separate_rms_nosqrt",
+        ):
             raise ValueError(
-                "wavelet_ctxscale_dual_center_norm_mode must be 'sum_then_rms' "
-                f"or 'separate_rms', got {self.wavelet_ctxscale_dual_center_norm_mode!r}"
+                "wavelet_ctxscale_dual_center_norm_mode must be 'sum_then_rms', "
+                f"'separate_rms', or 'separate_rms_nosqrt', got {self.wavelet_ctxscale_dual_center_norm_mode!r}"
             )
         if self.wavelet_ctxscale_dual_center_enable:
             if self.bias_type != "wavelet" or self.wavelet_ctxscale_pattern_mode != "ricker":
@@ -3413,6 +3541,10 @@ class PaTHAttention(nn.Module):
             # with_null_independent_scales' g_l, just query-independent (init 0 ->
             # sigmoid(0)=0.5 each, unbiased starting point).
             self.wavelet_ctxscale_ratio_param = nn.Parameter(torch.zeros(_K))
+        if self.wavelet_ctxscale_g0_learnable:
+            # Raw logit (not the gate itself), sigmoid at use-site -- init 0 ->
+            # sigmoid(0)=0.5, matching the scale-ratio param's unbiased starting point.
+            self.wavelet_ctxscale_g0_param = nn.Parameter(torch.zeros(1))
         if layer_idx in (0, None):
             print(
                 f"[PAT-225] wavelet_ctxscale_k={_K} shift_number={_shift_number} "
@@ -3447,6 +3579,21 @@ class PaTHAttention(nn.Module):
             )
         else:
             self.wavelet_static_router_logits = None
+        # PAT-225 mixed-length-training follow-up: give the router an explicit signal for
+        # the current forward pass's sequence length T, so it has a chance to learn a
+        # length-conditioned scale preference (e.g. "prefer scale i at short T, scale j at
+        # long T") instead of only ever seeing query-content features that carry no direct
+        # T information. Off by default; zero-initialized so enabling it is a true no-op
+        # until training moves the weights (matches every other opt-in flag added this
+        # session). Only meaningful when training mixes multiple sequence lengths.
+        self.wavelet_router_length_aware = self._as_bool(
+            getattr(config, "wavelet_router_length_aware", False), default=False
+        )
+        if self.wavelet_router_length_aware:
+            self.wavelet_ctx_router_length = nn.Linear(1, self.wavelet_ctxscale_k + 1, bias=False)
+            nn.init.zeros_(self.wavelet_ctx_router_length.weight)
+        else:
+            self.wavelet_ctx_router_length = None
         self.wavelet_shift_ln = nn.LayerNorm(self.hidden_size, eps=getattr(config, "layer_norm_epsilon", 1e-5))
         # PAT-244: shift_proj needs one output per actual wavelet slot
         # (k_total = k_distinct * shift_number), not per distinct scale --
@@ -6082,6 +6229,13 @@ class PaTHAttention(nn.Module):
         freq = float(getattr(self, "wavelet_morlet_freq", 5.0))
         return torch.exp(-0.5 * u.pow(2)) * torch.cos(freq * u)
 
+    def _ricker_cos_basis(self, u: torch.Tensor) -> torch.Tensor:
+        # Same envelope as _ricker_wavelet (and same SCALE_MULTIPLIER_DICT=1.0),
+        # just multiplied by a cos carrier -- isolates "does adding oscillation
+        # help" from morlet's confound of also silently widening the envelope.
+        freq = float(getattr(self, "wavelet_morlet_freq", 5.0))
+        return self._ricker_wavelet(u) * torch.cos(freq * u)
+
     @staticmethod
     def _gaussian_basis(u: torch.Tensor) -> torch.Tensor:
         return torch.exp(-0.5 * u.pow(2))
@@ -6786,6 +6940,15 @@ class PaTHAttention(nn.Module):
                 f"got {tuple(x_feat.shape)}."
             )
         router_logits = router_mod(x_feat)
+        if getattr(self, "wavelet_router_length_aware", False) and self.wavelet_ctx_router_length is not None:
+            # Broadcast log2(T) (constant within this forward call) as an explicit length
+            # feature, added on top of the existing per-query router logits. Lets the
+            # router learn a length-conditioned scale preference under mixed-length
+            # training instead of only ever seeing content features with no direct T signal.
+            _log2_t = torch.log2(torch.tensor(float(T), device=router_logits.device, dtype=torch.float32))
+            _len_feat = _log2_t.view(1, 1, 1).to(dtype=self.wavelet_ctx_router_length.weight.dtype)
+            _len_bias = self.wavelet_ctx_router_length(_len_feat)  # [1, 1, K+1]
+            router_logits = router_logits + _len_bias.to(dtype=router_logits.dtype)
         if getattr(self, "wavelet_router_cosine", False):
             # PAT-244 unified cosine router (CLIP / QK-norm template): gauge-fix EVERY
             # logit (null + all K scales) by L2-normalizing the router feature and each
@@ -6855,12 +7018,6 @@ class PaTHAttention(nn.Module):
             for _mi in self.wavelet_ctxscale_scale_mask_idx:
                 if 0 <= int(_mi) < int(self.wavelet_ctxscale_k):
                     router_logits[..., 1 + int(_mi)] = -1e4
-        # PAT-225 per-layer knockout: force this layer's null-vs-nonnull gate to
-        # pi_null=1 (wavelet bias fully off, degenerate to baseline PaTH) if this
-        # layer_idx is in the configured knockout set.
-        if getattr(self, "wavelet_ctxscale_ko_layers_idx", ()) and int(self.layer_idx or 0) in self.wavelet_ctxscale_ko_layers_idx:
-            router_logits = router_logits.clone()
-            router_logits[..., 0] = -1e4
         router_sigmoid_mode = str(getattr(self, "wavelet_router_sigmoid_mode", "softmax")).strip().lower()
         if router_sigmoid_mode not in ("softmax", "with_null", "no_null", "with_null_independent_scales", "signed"):
             router_sigmoid_mode = "softmax"
@@ -7111,6 +7268,61 @@ class PaTHAttention(nn.Module):
             nonnull_gate = g0_gate
             pi_scale_without_null_gate = learned_ratio.expand_as(pi_scale)
             router_mode = "sigmoid_with_null_learnable_static_ratio"
+
+        if getattr(self, "wavelet_ctxscale_g0_learnable", False) and not use_mlp_bias_baseline:
+            # PAT-253: query-INDEPENDENT but LEARNED null/apply gate. Runs after every
+            # scale-mixture branch above so it composes with whichever mixture is
+            # currently in effect (default per-query g, fixed_scale_ratio, or
+            # ratio_learnable) via pi_scale_without_null_gate, which each of those
+            # branches already sets -- this override only replaces g0_gate itself.
+            if router_sigmoid_mode != "with_null_independent_scales":
+                raise ValueError(
+                    "wavelet_ctxscale_g0_learnable requires "
+                    f"wavelet_router_sigmoid_mode='with_null_independent_scales', got {router_sigmoid_mode!r}."
+                )
+            g0_gate = torch.sigmoid(self.wavelet_ctxscale_g0_param).to(
+                dtype=router_logits.dtype, device=router_logits.device
+            )
+            g0_gate = g0_gate.view(*([1] * (router_logits.dim() - 1)), 1) * torch.ones_like(
+                router_logits[..., 0:1]
+            )
+            pi_scale = g0_gate * pi_scale_without_null_gate
+            pi_null = (1.0 - g0_gate).clamp(min=0.0, max=1.0)
+            pi = torch.cat([pi_null, pi_scale], dim=-1)
+            nonnull_gate = g0_gate
+            router_mode = router_mode + "_g0static"
+
+        # Apply layer/query knockout to the final router weights. Doing this to
+        # raw router logits is incorrect for rms_joint because normalization
+        # maps a sentinel such as -1e4 back to a finite value.
+        _ko_this_layer = (
+            int(self.layer_idx or 0)
+            in getattr(self, "wavelet_ctxscale_ko_layers_idx", ())
+        )
+        if _ko_this_layer:
+            pi = pi.clone()
+            _ranges = getattr(self, "wavelet_ctxscale_ko_query_ranges_idx", ())
+            if not _ranges:
+                pi[..., 0] = 1.0
+                pi[..., 1:] = 0.0
+                if g0_gate is not None:
+                    g0_gate = torch.zeros_like(g0_gate)
+                nonnull_gate = torch.zeros_like(nonnull_gate)
+            else:
+                _T_router = int(pi.shape[-2])
+                if g0_gate is not None:
+                    g0_gate = g0_gate.clone()
+                nonnull_gate = nonnull_gate.clone()
+                for _start, _end in _ranges:
+                    _start = min(int(_start), _T_router)
+                    _end = min(int(_end), _T_router)
+                    if _start >= _end:
+                        continue
+                    pi[..., _start:_end, 0] = 1.0
+                    pi[..., _start:_end, 1:] = 0.0
+                    if g0_gate is not None:
+                        g0_gate[..., _start:_end, :] = 0.0
+                    nonnull_gate[..., _start:_end, :] = 0.0
 
         if getattr(self, "_pat_g0_cap", None) is not None:  # PAT-243 g0_gate-by-position probe (default off)
             _g0_for_cap = g0_gate if g0_gate is not None else nonnull_gate
@@ -7459,6 +7671,21 @@ class PaTHAttention(nn.Module):
                 )
         logits_out = E_base_raw.to(dtype=torch.float32).clone()
         self._last_logits_pa_only = E_base_raw.detach().to(dtype=torch.float32)
+        _pa_dampen_threshold = int(getattr(self, "wavelet_pa_beyond_dampen_threshold", 0))
+        _pa_dampen_alpha = float(getattr(self, "wavelet_pa_beyond_dampen_alpha", 1.0))
+        if _pa_dampen_threshold > 0 and _pa_dampen_alpha != 1.0:
+            _q_pos = torch.arange(logits_out.shape[-2], device=logits_out.device, dtype=torch.long).view(1, 1, -1, 1)
+            _k_pos = torch.arange(logits_out.shape[-1], device=logits_out.device, dtype=torch.long).view(1, 1, 1, -1)
+            _beyond_mask = (_q_pos - _k_pos) >= _pa_dampen_threshold
+            logits_out = torch.where(_beyond_mask, logits_out * _pa_dampen_alpha, logits_out)
+        _pa_within_threshold = int(getattr(self, "wavelet_pa_within_dampen_threshold", 0))
+        _pa_within_alpha = float(getattr(self, "wavelet_pa_within_dampen_alpha", 1.0))
+        if _pa_within_threshold > 0 and _pa_within_alpha != 1.0:
+            _q_pos = torch.arange(logits_out.shape[-2], device=logits_out.device, dtype=torch.long).view(1, 1, -1, 1)
+            _k_pos = torch.arange(logits_out.shape[-1], device=logits_out.device, dtype=torch.long).view(1, 1, 1, -1)
+            _dist = _q_pos - _k_pos
+            _within_mask = (_dist >= 0) & (_dist < _pa_within_threshold)
+            logits_out = torch.where(_within_mask, logits_out * _pa_within_alpha, logits_out)
         if self.wavelet_logit_bias_debug_assert:
             assert E_base_raw.dim() == 4
 
@@ -7719,7 +7946,10 @@ class PaTHAttention(nn.Module):
                             raise ValueError("dual-center wavelet basis requires bias_type='wavelet'")
                         abs_basis = self._ricker_wavelet(abs_u_i)
                         query_basis = self._ricker_wavelet(query_u_i)
-                        if getattr(self, "wavelet_ctxscale_dual_center_norm_mode", "sum_then_rms") == "separate_rms":
+                        dual_center_norm_mode = getattr(
+                            self, "wavelet_ctxscale_dual_center_norm_mode", "sum_then_rms"
+                        )
+                        if dual_center_norm_mode in ("separate_rms", "separate_rms_nosqrt"):
                             if getattr(self, "wavelet_logit_bias_center", False):
                                 _qc = abs_basis.shape[-2]
                                 _Tk = abs_basis.shape[-1]
@@ -7732,7 +7962,10 @@ class PaTHAttention(nn.Module):
                             if not getattr(self, "wavelet_logit_bias_norm_disable", False):
                                 abs_basis = self._rms_norm_wavelet_basis(abs_basis, q0=q0, eps=eps)
                                 query_basis = self._rms_norm_wavelet_basis(query_basis, q0=q0, eps=eps)
-                            basis_table = (abs_basis + query_basis) / math.sqrt(2.0)
+                            if dual_center_norm_mode == "separate_rms_nosqrt":
+                                basis_table = abs_basis + query_basis
+                            else:
+                                basis_table = (abs_basis + query_basis) / math.sqrt(2.0)
                             skip_common_basis_center_norm = True
                         else:
                             basis_table = abs_basis + query_basis
@@ -7754,6 +7987,10 @@ class PaTHAttention(nn.Module):
                         elif self.bias_type == "sine":
                             basis_table = self._sine_basis(u_i)
                         elif self.bias_type == "morlet":
+                            basis_table = self._morlet_basis(u_i)
+                        elif self.bias_type == "ricker_cos":
+                            basis_table = self._ricker_cos_basis(u_i)
+                        elif self.bias_type == "morlet_gaussamp":
                             basis_table = self._morlet_basis(u_i)
                         elif self.bias_type == "gaussian":
                             basis_table = self._gaussian_basis(u_i)
@@ -7949,7 +8186,27 @@ class PaTHAttention(nn.Module):
                 # row-center then scale: softmax is invariant to row-wise constant shifts
                 _row_mean = eff_to_add.mean(dim=-1, keepdim=True)
                 eff_to_add = (eff_to_add - _row_mean) * _lambda
-            logits_out[:, :, q0:q1, :] = logits_out[:, :, q0:q1, :] + eff_to_add
+            _qwab_dampen_threshold = int(getattr(self, "wavelet_qwab_beyond_dampen_threshold", 0))
+            _qwab_dampen_alpha = float(getattr(self, "wavelet_qwab_beyond_dampen_alpha", 1.0))
+            if _qwab_dampen_threshold > 0 and _qwab_dampen_alpha != 1.0:
+                _q_pos_chunk = torch.arange(q0, q1, device=eff_to_add.device, dtype=torch.long).view(1, 1, -1, 1)
+                _k_pos_chunk = torch.arange(eff_to_add.shape[-1], device=eff_to_add.device, dtype=torch.long).view(1, 1, 1, -1)
+                _qwab_beyond_mask = (_q_pos_chunk - _k_pos_chunk) >= _qwab_dampen_threshold
+                eff_to_add = torch.where(_qwab_beyond_mask, eff_to_add * _qwab_dampen_alpha, eff_to_add)
+            _qwab_within_threshold = int(getattr(self, "wavelet_qwab_within_dampen_threshold", 0))
+            _qwab_within_alpha = float(getattr(self, "wavelet_qwab_within_dampen_alpha", 1.0))
+            if _qwab_within_threshold > 0 and _qwab_within_alpha != 1.0:
+                _q_pos_chunk2 = torch.arange(q0, q1, device=eff_to_add.device, dtype=torch.long).view(1, 1, -1, 1)
+                _k_pos_chunk2 = torch.arange(eff_to_add.shape[-1], device=eff_to_add.device, dtype=torch.long).view(1, 1, 1, -1)
+                _qwab_within_mask = (_q_pos_chunk2 - _k_pos_chunk2) < _qwab_within_threshold
+                eff_to_add = torch.where(_qwab_within_mask, eff_to_add * _qwab_within_alpha, eff_to_add)
+            bias_eval_mult = float(getattr(self, "wavelet_logit_bias_eval_mult", 1.0))
+            if bool(getattr(self, "wavelet_ctxscale_gain_st", False)) and bias_eval_mult != 1.0:
+                scaled = eff_to_add * bias_eval_mult
+                eff_to_add_final = eff_to_add + (scaled - eff_to_add).detach()
+            else:
+                eff_to_add_final = eff_to_add * bias_eval_mult
+            logits_out[:, :, q0:q1, :] = logits_out[:, :, q0:q1, :] + eff_to_add_final
 
             if analysis_enabled and analysis_q_local is not None and analysis_q_abs is not None and analysis_eff_abs_vals is not None:
                 for j in range(int(analysis_q_local.numel())):
@@ -10068,9 +10325,18 @@ class PaTHAttention(nn.Module):
         ctxscale_shift_payload = None
 
         # --- baseline raw logits and M_base ---
-        E_base_raw, M_base, strict_WK, A = path_ut_base_raw(
-            q, k, w, beta, compute_dtype=compute_dtype
+        E_base_raw, M_base, strict_WK, A, lower_QK, correction = path_ut_base_raw(
+            q, k, w, beta, compute_dtype=compute_dtype,
+            drift_dampen_ltrain=int(getattr(self, "wavelet_pa_state_drift_dampen_ltrain", 0)),
+            drift_dampen_alpha=float(getattr(self, "wavelet_pa_state_drift_dampen_alpha", 1.0)),
         )
+        self._last_pa_raw_logits_unconditional = E_base_raw.detach().to(dtype=torch.float32)
+        if self.wavelet_pa_debug_store_correction_terms:
+            self._last_pa_lower_QK = lower_QK.detach().to(dtype=torch.float32)
+            self._last_pa_correction = correction.detach().to(dtype=torch.float32)
+        else:
+            self._last_pa_lower_QK = None
+            self._last_pa_correction = None
         # --- pick M_used for defining QH in wavelet branch ---
         if use_wavelet_fused_H and wavelet_dtt is not None:
             M_used = path_ut_M_wave_fused(q, w, beta, A, wavelet_dtt, d_chunk=d_chunk, compute_dtype=compute_dtype)
