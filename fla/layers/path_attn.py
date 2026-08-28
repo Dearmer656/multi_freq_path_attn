@@ -10593,6 +10593,16 @@ class PaTHAttention(nn.Module):
             # Trigger rows → path logits; non-trigger rows → standard QK^T logits
             E_wav_raw = torch.where(_trigger_mask, E_wav_raw, _E_std_raw)
 
+        # PAT-225 capture (analysis-only, no effect on forward output): the
+        # existing _last_logits_pa_only/_last_logits_full sets inside
+        # _build_ctxscale_shift_logit_bias_v0 only fire for
+        # wavelet_mode=="logit_bias_ctxscale_shift_v0". E_base_raw/E_wav_raw
+        # are finalized here regardless of which wavelet_mode branch ran
+        # above, so capture unconditionally here too (harmless redundant
+        # overwrite with the same values for the ctxscale_shift_v0 case).
+        self._last_logits_pa_only = E_base_raw.detach().to(dtype=torch.float32)
+        self._last_logits_full = E_wav_raw.detach().to(dtype=torch.float32)
+
         P_base = None
         heatmap_enabled = bool(getattr(self, "eval_attn_heatmap_enabled", False)) or bool(getattr(self, "_debug_enabled", False))
         need_base_softmax = bool((analyzer is not None and rel is not None) or ((not self.training) and heatmap_enabled))
