@@ -6920,6 +6920,7 @@ class PaTHAttention(nn.Module):
         self._last_ctxscale_non_null_mass = None
         self._last_ctxscale_null_mass = None
         self._last_ctxscale_monitor_payload = None
+        self._last_ctxscale_beta_by_scale = None
         wavelet_mode_resolved = self._normalize_wavelet_mode(getattr(self.config, "wavelet_mode", self.wavelet_mode))
         use_mlp_bias_baseline = bool(wavelet_mode_resolved == "mlp_bias_baseline_v0")
         basis_control = str(getattr(self, "wavelet_basis_control", "none")).strip().lower()
@@ -7980,6 +7981,17 @@ class PaTHAttention(nn.Module):
                         beta_i = beta_m_i * s_i
                     else:
                         beta_i = beta_m_i
+
+                    if bool(getattr(self, "_capture_debug_tensors", True)):
+                        # PAT-254 Preflight: real per-query learned shift (beta_i) and
+                        # the scale/absolute-key coordinate actually used to build this
+                        # scale's basis_table, for reconstructing the true (not
+                        # idealized) wavelet template offline. [B,Tq] per scale index.
+                        if not hasattr(self, "_last_ctxscale_beta_by_scale") or self._last_ctxscale_beta_by_scale is None:
+                            self._last_ctxscale_beta_by_scale = {}
+                        self._last_ctxscale_beta_by_scale[int(scale_idx)] = beta_i.detach().to(torch.float32)
+                        self._last_ctxscale_diff = diff.detach().to(torch.float32)
+                        self._last_ctxscale_scales = scales.detach().to(torch.float32)
 
                     base_x_i = diff.view(1, 1, T)
                     if getattr(self, "wavelet_ctxscale_dual_center_enable", False):
