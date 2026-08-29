@@ -7395,6 +7395,12 @@ class PaTHAttention(nn.Module):
             pi = torch.cat([pi[..., 0:1], pi_scale], dim=-1)
             if pi_scale_without_null_gate is not None:
                 pi_scale_without_null_gate = pi_scale_without_null_gate.repeat_interleave(_shift_number, dim=-1)
+        # Router usage capture (analysis-only, no effect on the bias path):
+        # pi[..., 0] is the null gate, pi[..., 1:] are the K final per-scale
+        # weights actually used below to build the bias -- this is the
+        # "which scale gets used" statistic for K>1 usage plots. QWAB-only
+        # (PA-only checkpoints never reach this function).
+        self._last_router_pi = pi.detach().to(torch.float32)
         router_mode_is_signed = router_mode == "sigmoid_signed"
         # "rms_both": per-scale RMS-normalize each basis (like "none"/"sqrt"/"k"),
         # THEN weighted-sum, THEN ALSO apply the outer joint RMS over the sum (like
@@ -10602,6 +10608,13 @@ class PaTHAttention(nn.Module):
         # overwrite with the same values for the ctxscale_shift_v0 case).
         self._last_logits_pa_only = E_base_raw.detach().to(dtype=torch.float32)
         self._last_logits_full = E_wav_raw.detach().to(dtype=torch.float32)
+        # Value vectors used in the final attention-output einsum below
+        # (out_wav = einsum("b h i j, b j h d -> b i h d", P_wav, v)). v is
+        # untouched between the top-of-function _match_heads(v, Hw) and that
+        # einsum, so this is exactly the tensor the output actually uses --
+        # needed to decompose Delta(output) into an attention-weight-shift
+        # term vs a value-content-shift term across two checkpoints.
+        self._last_value_vectors = v.detach().to(dtype=torch.float32)
 
         P_base = None
         heatmap_enabled = bool(getattr(self, "eval_attn_heatmap_enabled", False)) or bool(getattr(self, "_debug_enabled", False))
