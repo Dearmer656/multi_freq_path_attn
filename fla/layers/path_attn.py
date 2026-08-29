@@ -10606,15 +10606,24 @@ class PaTHAttention(nn.Module):
         # are finalized here regardless of which wavelet_mode branch ran
         # above, so capture unconditionally here too (harmless redundant
         # overwrite with the same values for the ctxscale_shift_v0 case).
-        self._last_logits_pa_only = E_base_raw.detach().to(dtype=torch.float32)
-        self._last_logits_full = E_wav_raw.detach().to(dtype=torch.float32)
-        # Value vectors used in the final attention-output einsum below
-        # (out_wav = einsum("b h i j, b j h d -> b i h d", P_wav, v)). v is
-        # untouched between the top-of-function _match_heads(v, Hw) and that
-        # einsum, so this is exactly the tensor the output actually uses --
-        # needed to decompose Delta(output) into an attention-weight-shift
-        # term vs a value-content-shift term across two checkpoints.
-        self._last_value_vectors = v.detach().to(dtype=torch.float32)
+        # These three are opt-OUT (default True) rather than opt-in, so every
+        # existing caller keeps working unchanged -- but they're expensive at
+        # large model/seq_len (full [B,H,T,T] fp32 per layer, retained until
+        # the next forward call), enough to OOM a 48GB card on a 24-layer/
+        # 16-head medium model at L=4096 on their own. A script that only
+        # needs a cheap capture (e.g. _last_router_pi below) should set
+        # module._capture_debug_tensors = False on each PaTHAttention module
+        # before its forward pass to skip this block.
+        if bool(getattr(self, "_capture_debug_tensors", True)):
+            self._last_logits_pa_only = E_base_raw.detach().to(dtype=torch.float32)
+            self._last_logits_full = E_wav_raw.detach().to(dtype=torch.float32)
+            # Value vectors used in the final attention-output einsum below
+            # (out_wav = einsum("b h i j, b j h d -> b i h d", P_wav, v)). v is
+            # untouched between the top-of-function _match_heads(v, Hw) and that
+            # einsum, so this is exactly the tensor the output actually uses --
+            # needed to decompose Delta(output) into an attention-weight-shift
+            # term vs a value-content-shift term across two checkpoints.
+            self._last_value_vectors = v.detach().to(dtype=torch.float32)
 
         P_base = None
         heatmap_enabled = bool(getattr(self, "eval_attn_heatmap_enabled", False)) or bool(getattr(self, "_debug_enabled", False))
