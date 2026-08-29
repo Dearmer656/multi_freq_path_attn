@@ -10475,6 +10475,22 @@ class PaTHAttention(nn.Module):
                 enable_film=bool(wavelet_mode == "logit_bias_ctxscale_shift_v0_film"),
                 k = k if self.bias_type == "rotary" else None,
             )
+            # PAT-254 Task 1: causal-subtraction ablation hook. Forward-only,
+            # additive on top of the real bias -- subtracts lambda * delta
+            # from the combined logits, where `delta` is an externally
+            # supplied [T,T] matrix (e.g. lambda * D @ P_Psi, or a matched
+            # DCT-aligned control) built offline from a prior forward pass'
+            # captured A^Q-off/A^PA. No effect unless explicitly enabled.
+            _sub_spec = getattr(self, "_ctxscale_subtract_spec", None)
+            if isinstance(_sub_spec, dict) and bool(_sub_spec.get("enabled", False)):
+                _delta = _sub_spec["delta"].to(device=E_wav_raw.device, dtype=E_wav_raw.dtype)
+                _lam = float(_sub_spec.get("lambda", 1.0))
+                if _delta.shape[-1] < T:
+                    _pad = T - _delta.shape[-1]
+                    _delta = torch.nn.functional.pad(_delta, (0, _pad, 0, _pad))
+                elif _delta.shape[-1] > T:
+                    _delta = _delta[:T, :T]
+                E_wav_raw = E_wav_raw - _lam * _delta.view(1, 1, T, T)
         elif rel_enabled and wavelet_mode == "router_rel":
             if router1 is not None and router2 is not None:
                 rel = self.wavelet_rel_from_M_scale_router(
