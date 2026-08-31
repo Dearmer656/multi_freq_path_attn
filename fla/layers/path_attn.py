@@ -10368,6 +10368,12 @@ class PaTHAttention(nn.Module):
             beta = beta  # assume already [B,T,Hw]
 
         B, T, H, d = q.shape
+        if bool(getattr(self, "_capture_debug_tensors", True)):
+            # Raw per-position query/key vectors (post head-match, pre-PaTH
+            # transform) for representation-geometry probes (query/key
+            # similarity heatmaps) -- independent of the attention bias path.
+            self._last_q_vectors = q.detach().to(dtype=torch.float32)
+            self._last_k_vectors = k.detach().to(dtype=torch.float32)
         scale = d ** -0.5
         future = _future_mask(T, q.device)  # [1,1,T,T]
         wavelet_mode = self._normalize_wavelet_mode(getattr(config, "wavelet_mode", self.wavelet_mode))
