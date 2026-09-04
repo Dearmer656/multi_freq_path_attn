@@ -2913,6 +2913,14 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctx_feat_mode = str(
             getattr(config, "wavelet_ctx_feat_mode", "q_meanH")
         ).strip()
+        # PAT-244 ablation switch: when enabled, force a per-head router feature
+        # so scale selection becomes independent per attention head without
+        # changing the default head-shared path.
+        self.wavelet_ctxscale_router_per_head = self._as_bool(
+            getattr(config, "wavelet_ctxscale_router_per_head", False), default=False
+        )
+        if self.wavelet_ctxscale_router_per_head:
+            self.wavelet_ctx_feat_mode = "q_minus_qcorr_meanh_perhead"
         if self.wavelet_ctx_feat_mode.lower() in (
             "q_perh",
             "q_headwise",
@@ -6506,6 +6514,10 @@ class PaTHAttention(nn.Module):
             )
         if mode == "q_minus_qcorr_meanh":
             return feat_ln(d_mean.to(ln_dtype))
+        if mode == "q_minus_qcorr_meanh_perhead":
+            # Per-head ablation: preserve the head axis so each head can route
+            # scale weights independently, while keeping the same delta math.
+            return feat_ln(delta.to(ln_dtype))
         if mode == "q_minus_qcorr_rmsh":
             d_rms = torch.sqrt(delta.pow(2).mean(dim=2).clamp_min(0.0) + float(self.wavelet_ctx_feat_rms_eps))
             return feat_ln(d_rms.to(ln_dtype))
@@ -6653,7 +6665,7 @@ class PaTHAttention(nn.Module):
         mode = str(spec.get("mode", "")).strip().lower()
         if mode not in ("null", "small", "large", "uniform"):
             return pi
-        if pi.dim() != 3:
+        if pi.dim() not in (3, 4):
             return pi
         Kp1 = int(pi.shape[-1])
         if Kp1 <= 1:
@@ -7376,10 +7388,10 @@ class PaTHAttention(nn.Module):
         # IMPORTANT: pi_scale must be derived from post-intervention pi.
         # Otherwise do(scale) has no effect on the final bias path.
         pi_scale = pi[..., 1:]
-        if pi.dim() != 3:
+        if pi.dim() not in (3, 4):
             raise ValueError(
-                "Head-wise wavelet routing has been removed; "
-                f"router probabilities must be 3D, got {tuple(pi.shape)}."
+                "Wavelet router probabilities must be 3D or 4D; "
+                f"got {tuple(pi.shape)}."
             )
         # PAT-244: expand from K_distinct (one router decision per distinct
         # scale in wavelet_ctxscale_scale_max_exp) to K_total = K_distinct *
@@ -7913,17 +7925,24 @@ class PaTHAttention(nn.Module):
                     analysis_q_abs = q_abs_a
                     analysis_q_count += int(B * int(q_abs_a.numel()))
 
-            bias_chunk = torch.zeros((B, q1 - q0, T), device=device, dtype=torch.float32)
+            per_head_router = int(pi.dim()) == 4
+            if per_head_router:
+                bias_chunk = torch.zeros((B, int(pi.shape[2]), q1 - q0, T), device=device, dtype=torch.float32)
+            else:
+                bias_chunk = torch.zeros((B, q1 - q0, T), device=device, dtype=torch.float32)
             if self.wavelet_logit_bias_debug_assert:
-                assert bias_chunk.shape == (B, q1 - q0, T)
+                if per_head_router:
+                    assert bias_chunk.shape == (B, int(pi.shape[2]), q1 - q0, T)
+                else:
+                    assert bias_chunk.shape == (B, q1 - q0, T)
             nonnull_gate_chunk = None
-            pi_scale_for_sum = pi_scale[:, q0:q1, :]
+            pi_scale_for_sum = pi_scale[:, q0:q1, ...]
             if multiscale_rms_after_sum:
                 # For post-sum RMS, keep the null/non-null gate outside the RMS.
                 # First sum conditional scale contributions, RMS over full context,
                 # then multiply by the post-intervention non-null gate.
-                nonnull_gate_chunk = nonnull_gate[:, q0:q1, :]
-                pi_scale_for_sum = pi_scale_without_null_gate[:, q0:q1, :]
+                nonnull_gate_chunk = nonnull_gate[:, q0:q1, ...]
+                pi_scale_for_sum = pi_scale_without_null_gate[:, q0:q1, ...]
             if use_mlp_bias_baseline:
                 # Param-matched non-wavelet baseline: low-rank U@V^T without pi-mixture.
                 u_q = torch.tanh(router_logits[:, q0:q1, 1:] / tau)
@@ -8066,7 +8085,14 @@ class PaTHAttention(nn.Module):
                     if getattr(self, "_pat234_cap", None) is not None:  # PAT-234 stage probe (default off)
                         self._pat234_cap.setdefault("S1_postnorm", []).append((int(lid), int(scale_idx), int(q0), basis_table.detach().float().cpu()))
 
-                    contrib_i = pi_scale_for_sum[..., i].unsqueeze(-1) * basis_table ### weight * wavelet basis
+                    if per_head_router:
+                        # pi_scale_for_sum[..., i] is [B, q_len, H] (head axis stayed where
+                        # the router feature put it); bias_chunk is [B, H, q_len, T], so the
+                        # head axis must move before the query axis to broadcast correctly.
+                        w_i = pi_scale_for_sum[..., i].permute(0, 2, 1).unsqueeze(-1)  # [B, H, q_len, 1]
+                        contrib_i = w_i * basis_table.unsqueeze(1)  # -> [B, H, q_len, T]
+                    else:
+                        contrib_i = pi_scale_for_sum[..., i].unsqueeze(-1) * basis_table ### weight * wavelet basis
 
                     if getattr(self, "_pat234_cap", None) is not None:  # PAT-234: post-gain per scale
                         self._pat234_cap.setdefault("S3_postgain", []).append((int(lid), int(scale_idx), int(q0), contrib_i.detach().float().cpu()))
@@ -8190,7 +8216,10 @@ class PaTHAttention(nn.Module):
                 sat_den += int(s_raw.numel())
             g_bias_max = float(getattr(self.config, "wavelet_ctxscale_g_bias_max", self.wavelet_ctxscale_g_bias_max))
             if use_head_gate and g_head is not None:
-                eff_to_add = bias_chunk.unsqueeze(1) * g_head.view(1, -1, 1, 1)
+                if bias_chunk.dim() == 3:
+                    eff_to_add = bias_chunk.unsqueeze(1) * g_head.view(1, -1, 1, 1)
+                else:
+                    eff_to_add = bias_chunk * g_head.view(1, -1, 1, 1)
                 eff_to_add = eff_to_add.clamp(min=-g_bias_max, max=g_bias_max)
                 if not torch.isfinite(eff_to_add).all():
                     _warn_nonfinite("g_bias_head")
@@ -8216,7 +8245,7 @@ class PaTHAttention(nn.Module):
                         posinf=g_bias_max,
                         neginf=-g_bias_max,
                     )
-                eff_to_add = eff_chunk.unsqueeze(1)
+                eff_to_add = eff_chunk.unsqueeze(1) if eff_chunk.dim() == 3 else eff_chunk
             if head_mask is not None:
                 eff_to_add = eff_to_add * head_mask
 
