@@ -8301,7 +8301,13 @@ class PaTHAttention(nn.Module):
                     k_idx = _analysis_k_idx_for_q(q_abs_val)
                     if k_idx is None or int(k_idx.numel()) == 0:
                         continue
-                    e_vals = eff_chunk[:, q_rel, :].index_select(-1, k_idx).abs().reshape(-1)
+                    # per_head_router: eff_chunk is [B, H, q_len, T] (query axis dim 2), not
+                    # the shared-router [B, q_len, T] layout (query axis dim 1) -- see the
+                    # matching fix a few lines below in the need_log sampling block.
+                    if per_head_router:
+                        e_vals = eff_chunk[:, :, q_rel, :].index_select(-1, k_idx).abs().reshape(-1)
+                    else:
+                        e_vals = eff_chunk[:, q_rel, :].index_select(-1, k_idx).abs().reshape(-1)
                     if int(e_vals.numel()) > 0:
                         analysis_eff_abs_vals.append(e_vals.detach().cpu())
 
@@ -8310,14 +8316,30 @@ class PaTHAttention(nn.Module):
                 if bool(local.any()):
                     q_abs = sample_q_idx[local]
                     q_local = q_abs - q0
-                    b_sel = bias_chunk.index_select(1, q_local).index_select(2, sample_k_idx)
-                    e_sel = eff_chunk.index_select(1, q_local).index_select(2, sample_k_idx)
+                    # per_head_router: bias_chunk/eff_chunk are [B, H, q_len, T] (query axis
+                    # is dim 2, key axis is dim 3), not the shared-router [B, q_len, T]
+                    # layout (query axis dim 1, key axis dim 2) -- indexing with the wrong
+                    # axis numbers here silently selects along the head axis instead of the
+                    # query axis, and a query-position index >= num_heads is out of bounds
+                    # (CUDA device-side assert, discovered when this logging block first ran
+                    # under a per-head router config).
+                    if per_head_router:
+                        b_sel = bias_chunk.index_select(2, q_local).index_select(3, sample_k_idx)
+                        e_sel = eff_chunk.index_select(2, q_local).index_select(3, sample_k_idx)
+                    else:
+                        b_sel = bias_chunk.index_select(1, q_local).index_select(2, sample_k_idx)
+                        e_sel = eff_chunk.index_select(1, q_local).index_select(2, sample_k_idx)
                     base_chunk = E_base_raw[:, :, q0:q1, :].mean(dim=1)
                     base_sel = base_chunk.index_select(1, q_local).index_select(2, sample_k_idx)
                     valid = sample_k_idx.view(1, 1, -1) <= q_abs.view(1, -1, 1)
                     valid = valid.expand(B, -1, -1)
-                    b_vals = b_sel[valid]
-                    e_vals = e_sel[valid]
+                    if per_head_router:
+                        valid_bh = valid.unsqueeze(1).expand(-1, b_sel.shape[1], -1, -1)
+                        b_vals = b_sel[valid_bh]
+                        e_vals = e_sel[valid_bh]
+                    else:
+                        b_vals = b_sel[valid]
+                        e_vals = e_sel[valid]
                     base_vals = base_sel[valid]
                     if b_vals.numel() > 0:
                         take = min(sample_budget - sample_count, int(b_vals.numel()))
