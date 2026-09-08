@@ -6966,10 +6966,11 @@ class PaTHAttention(nn.Module):
             use_mlp=use_mlp_bias_baseline,
             hidden_states=hidden_states,
         )
-        if x_feat.dim() != 3:
+        if x_feat.dim() not in (3, 4):
             raise ValueError(
-                "Wavelet router features must have shape [B, T, D]; "
-                f"got {tuple(x_feat.shape)}."
+                "Wavelet router features must have shape [B, T, D] or, for the "
+                "per-head router (wavelet_ctx_feat_mode=q_minus_qcorr_meanh_perhead), "
+                f"[B, T, H, D]; got {tuple(x_feat.shape)}."
             )
         router_logits = router_mod(x_feat)
         if getattr(self, "wavelet_router_length_aware", False) and self.wavelet_ctx_router_length is not None:
