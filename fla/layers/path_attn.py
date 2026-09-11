@@ -8363,7 +8363,16 @@ class PaTHAttention(nn.Module):
                 if not torch.isfinite(eff_chunk).all():
                     raise FloatingPointError("ctxscale_shift_v0: non-finite effective bias chunk")
 
-        self._last_logits_full = logits_out.detach().to(dtype=torch.float32)
+        # Same class of bug as _last_pa_raw_logits_unconditional (see
+        # path_attention_with_wavelet_QH): this ran unconditionally, so the
+        # caller's own `if _capture_debug_tensors:` guard around its
+        # (redundant) re-assignment of self._last_logits_full was moot --
+        # this line already populated it regardless. [B,H,T,T] fp32 per
+        # layer, persists until next forward call; gate it the same way.
+        if bool(getattr(self, "_capture_debug_tensors", True)):
+            self._last_logits_full = logits_out.detach().to(dtype=torch.float32)
+        else:
+            self._last_logits_full = None
         if self.wavelet_logit_bias_debug_assert and not torch.isfinite(logits_out).all():
             raise FloatingPointError("ctxscale_shift_v0: non-finite logits after bias injection")
 
@@ -10444,13 +10453,39 @@ class PaTHAttention(nn.Module):
             drift_dampen_ltrain=int(getattr(self, "wavelet_pa_state_drift_dampen_ltrain", 0)),
             drift_dampen_alpha=float(getattr(self, "wavelet_pa_state_drift_dampen_alpha", 1.0)),
         )
-        self._last_pa_raw_logits_unconditional = E_base_raw.detach().to(dtype=torch.float32)
+        # Was truly unconditional (no flag could skip it) -- at medium
+        # scale (24 layers x 16 heads) this alone retains a [B,H,T,T] fp32
+        # tensor PER LAYER for the whole forward pass (nothing frees layer
+        # i's copy while layers i+1..23 run), e.g. ~25.7GB total at L=4096,
+        # ~103GB at L=16384. That's on top of the (also unfixed until now)
+        # _last_logits_full leak already gated below by _capture_debug_tensors
+        # -- combined, this is why QWAB pytorch OOMs at L=4096 while PA-only
+        # (which skips _last_logits_full, having no wavelet branch) survives
+        # to L=8192. Only 3 known readers (_gen_postfix_4way_s42/*.py analysis
+        # scripts), none of which explicitly set _capture_debug_tensors=False
+        # elsewhere -- gating this under the same flag (default True, so
+        # those scripts are unaffected) lets eval/perplexity scripts opt out
+        # via the flag the code's own comment below already documents.
+        if bool(getattr(self, "_capture_debug_tensors", True)):
+            self._last_pa_raw_logits_unconditional = E_base_raw.detach().to(dtype=torch.float32)
+        else:
+            self._last_pa_raw_logits_unconditional = None
         if self.wavelet_pa_debug_store_correction_terms:
             self._last_pa_lower_QK = lower_QK.detach().to(dtype=torch.float32)
             self._last_pa_correction = correction.detach().to(dtype=torch.float32)
         else:
             self._last_pa_lower_QK = None
             self._last_pa_correction = None
+        # strict_WK/lower_QK/correction are only ever read in the debug block
+        # just above (both branches handled); A is only read a few lines
+        # below when use_wavelet_fused_H is True. As local variables in this
+        # (very long) function they would otherwise stay alive -- and
+        # un-freeable -- until the function returns, well past their last
+        # use: 3-4 more [B,H,T,T] fp32 tensors held for nothing, e.g. ~17GB
+        # each at L=16384. Free them the moment they're confirmed unneeded.
+        del strict_WK, lower_QK, correction
+        if not (use_wavelet_fused_H and wavelet_dtt is not None):
+            del A
         # --- pick M_used for defining QH in wavelet branch ---
         if use_wavelet_fused_H and wavelet_dtt is not None:
             M_used = path_ut_M_wave_fused(q, w, beta, A, wavelet_dtt, d_chunk=d_chunk, compute_dtype=compute_dtype)
