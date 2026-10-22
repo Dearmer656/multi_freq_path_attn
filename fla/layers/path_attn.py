@@ -72,6 +72,11 @@ SCALE_MULTIPLIER_DICT = {
     # reuses morlet's exact basis fn (envelope * cos) but with gaussian's
     # multiplier, so the envelope half-life matches Ricker's at the same exp.
     'morlet_gaussamp': 0.5316,
+    # PAT-310 C2 controls (Reviewer XHXZ). Both keep the QWAB gate and only
+    # replace the basis shape; 1.0 ties the prefix window to Ricker's positive
+    # lobe (|u|<1 -> keys [0, rho)).
+    'first_token': 1.0,
+    'prefix_box': 1.0,
 }
 
 
@@ -8112,6 +8117,19 @@ class PaTHAttention(nn.Module):
                             basis_table = self._gaussian_basis(u_i)
                         elif self.bias_type == "linear":
                             basis_table = self._linear_basis(u_i)
+                        elif self.bias_type == "prefix_box":
+                            # PAT-310 C2: flat gated bias on the fixed prefix window [0, s_i).
+                            # No shift (0 * u_i only keeps shift_proj in the graph for DDP);
+                            # goes through the same RMS norm as every other basis.
+                            basis_table = (base_x_i < s_i).to(u_i.dtype) + 0.0 * u_i
+                        elif self.bias_type == "first_token":
+                            # PAT-310 C2: gated bias on key 0 only. Plain RMS norm would give
+                            # sqrt(T) on one key, so instead match the value the Ricker basis
+                            # (beta=0) puts on key 0 after its RMS norm, then skip the norm.
+                            ricker_ref = self._ricker_wavelet(base_x_i / s_i)
+                            ref_rms = torch.sqrt(ricker_ref.pow(2).mean(dim=-1, keepdim=True) + float(eps))
+                            basis_table = (base_x_i == 0).to(u_i.dtype) / ref_rms + 0.0 * u_i
+                            skip_common_basis_center_norm = True
                         elif self.bias_type == "rotary":
                             pass
                         else:
