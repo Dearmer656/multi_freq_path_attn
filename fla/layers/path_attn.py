@@ -3823,6 +3823,26 @@ class PaTHAttention(nn.Module):
 
         # 输出层（H*R*d → hidden_size）
         self.o_proj = nn.Linear(self.hidden_size * self.r, self.hidden_size, bias=False)
+        # Gated attention (Qiu et al., NeurIPS 2025), ported from the official
+        # implementation (github.com/qiuzh20/gated_attention @ f4c2a5f6,
+        # modeling_qwen3.py Qwen3Attention): a sigmoid gate computed from the
+        # same hidden_states as the query, applied to the attention output before
+        # o_proj. Official code produces gate_score as extra output rows of q_proj
+        # (bias=config.qkv_bias, False by default); here it is a separate Linear
+        # on the same input -- functionally identical, but keeps the pretrained
+        # q_proj weights loadable instead of reinitializing a resized q_proj.
+        self.headwise_attn_output_gate = self._as_bool(
+            getattr(config, "headwise_attn_output_gate", False), default=False
+        )
+        self.elementwise_attn_output_gate = self._as_bool(
+            getattr(config, "elementwise_attn_output_gate", False), default=False
+        )
+        if self.headwise_attn_output_gate or self.elementwise_attn_output_gate:
+            assert self.r == 1, "attn_output_gate is only wired for num_harmonics == 1"
+        if self.headwise_attn_output_gate:
+            self.attn_output_gate_proj = nn.Linear(self.hidden_size, self.num_heads, bias=False)
+        elif self.elementwise_attn_output_gate:
+            self.attn_output_gate_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.wavelet_baseline_use = wavelet_baseline_use
         if wavelet_baseline_use:
             self.attn_dropout = nn.Dropout(attn_pdrop)
@@ -3960,6 +3980,26 @@ class PaTHAttention(nn.Module):
             }
             self.debug_accum[layer_idx] = st
         return st
+
+    def _apply_attn_output_gate(self, o, hidden_states):
+        """Official gated-attention output gate (Qiu et al. 2025; see __init__).
+
+        o: attention output [B, T, H, D] (num_harmonics == 1). Mirrors the official
+        Qwen3Attention: gate_score reshaped to (bsz, q_len, -1, 1) [headwise] or
+        (bsz, q_len, -1, head_dim) [elementwise], then
+        attn_output = attn_output * torch.sigmoid(gate_score).
+        """
+        if not (getattr(self, "headwise_attn_output_gate", False) or getattr(self, "elementwise_attn_output_gate", False)):
+            return o
+        bsz, q_len, _ = hidden_states.size()
+        gate_score = self.attn_output_gate_proj(hidden_states)
+        if self.headwise_attn_output_gate:
+            gate_score = gate_score.reshape(bsz, q_len, -1, 1)
+        elif self.elementwise_attn_output_gate:
+            gate_score = gate_score.reshape(bsz, q_len, -1, self.head_dim)
+        if self.headwise_attn_output_gate or self.elementwise_attn_output_gate:
+            o = o * torch.sigmoid(gate_score).to(o.dtype)
+        return o
 
     @staticmethod
     def _as_bool(v, default=False):
@@ -11139,6 +11179,7 @@ class PaTHAttention(nn.Module):
                 reg_loss = getattr(self, "_last_router_entropy_reg_loss", None)
                 if torch.is_tensor(reg_loss):
                     dis_loss = dis_loss + reg_loss.to(dtype=dis_loss.dtype, device=dis_loss.device)
+            o = self._apply_attn_output_gate(o, hidden_states)
             o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
             o = self.o_proj(o.to(hidden_states.dtype))
             if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:
@@ -11210,6 +11251,7 @@ class PaTHAttention(nn.Module):
                 global_step=global_step,
                 router_log_every=getattr(self.config, "router_log_every", 500),
             )
+        o = self._apply_attn_output_gate(o, hidden_states)
         o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
         o = self.o_proj(o.to(hidden_states.dtype))
         if wavelet_mode == "cond_film_v2" and self.wavelet_cond_film_v2 is not None:
