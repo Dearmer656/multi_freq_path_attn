@@ -3074,6 +3074,11 @@ class PaTHAttention(nn.Module):
         self.wavelet_ctxscale_center_pos_ratio = max(
             0.0, min(1.0, self.wavelet_ctxscale_center_pos_ratio)
         )
+        # PAT-310 C2: prefix_box window width = ratio * scale (1.0 = Ricker positive-lobe
+        # support at beta=0; 0.55 ~ equal positive area to Ricker under equal RMS energy).
+        self.wavelet_ctxscale_prefix_box_width_ratio = float(
+            getattr(config, "wavelet_ctxscale_prefix_box_width_ratio", 1.0)
+        )
         # PAT-234 dual-center ablation: one per-scale waveform is the sum of the
         # absolute-key Ricker pattern and the query-centered Ricker pattern, then
         # the existing per-scale centering/RMS is applied to the summed waveform.
@@ -8118,10 +8123,11 @@ class PaTHAttention(nn.Module):
                         elif self.bias_type == "linear":
                             basis_table = self._linear_basis(u_i)
                         elif self.bias_type == "prefix_box":
-                            # PAT-310 C2: flat gated bias on the fixed prefix window [0, s_i).
+                            # PAT-310 C2: flat gated bias on the fixed prefix window [0, width_ratio * s_i).
                             # No shift (0 * u_i only keeps shift_proj in the graph for DDP);
                             # goes through the same RMS norm as every other basis.
-                            basis_table = (base_x_i < s_i).to(u_i.dtype) + 0.0 * u_i
+                            box_w = float(getattr(self, "wavelet_ctxscale_prefix_box_width_ratio", 1.0)) * s_i
+                            basis_table = (base_x_i < box_w).to(u_i.dtype) + 0.0 * u_i
                         elif self.bias_type == "first_token":
                             # PAT-310 C2: gated bias on key 0 only. Plain RMS norm would give
                             # sqrt(T) on one key, so instead match the value the Ricker basis
