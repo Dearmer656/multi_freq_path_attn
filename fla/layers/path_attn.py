@@ -10496,6 +10496,7 @@ class PaTHAttention(nn.Module):
         config=None,
         global_step=None,
         router_log_every=None,
+        g=None,
     ):
         # === (A) head 对齐：先沿用你现在的 Hw 对齐（但见下文我建议改成 Hq 对齐） ===
         Hw = w.shape[2]
@@ -10798,6 +10799,12 @@ class PaTHAttention(nn.Module):
             )
             # Trigger rows → path logits; non-trigger rows → standard QK^T logits
             E_wav_raw = torch.where(_trigger_mask, E_wav_raw, _E_std_raw)
+
+        # FoX forget gate, same term as g_cumsum in the Triton kernel: added to
+        # the raw logits before scale, on top of the (unchanged) wavelet bias.
+        if g is not None:
+            g_cumsum = torch.cumsum(_match_heads(g, Hw).to(compute_dtype), dim=1).transpose(1, 2)  # [B,H,T]
+            E_wav_raw = E_wav_raw + g_cumsum.unsqueeze(-1) - g_cumsum.unsqueeze(-2)
 
         # PAT-225 capture (analysis-only, no effect on forward output): the
         # existing _last_logits_pa_only/_last_logits_full sets inside
@@ -11192,6 +11199,7 @@ class PaTHAttention(nn.Module):
                     config=self.config,
                     global_step=global_step,
                     router_log_every=getattr(self.config, "router_log_every", 500),
+                    g=g,
                 )
             if self.layer_idx == 11 and analyzer:
                 analyzer['layer_attention_analyzer'].save(
@@ -11289,6 +11297,7 @@ class PaTHAttention(nn.Module):
                 config=self.config,
                 global_step=global_step,
                 router_log_every=getattr(self.config, "router_log_every", 500),
+                g=g,
             )
         o = self._apply_attn_output_gate(o, hidden_states)
         o = rearrange(o, 'b t (h r) d -> b t (h r d)', r=self.r)
